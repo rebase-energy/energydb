@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Type
 
 import energydatamodel as edm
+from psycopg.types.json import Jsonb
 
 # Maps asset_type strings to EnergyDataModel classes
 ASSET_TYPE_MAP: Dict[str, Type[edm.EnergyAsset]] = {
@@ -43,7 +44,7 @@ def serialize_asset(asset: edm.EnergyAsset) -> Dict[str, Any]:
     return {
         "asset_type": asset_type,
         "name": asset.name,
-        "properties": properties,
+        "properties": Jsonb(properties),
         "latitude": getattr(asset, "latitude", None),
         "longitude": getattr(asset, "longitude", None),
         "altitude": getattr(asset, "altitude", None),
@@ -82,7 +83,7 @@ def serialize_collection(collection) -> Dict[str, Any]:
     return {
         "collection_type": collection_type,
         "name": getattr(collection, "name", None),
-        "properties": {},
+        "properties": Jsonb({}),
         "latitude": getattr(collection, "latitude", None),
         "longitude": getattr(collection, "longitude", None),
     }

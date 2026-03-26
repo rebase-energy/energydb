@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.resources
+import os
 from typing import Any, Dict, List, Optional
 
 import energydatamodel as edm
 import psycopg
+from psycopg.types.json import Jsonb
 from timedb import TimeDataClient
 
 from energydb.hierarchy import reconstruct_tree, walk_tree
@@ -19,6 +21,12 @@ class EnergyDataClient(TimeDataClient):
     Extends TimeDB's TimeDataClient with tables for energy assets,
     collections (portfolios, sites), and asset-to-series links.
     """
+
+    def __init__(self, conninfo=None, min_size=2, max_size=10):
+        super().__init__(conninfo=conninfo, min_size=min_size, max_size=max_size)
+        # TimeDB's module-level functions read conninfo from env vars,
+        # so propagate it to ensure they work with the instance's connection.
+        os.environ["DATABASE_URL"] = self._conninfo
 
     # ── Schema management ───────────────────────────────────
 
@@ -44,19 +52,38 @@ class EnergyDataClient(TimeDataClient):
             conn.execute(sql)
             conn.commit()
 
+    # ── Save (unified entry point) ─────────────────────────
+
+    def save(self, obj):
+        """Persist an EnergyDataModel object to the database.
+
+        Dispatches based on type:
+        - EnergyCollection (Portfolio, Site, EnergyCommunity, ...) → saves full tree
+        - EnergyAsset (WindTurbine, PVSystem, Battery, ...) → saves single asset
+
+        Any TimeSeries attached to assets are automatically persisted to TimeDB.
+        """
+        if isinstance(obj, edm.EnergyCollection):
+            self._save_collection(obj)
+        elif isinstance(obj, edm.EnergyAsset):
+            self.save_asset(obj)
+        else:
+            raise TypeError(f"Cannot save object of type {type(obj).__name__}")
+
     # ── Asset CRUD ──────────────────────────────────────────
 
     def save_asset(self, asset: edm.EnergyAsset) -> int:
-        """Persist an EnergyAsset. Returns the asset_id.
+        """Persist an EnergyAsset and its time series. Returns the asset_id.
 
         Uses upsert semantics — updates properties if the asset already exists.
+        Any TimeSeries attached via asset.timeseries are automatically saved to TimeDB.
         """
         data = serialize_asset(asset)
         with self._pool.connection() as conn:
             row = conn.execute(
                 """
                 INSERT INTO asset (asset_type, name, properties, latitude, longitude, altitude, timezone)
-                VALUES (%(asset_type)s, %(name)s, %(properties)s::jsonb,
+                VALUES (%(asset_type)s, %(name)s, %(properties)s,
                         %(latitude)s, %(longitude)s, %(altitude)s, %(timezone)s)
                 ON CONFLICT (name, asset_type)
                 DO UPDATE SET properties = EXCLUDED.properties,
@@ -70,19 +97,25 @@ class EnergyDataClient(TimeDataClient):
                 data,
             ).fetchone()
             conn.commit()
-            return row[0]
+            asset_id = row[0]
+        self._save_asset_timeseries(asset_id, asset)
+        return asset_id
 
-    def get_asset(self, name: str, asset_type: Optional[str] = None) -> edm.EnergyAsset:
+    def get_asset(self, name: str, asset_type: Optional[str] = None, include_timeseries: bool = True) -> edm.EnergyAsset:
         """Load an asset from the database.
 
         Args:
             name: Asset name
             asset_type: Optional type filter (e.g., 'WindTurbine')
+            include_timeseries: If True, also load linked time series from TimeDB
         """
         row = self._fetch_asset_row(name, asset_type)
         if row is None:
             raise ValueError(f"Asset not found: {name}")
-        return reconstruct_asset(row)
+        asset = reconstruct_asset(row)
+        if include_timeseries:
+            self._load_asset_timeseries(row["asset_id"], asset)
+        return asset
 
     def list_assets(self, asset_type: Optional[str] = None) -> List[edm.EnergyAsset]:
         """List all assets, optionally filtered by type."""
@@ -114,19 +147,22 @@ class EnergyDataClient(TimeDataClient):
 
     # ── Hierarchy CRUD ──────────────────────────────────────
 
-    def save_portfolio(self, portfolio: edm.Portfolio):
-        """Persist a full Portfolio tree (collections, assets, links).
+    def _save_collection(self, collection: edm.EnergyCollection):
+        """Persist any EnergyCollection tree (Portfolio, Site, EnergyCommunity, ...).
 
-        The entire tree is saved in a single atomic transaction.
+        The asset/collection structure is saved atomically. Any TimeSeries
+        attached to assets are then persisted to TimeDB.
         """
+        assets_with_ids = []
+
         with self._pool.connection() as conn:
             with conn.transaction():
-                def on_collection(collection, parent_id):
-                    data = serialize_collection(collection)
+                def on_collection(col, parent_id):
+                    data = serialize_collection(col)
                     row = conn.execute(
                         """
                         INSERT INTO collection (collection_type, name, properties, parent_id, latitude, longitude)
-                        VALUES (%(collection_type)s, %(name)s, %(properties)s::jsonb,
+                        VALUES (%(collection_type)s, %(name)s, %(properties)s,
                                 %(parent_id)s, %(latitude)s, %(longitude)s)
                         ON CONFLICT (name, collection_type)
                         DO UPDATE SET properties = EXCLUDED.properties,
@@ -144,7 +180,7 @@ class EnergyDataClient(TimeDataClient):
                     row = conn.execute(
                         """
                         INSERT INTO asset (asset_type, name, properties, latitude, longitude, altitude, timezone)
-                        VALUES (%(asset_type)s, %(name)s, %(properties)s::jsonb,
+                        VALUES (%(asset_type)s, %(name)s, %(properties)s,
                                 %(latitude)s, %(longitude)s, %(altitude)s, %(timezone)s)
                         ON CONFLICT (name, asset_type)
                         DO UPDATE SET properties = EXCLUDED.properties,
@@ -157,7 +193,9 @@ class EnergyDataClient(TimeDataClient):
                         """,
                         data,
                     ).fetchone()
-                    return row[0]
+                    asset_id = row[0]
+                    assets_with_ids.append((asset_id, asset))
+                    return asset_id
 
                 def on_link(col_id, asset_id):
                     conn.execute(
@@ -169,7 +207,39 @@ class EnergyDataClient(TimeDataClient):
                         (col_id, asset_id),
                     )
 
-                walk_tree(portfolio, on_collection, on_asset, on_link)
+                walk_tree(collection, on_collection, on_asset, on_link)
+
+        # Save time series (outside the asset transaction — uses TimeDB's own connections)
+        for asset_id, asset in assets_with_ids:
+            self._save_asset_timeseries(asset_id, asset)
+
+    def save_portfolio(self, portfolio: edm.Portfolio):
+        """Persist a full Portfolio tree. Shorthand for save(portfolio)."""
+        self._save_collection(portfolio)
+
+    def save_site(self, site: edm.Site, parent: Optional[str] = None):
+        """Persist a Site and its assets.
+
+        Args:
+            site: The Site to persist
+            parent: Optional parent collection name to attach to
+        """
+        if parent:
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT collection_id FROM collection WHERE name = %s", (parent,),
+                ).fetchone()
+                if row:
+                    # Temporarily set parent on the site for the tree walk
+                    # We handle this by saving the site then updating parent_id
+                    self._save_collection(site)
+                    conn.execute(
+                        "UPDATE collection SET parent_id = %s WHERE name = %s AND collection_type = %s",
+                        (row[0], site.name, type(site).__name__),
+                    )
+                    conn.commit()
+                    return
+        self._save_collection(site)
 
     def get_portfolio(self, name: str) -> edm.Portfolio:
         """Reconstruct a full Portfolio tree from the database."""
@@ -206,64 +276,6 @@ class EnergyDataClient(TimeDataClient):
                 return [self._collection_row_to_dict(r) for r in rows]
 
             return reconstruct_tree(root, get_assets, get_subcollections, reconstruct_asset)
-
-    def save_site(self, site: edm.Site, parent: Optional[str] = None):
-        """Persist a Site and its assets.
-
-        Args:
-            site: The Site to persist
-            parent: Optional parent collection name to attach to
-        """
-        with self._pool.connection() as conn:
-            with conn.transaction():
-                parent_id = None
-                if parent:
-                    row = conn.execute(
-                        "SELECT collection_id FROM collection WHERE name = %s",
-                        (parent,),
-                    ).fetchone()
-                    if row:
-                        parent_id = row[0]
-
-                data = serialize_collection(site)
-                row = conn.execute(
-                    """
-                    INSERT INTO collection (collection_type, name, properties, parent_id, latitude, longitude)
-                    VALUES (%(collection_type)s, %(name)s, %(properties)s::jsonb,
-                            %(parent_id)s, %(latitude)s, %(longitude)s)
-                    ON CONFLICT (name, collection_type)
-                    DO UPDATE SET properties = EXCLUDED.properties,
-                                 parent_id = EXCLUDED.parent_id,
-                                 latitude = EXCLUDED.latitude,
-                                 longitude = EXCLUDED.longitude
-                    RETURNING collection_id
-                    """,
-                    {**data, "parent_id": parent_id},
-                ).fetchone()
-                col_id = row[0]
-
-                for asset in getattr(site, "assets", []):
-                    asset_data = serialize_asset(asset)
-                    asset_row = conn.execute(
-                        """
-                        INSERT INTO asset (asset_type, name, properties, latitude, longitude, altitude, timezone)
-                        VALUES (%(asset_type)s, %(name)s, %(properties)s::jsonb,
-                                %(latitude)s, %(longitude)s, %(altitude)s, %(timezone)s)
-                        ON CONFLICT (name, asset_type)
-                        DO UPDATE SET properties = EXCLUDED.properties,
-                                     latitude = EXCLUDED.latitude,
-                                     longitude = EXCLUDED.longitude,
-                                     altitude = EXCLUDED.altitude,
-                                     timezone = EXCLUDED.timezone,
-                                     updated_at = now()
-                        RETURNING asset_id
-                        """,
-                        asset_data,
-                    ).fetchone()
-                    conn.execute(
-                        "INSERT INTO collection_asset (collection_id, asset_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                        (col_id, asset_row[0]),
-                    )
 
     def get_site(self, name: str) -> edm.Site:
         """Reconstruct a Site with its assets from the database."""
@@ -440,6 +452,43 @@ class EnergyDataClient(TimeDataClient):
         return [reconstruct_asset(self._row_to_dict(r)) for r in rows]
 
     # ── Internal helpers ────────────────────────────────────
+
+    def _save_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
+        """Persist any TimeSeries attached to an asset."""
+        ts_data = asset.timeseries
+        if not ts_data:
+            return
+        ts_list = ts_data if isinstance(ts_data, list) else [ts_data]
+        for ts in ts_list:
+            if ts.name is None or ts.df is None:
+                continue
+            series_id = self.create_series(ts.name)
+            self.get_series(series_id=series_id).insert(ts.df)
+            with self._pool.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO asset_series (asset_id, series_id, role)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (asset_id, series_id, ts.name),
+                )
+                conn.commit()
+
+    def _load_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
+        """Load linked time series from TimeDB and attach to the asset."""
+        with self._pool.connection() as conn:
+            links = conn.execute(
+                "SELECT series_id, role FROM asset_series WHERE asset_id = %s ORDER BY role",
+                (asset_id,),
+            ).fetchall()
+        if not links:
+            return
+        ts_list = []
+        for series_id, role in links:
+            df = self.get_series(series_id=series_id).read()
+            ts_list.append(edm.TimeSeries(name=role, df=df.reset_index()))
+        asset.timeseries = ts_list if len(ts_list) > 1 else ts_list[0]
 
     def _fetch_asset_row(self, name: str, asset_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._pool.connection() as conn:
