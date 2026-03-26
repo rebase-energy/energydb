@@ -154,6 +154,7 @@ class EnergyDataClient(TimeDataClient):
         attached to assets are then persisted to TimeDB.
         """
         assets_with_ids = []
+        collections_with_ids = []
 
         with self._pool.connection() as conn:
             with conn.transaction():
@@ -173,7 +174,9 @@ class EnergyDataClient(TimeDataClient):
                         """,
                         {**data, "parent_id": parent_id},
                     ).fetchone()
-                    return row[0]
+                    col_id = row[0]
+                    collections_with_ids.append((col_id, col))
+                    return col_id
 
                 def on_asset(asset):
                     data = serialize_asset(asset)
@@ -209,9 +212,11 @@ class EnergyDataClient(TimeDataClient):
 
                 walk_tree(collection, on_collection, on_asset, on_link)
 
-        # Save time series (outside the asset transaction — uses TimeDB's own connections)
+        # Save time series (outside the transaction — uses TimeDB's own connections)
         for asset_id, asset in assets_with_ids:
             self._save_asset_timeseries(asset_id, asset)
+        for col_id, col in collections_with_ids:
+            self._save_collection_timeseries(col_id, col)
 
     def save_portfolio(self, portfolio: edm.Portfolio):
         """Persist a full Portfolio tree. Shorthand for save(portfolio)."""
@@ -275,7 +280,11 @@ class EnergyDataClient(TimeDataClient):
                 ).fetchall()
                 return [self._collection_row_to_dict(r) for r in rows]
 
-            return reconstruct_tree(root, get_assets, get_subcollections, reconstruct_asset)
+            tree = reconstruct_tree(root, get_assets, get_subcollections, reconstruct_asset)
+
+        # Load timeseries for all collections in the tree
+        self._load_tree_timeseries(tree)
+        return tree
 
     def get_site(self, name: str) -> edm.Site:
         """Reconstruct a Site with its assets from the database."""
@@ -307,7 +316,9 @@ class EnergyDataClient(TimeDataClient):
             kwargs["latitude"] = col["latitude"]
         if col.get("longitude") is not None:
             kwargs["longitude"] = col["longitude"]
-        return edm.Site(**kwargs)
+        site = edm.Site(**kwargs)
+        self._load_collection_timeseries(col["collection_id"], site)
+        return site
 
     # ── Series on assets ────────────────────────────────────
 
@@ -453,9 +464,36 @@ class EnergyDataClient(TimeDataClient):
 
     # ── Internal helpers ────────────────────────────────────
 
-    def _save_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
-        """Persist any TimeSeries attached to an asset."""
-        ts_data = asset.timeseries
+    def _load_tree_timeseries(self, collection):
+        """Recursively load timeseries for all collections and assets in a tree."""
+        # Load this collection's timeseries
+        col_id = self._get_collection_id(collection)
+        if col_id is not None:
+            self._load_collection_timeseries(col_id, collection)
+        # Load asset timeseries
+        for asset in getattr(collection, "assets", []) or []:
+            row = self._fetch_asset_row(asset.name)
+            if row:
+                self._load_asset_timeseries(row["asset_id"], asset)
+        # Recurse into sub-collections
+        for sub in getattr(collection, "collections", []) or []:
+            self._load_tree_timeseries(sub)
+
+    def _get_collection_id(self, collection) -> Optional[int]:
+        """Look up the collection_id for a reconstructed collection object."""
+        name = getattr(collection, "name", None)
+        if not name:
+            return None
+        col_type = type(collection).__name__
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT collection_id FROM collection WHERE name = %s AND collection_type = %s",
+                (name, col_type),
+            ).fetchone()
+        return row[0] if row else None
+
+    def _save_timeseries(self, ts_data, entity_id: int, table: str, id_column: str):
+        """Persist TimeSeries to TimeDB and link to an entity."""
         if not ts_data:
             return
         ts_list = ts_data if isinstance(ts_data, list) else [ts_data]
@@ -463,32 +501,55 @@ class EnergyDataClient(TimeDataClient):
             if ts.name is None or ts.df is None:
                 continue
             series_id = self.create_series(ts.name)
-            self.get_series(series_id=series_id).insert(ts.df)
+            self.get_series(series_id=series_id).insert(ts.to_pandas().reset_index())
             with self._pool.connection() as conn:
                 conn.execute(
-                    """
-                    INSERT INTO asset_series (asset_id, series_id, role)
+                    f"""
+                    INSERT INTO {table} ({id_column}, series_id, role)
                     VALUES (%s, %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
-                    (asset_id, series_id, ts.name),
+                    (entity_id, series_id, ts.name),
                 )
                 conn.commit()
 
-    def _load_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
-        """Load linked time series from TimeDB and attach to the asset."""
+    def _load_timeseries(self, entity_id: int, table: str, id_column: str) -> Optional[list]:
+        """Load linked time series from TimeDB."""
         with self._pool.connection() as conn:
             links = conn.execute(
-                "SELECT series_id, role FROM asset_series WHERE asset_id = %s ORDER BY role",
-                (asset_id,),
+                f"SELECT series_id, role FROM {table} WHERE {id_column} = %s ORDER BY role",
+                (entity_id,),
             ).fetchall()
         if not links:
-            return
+            return None
         ts_list = []
         for series_id, role in links:
             df = self.get_series(series_id=series_id).read()
-            ts_list.append(edm.TimeSeries(name=role, df=df.reset_index()))
-        asset.timeseries = ts_list if len(ts_list) > 1 else ts_list[0]
+            ts_list.append(edm.TimeSeries.from_pandas(df.reset_index(), name=role))
+        return ts_list if len(ts_list) > 1 else ts_list[0]
+
+    def _save_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
+        """Persist any TimeSeries attached to an asset."""
+        self._save_timeseries(asset.timeseries, asset_id, "asset_series", "asset_id")
+
+    def _save_collection_timeseries(self, collection_id: int, collection):
+        """Persist any TimeSeries attached to a collection."""
+        self._save_timeseries(
+            getattr(collection, "timeseries", None),
+            collection_id, "collection_series", "collection_id",
+        )
+
+    def _load_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
+        """Load linked time series from TimeDB and attach to the asset."""
+        result = self._load_timeseries(asset_id, "asset_series", "asset_id")
+        if result is not None:
+            asset.timeseries = result
+
+    def _load_collection_timeseries(self, collection_id: int, collection):
+        """Load linked time series from TimeDB and attach to the collection."""
+        result = self._load_timeseries(collection_id, "collection_series", "collection_id")
+        if result is not None:
+            collection.timeseries = result
 
     def _fetch_asset_row(self, name: str, asset_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._pool.connection() as conn:

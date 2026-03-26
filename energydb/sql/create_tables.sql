@@ -46,3 +46,12 @@ CREATE TABLE IF NOT EXISTS asset_series (
     PRIMARY KEY (asset_id, series_id)
 );
 CREATE INDEX IF NOT EXISTS idx_asset_series_series ON asset_series (series_id);
+
+-- Collection owns time series (links to TimeDB's series_table)
+CREATE TABLE IF NOT EXISTS collection_series (
+    collection_id   bigint REFERENCES collection(collection_id) ON DELETE CASCADE,
+    series_id       bigint NOT NULL,
+    role            text,
+    PRIMARY KEY (collection_id, series_id)
+);
+CREATE INDEX IF NOT EXISTS idx_collection_series_series ON collection_series (series_id);
