@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: energydb
+Version: 0.1.0
+Summary: Energy database extending TimeDB with asset storage and hierarchy management
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: timedb>=0.1.4
+Requires-Dist: energydatamodel>=0.0.3
+Requires-Dist: psycopg[binary]>=3.1
+Requires-Dist: psycopg_pool>=3.1
+
+# energydb
