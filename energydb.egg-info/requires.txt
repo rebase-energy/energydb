@@ -1,4 +1,0 @@
-timedb>=0.1.4
-energydatamodel>=0.0.3
-psycopg[binary]>=3.1
-psycopg_pool>=3.1
