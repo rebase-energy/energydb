@@ -1,597 +1,799 @@
-"""EnergyDataClient — extends TimeDB with energy asset storage."""
+"""EnergyDataClient — main entry point for energydb."""
 
 from __future__ import annotations
 
-import importlib.resources
-import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import energydatamodel as edm
-import psycopg
+import polars as pl
+from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
+from sqlalchemy import create_engine
 from timedb import TimeDataClient
 
-from energydb.hierarchy import reconstruct_tree, walk_tree
-from energydb.serialization import reconstruct_asset, serialize_asset, serialize_collection
+from energydb._resolve import (
+    join_hierarchy,
+    resolve_node_id_by_name,
+    resolve_manifest,
+    resolve_path,
+    resolve_paths_bulk,
+    resolve_subtree_ids,
+)
+from energydb.models import Base, ENERGYDB_TABLES
+from energydb.scope import EdgeScope, NodeScope
+from energydb.serialization import (
+    reconstruct_edge,
+    reconstruct_node,
+    serialize_edge,
+    serialize_node,
+)
 
 
-class EnergyDataClient(TimeDataClient):
-    """Database client for energy assets and time series.
+_SEARCH_PATH = "SET search_path TO energydb, timedb, public"
 
-    Extends TimeDB's TimeDataClient with tables for energy assets,
-    collections (portfolios, sites), and asset-to-series links.
+
+class EnergyDataClient:
+    """Database client for energy assets, hierarchy, and time series.
+
+    Uses composition: holds a reference to a :class:`TimeDataClient` and uses
+    its shared connection pool for all Postgres operations.
     """
 
-    def __init__(self, conninfo=None, min_size=2, max_size=10):
-        super().__init__(conninfo=conninfo, min_size=min_size, max_size=max_size)
-        # TimeDB's module-level functions read conninfo from env vars,
-        # so propagate it to ensure they work with the instance's connection.
-        os.environ["DATABASE_URL"] = self._conninfo
+    def __init__(self, td: TimeDataClient):
+        self.td = td
 
-    # ── Schema management ───────────────────────────────────
+    # ------------------------------------------------------------------
+    # Schema management
+    # ------------------------------------------------------------------
 
-    def create(self, retention=None, **kwargs):
-        """Create TimeDB tables and EnergyDB asset tables."""
-        super().create(retention=retention, **kwargs)
-        self._create_asset_tables()
+    def create(self, engine_or_conninfo=None):
+        """Create EnergyDB schema and tables.
+
+        Accepts an optional SQLAlchemy engine or conninfo string.
+        Falls back to td's connection info for a short-lived engine.
+        """
+        # Ensure schema exists via raw connection
+        with self.td.connection() as conn:
+            conn.execute("CREATE SCHEMA IF NOT EXISTS energydb")
+            conn.commit()
+
+        # Create tables via SQLAlchemy
+        if engine_or_conninfo is None:
+            conninfo = self.td._pool.conninfo
+            engine_or_conninfo = f"postgresql+psycopg://{conninfo.split('://', 1)[-1]}" if "://" in conninfo else conninfo
+        if isinstance(engine_or_conninfo, str):
+            engine = create_engine(engine_or_conninfo)
+        else:
+            engine = engine_or_conninfo
+
+        Base.metadata.create_all(engine, tables=ENERGYDB_TABLES, checkfirst=True)
 
     def delete(self):
-        """Drop EnergyDB asset tables and TimeDB tables."""
-        self._drop_asset_tables()
-        super().delete()
-
-    def _create_asset_tables(self):
-        sql = importlib.resources.files("energydb.sql").joinpath("create_tables.sql").read_text()
-        with self._pool.connection() as conn:
-            conn.execute(sql)
+        """Drop EnergyDB schema and all tables."""
+        with self.td.connection() as conn:
+            conn.execute("DROP SCHEMA IF EXISTS energydb CASCADE")
             conn.commit()
 
-    def _drop_asset_tables(self):
-        sql = importlib.resources.files("energydb.sql").joinpath("drop_tables.sql").read_text()
-        with self._pool.connection() as conn:
-            conn.execute(sql)
-            conn.commit()
+    # ------------------------------------------------------------------
+    # Fluent entry
+    # ------------------------------------------------------------------
 
-    # ── Save (unified entry point) ─────────────────────────
-
-    def save(self, obj):
-        """Persist an EnergyDataModel object to the database.
-
-        Dispatches based on type:
-        - EnergyCollection (Portfolio, Site, EnergyCommunity, ...) → saves full tree
-        - EnergyAsset (WindTurbine, PVSystem, Battery, ...) → saves single asset
-
-        Any TimeSeries attached to assets are automatically persisted to TimeDB.
-        """
-        if isinstance(obj, edm.EnergyCollection):
-            self._save_collection(obj)
-        elif isinstance(obj, edm.EnergyAsset):
-            self.save_asset(obj)
-        else:
-            raise TypeError(f"Cannot save object of type {type(obj).__name__}")
-
-    # ── Asset CRUD ──────────────────────────────────────────
-
-    def save_asset(self, asset: edm.EnergyAsset) -> int:
-        """Persist an EnergyAsset and its time series. Returns the asset_id.
-
-        Uses upsert semantics — updates properties if the asset already exists.
-        Any TimeSeries attached via asset.timeseries are automatically saved to TimeDB.
-        """
-        data = serialize_asset(asset)
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO asset (asset_type, name, properties, latitude, longitude, altitude, timezone)
-                VALUES (%(asset_type)s, %(name)s, %(properties)s,
-                        %(latitude)s, %(longitude)s, %(altitude)s, %(timezone)s)
-                ON CONFLICT (name, asset_type)
-                DO UPDATE SET properties = EXCLUDED.properties,
-                             latitude = EXCLUDED.latitude,
-                             longitude = EXCLUDED.longitude,
-                             altitude = EXCLUDED.altitude,
-                             timezone = EXCLUDED.timezone,
-                             updated_at = now()
-                RETURNING asset_id
-                """,
-                data,
-            ).fetchone()
-            conn.commit()
-            asset_id = row[0]
-        self._save_asset_timeseries(asset_id, asset)
-        return asset_id
-
-    def get_asset(self, name: str, asset_type: Optional[str] = None, include_timeseries: bool = True) -> edm.EnergyAsset:
-        """Load an asset from the database.
+    def node(self, name: str | None = None, *, id: int | None = None) -> NodeScope:
+        """Entry point for fluent node navigation.
 
         Args:
-            name: Asset name
-            asset_type: Optional type filter (e.g., 'WindTurbine')
-            include_timeseries: If True, also load linked time series from TimeDB
+            name: Node name (raises if ambiguous across roots).
+            id: Node id (always unambiguous, what platform uses).
         """
-        row = self._fetch_asset_row(name, asset_type)
-        if row is None:
-            raise ValueError(f"Asset not found: {name}")
-        asset = reconstruct_asset(row)
-        if include_timeseries:
-            self._load_asset_timeseries(row["asset_id"], asset)
-        return asset
+        if id is not None:
+            return NodeScope(self.td, node_id=id)
+        if name is not None:
+            return NodeScope(self.td, name_chain=[name])
+        raise ValueError("Must provide name or id")
 
-    def list_assets(self, asset_type: Optional[str] = None) -> List[edm.EnergyAsset]:
-        """List all assets, optionally filtered by type."""
-        with self._pool.connection() as conn:
-            if asset_type:
-                rows = conn.execute(
-                    "SELECT asset_id, asset_type, name, properties, latitude, longitude, altitude, timezone "
-                    "FROM asset WHERE asset_type = %s ORDER BY name",
-                    (asset_type,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT asset_id, asset_type, name, properties, latitude, longitude, altitude, timezone "
-                    "FROM asset ORDER BY asset_type, name"
-                ).fetchall()
-        return [reconstruct_asset(self._row_to_dict(r)) for r in rows]
-
-    def delete_asset(self, name: str, asset_type: Optional[str] = None):
-        """Delete an asset and its series links (cascading)."""
-        with self._pool.connection() as conn:
-            if asset_type:
-                conn.execute(
-                    "DELETE FROM asset WHERE name = %s AND asset_type = %s",
-                    (name, asset_type),
-                )
-            else:
-                conn.execute("DELETE FROM asset WHERE name = %s", (name,))
-            conn.commit()
-
-    # ── Hierarchy CRUD ──────────────────────────────────────
-
-    def _save_collection(self, collection: edm.EnergyCollection):
-        """Persist any EnergyCollection tree (Portfolio, Site, EnergyCommunity, ...).
-
-        The asset/collection structure is saved atomically. Any TimeSeries
-        attached to assets are then persisted to TimeDB.
-        """
-        assets_with_ids = []
-        collections_with_ids = []
-
-        with self._pool.connection() as conn:
-            with conn.transaction():
-                def on_collection(col, parent_id):
-                    data = serialize_collection(col)
-                    row = conn.execute(
-                        """
-                        INSERT INTO collection (collection_type, name, properties, parent_id, latitude, longitude)
-                        VALUES (%(collection_type)s, %(name)s, %(properties)s,
-                                %(parent_id)s, %(latitude)s, %(longitude)s)
-                        ON CONFLICT (name, collection_type)
-                        DO UPDATE SET properties = EXCLUDED.properties,
-                                     parent_id = EXCLUDED.parent_id,
-                                     latitude = EXCLUDED.latitude,
-                                     longitude = EXCLUDED.longitude
-                        RETURNING collection_id
-                        """,
-                        {**data, "parent_id": parent_id},
-                    ).fetchone()
-                    col_id = row[0]
-                    collections_with_ids.append((col_id, col))
-                    return col_id
-
-                def on_asset(asset):
-                    data = serialize_asset(asset)
-                    row = conn.execute(
-                        """
-                        INSERT INTO asset (asset_type, name, properties, latitude, longitude, altitude, timezone)
-                        VALUES (%(asset_type)s, %(name)s, %(properties)s,
-                                %(latitude)s, %(longitude)s, %(altitude)s, %(timezone)s)
-                        ON CONFLICT (name, asset_type)
-                        DO UPDATE SET properties = EXCLUDED.properties,
-                                     latitude = EXCLUDED.latitude,
-                                     longitude = EXCLUDED.longitude,
-                                     altitude = EXCLUDED.altitude,
-                                     timezone = EXCLUDED.timezone,
-                                     updated_at = now()
-                        RETURNING asset_id
-                        """,
-                        data,
-                    ).fetchone()
-                    asset_id = row[0]
-                    assets_with_ids.append((asset_id, asset))
-                    return asset_id
-
-                def on_link(col_id, asset_id):
-                    conn.execute(
-                        """
-                        INSERT INTO collection_asset (collection_id, asset_id)
-                        VALUES (%s, %s)
-                        ON CONFLICT DO NOTHING
-                        """,
-                        (col_id, asset_id),
-                    )
-
-                walk_tree(collection, on_collection, on_asset, on_link)
-
-        # Save time series (outside the transaction — uses TimeDB's own connections)
-        for asset_id, asset in assets_with_ids:
-            self._save_asset_timeseries(asset_id, asset)
-        for col_id, col in collections_with_ids:
-            self._save_collection_timeseries(col_id, col)
-
-    def save_portfolio(self, portfolio: edm.Portfolio):
-        """Persist a full Portfolio tree. Shorthand for save(portfolio)."""
-        self._save_collection(portfolio)
-
-    def save_site(self, site: edm.Site, parent: Optional[str] = None):
-        """Persist a Site and its assets.
+    def edge(self, name: str | None = None, *, id: int | None = None) -> EdgeScope:
+        """Entry point for edge operations.
 
         Args:
-            site: The Site to persist
-            parent: Optional parent collection name to attach to
+            name: Edge name.
+            id: Edge id.
         """
-        if parent:
-            with self._pool.connection() as conn:
+        if id is not None:
+            return EdgeScope(self.td, edge_id=id)
+        if name is not None:
+            return EdgeScope(self.td, name=name)
+        raise ValueError("Must provide name or id")
+
+    # ------------------------------------------------------------------
+    # Imperative CRUD — nodes
+    # ------------------------------------------------------------------
+
+    def create_node(self, edm_obj, *, parent: int | str | None = None) -> int:
+        """Create a node in the hierarchy. Upsert semantics (idempotent).
+
+        If edm_obj.timeseries contains TimeSeriesDescriptors or TimeSeries,
+        they are automatically registered after the node is created. Any
+        attached data on TimeSeries is ignored here — use :meth:`write` to
+        persist a whole tree including data in one call.
+
+        Args:
+            edm_obj: Any EDM Node object (Portfolio, Site, WindTurbine, etc.)
+            parent: Parent node — int (node_id), str (name), or None (root).
+
+        Returns:
+            node_id of the created/existing node.
+        """
+        node_id, _ = self._create_node(edm_obj, parent=parent)
+        return node_id
+
+    def _create_node(
+        self, edm_obj, *, parent: int | str | None = None
+    ) -> tuple[int, list[tuple[int, pl.DataFrame]]]:
+        """Create a node and return ``(node_id, pending_data_writes)``.
+
+        ``pending_data_writes`` contains ``(series_id, df)`` pairs collected
+        from any :class:`TimeSeries` entries in ``edm_obj.timeseries``. The
+        caller is responsible for writing these — :meth:`create_node` ignores
+        them, :meth:`write` batches them into a single timedb write.
+        """
+        data = serialize_node(edm_obj)
+
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            # Resolve parent
+            parent_id = None
+            if isinstance(parent, int):
+                parent_id = parent
+            elif isinstance(parent, str):
+                parent_id = resolve_node_id_by_name(conn, parent)
+
+            if parent_id is not None:
+                # Child node — use child uniqueness constraint
                 row = conn.execute(
-                    "SELECT collection_id FROM collection WHERE name = %s", (parent,),
+                    "INSERT INTO node "
+                    "(node_type, name, parent_id, properties, "
+                    "latitude, longitude, altitude, timezone) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT ON CONSTRAINT node_child_uniq "
+                    "DO UPDATE SET properties = EXCLUDED.properties, "
+                    "latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, "
+                    "altitude = EXCLUDED.altitude, timezone = EXCLUDED.timezone, "
+                    "updated_at = now() "
+                    "RETURNING node_id",
+                    (
+                        data["node_type"], data["name"], parent_id,
+                        data["properties"], data["latitude"],
+                        data["longitude"], data["altitude"], data["timezone"],
+                    ),
                 ).fetchone()
-                if row:
-                    # Temporarily set parent on the site for the tree walk
-                    # We handle this by saving the site then updating parent_id
-                    self._save_collection(site)
+            else:
+                # Root node — no unique constraint on roots (multi-tenant),
+                # so do an explicit check first
+                existing = conn.execute(
+                    "SELECT node_id FROM node "
+                    "WHERE name = %s AND node_type = %s AND parent_id IS NULL",
+                    (data["name"], data["node_type"]),
+                ).fetchone()
+
+                if existing:
+                    # Update existing root
                     conn.execute(
-                        "UPDATE collection SET parent_id = %s WHERE name = %s AND collection_type = %s",
-                        (row[0], site.name, type(site).__name__),
+                        "UPDATE node SET properties = %s, "
+                        "latitude = %s, longitude = %s, altitude = %s, "
+                        "timezone = %s, updated_at = now() "
+                        "WHERE node_id = %s",
+                        (
+                            data["properties"], data["latitude"],
+                            data["longitude"], data["altitude"],
+                            data["timezone"], existing[0],
+                        ),
                     )
                     conn.commit()
-                    return
-        self._save_collection(site)
+                    node_id = existing[0]
+                else:
+                    row = conn.execute(
+                        "INSERT INTO node "
+                        "(node_type, name, parent_id, properties, "
+                        "latitude, longitude, altitude, timezone) "
+                        "VALUES (%s, %s, NULL, %s, %s, %s, %s, %s) "
+                        "RETURNING node_id",
+                        (
+                            data["node_type"], data["name"],
+                            data["properties"], data["latitude"],
+                            data["longitude"], data["altitude"],
+                            data["timezone"],
+                        ),
+                    ).fetchone()
+                    conn.commit()
+                    node_id = row[0]
 
-    def get_portfolio(self, name: str) -> edm.Portfolio:
-        """Reconstruct a full Portfolio tree from the database."""
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                "SELECT collection_id, collection_type, name, properties, parent_id, latitude, longitude "
-                "FROM collection WHERE name = %s AND collection_type = 'Portfolio'",
-                (name,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Portfolio not found: {name}")
-            root = self._collection_row_to_dict(row)
-
-            def get_assets(col_id):
-                rows = conn.execute(
-                    """
-                    SELECT a.asset_id, a.asset_type, a.name, a.properties,
-                           a.latitude, a.longitude, a.altitude, a.timezone
-                    FROM asset a
-                    JOIN collection_asset ca ON ca.asset_id = a.asset_id
-                    WHERE ca.collection_id = %s
-                    ORDER BY a.name
-                    """,
-                    (col_id,),
-                ).fetchall()
-                return [self._row_to_dict(r) for r in rows]
-
-            def get_subcollections(parent_id):
-                rows = conn.execute(
-                    "SELECT collection_id, collection_type, name, properties, parent_id, latitude, longitude "
-                    "FROM collection WHERE parent_id = %s ORDER BY name",
-                    (parent_id,),
-                ).fetchall()
-                return [self._collection_row_to_dict(r) for r in rows]
-
-            tree = reconstruct_tree(root, get_assets, get_subcollections, reconstruct_asset)
-
-        # Load timeseries for all collections in the tree
-        self._load_tree_timeseries(tree)
-        return tree
-
-    def get_site(self, name: str) -> edm.Site:
-        """Reconstruct a Site with its assets from the database."""
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                "SELECT collection_id, collection_type, name, properties, parent_id, latitude, longitude "
-                "FROM collection WHERE name = %s AND collection_type = 'Site'",
-                (name,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Site not found: {name}")
-            col = self._collection_row_to_dict(row)
-
-            asset_rows = conn.execute(
-                """
-                SELECT a.asset_id, a.asset_type, a.name, a.properties,
-                       a.latitude, a.longitude, a.altitude, a.timezone
-                FROM asset a
-                JOIN collection_asset ca ON ca.asset_id = a.asset_id
-                WHERE ca.collection_id = %s
-                ORDER BY a.name
-                """,
-                (col["collection_id"],),
-            ).fetchall()
-
-        assets = [reconstruct_asset(self._row_to_dict(r)) for r in asset_rows]
-        kwargs = {"name": col["name"], "assets": assets}
-        if col.get("latitude") is not None:
-            kwargs["latitude"] = col["latitude"]
-        if col.get("longitude") is not None:
-            kwargs["longitude"] = col["longitude"]
-        site = edm.Site(**kwargs)
-        self._load_collection_timeseries(col["collection_id"], site)
-        return site
-
-    # ── Series on assets ────────────────────────────────────
-
-    def add_series_to_asset(
-        self,
-        asset_name: str,
-        series_name: str,
-        role: Optional[str] = None,
-        asset_type: Optional[str] = None,
-        **series_kwargs,
-    ) -> int:
-        """Create a TimeDB series and link it to an asset.
-
-        Args:
-            asset_name: Name of the asset to link to
-            series_name: Name for the TimeDB series
-            role: Role label (e.g., 'active_power', 'wind_speed')
-            asset_type: Optional asset type filter
-            **series_kwargs: Passed to TimeDB's create_series() (unit, labels, etc.)
-
-        Returns:
-            The series_id of the created/existing series
-        """
-        row = self._fetch_asset_row(asset_name, asset_type)
-        if row is None:
-            raise ValueError(f"Asset not found: {asset_name}")
-        asset_id = row["asset_id"]
-
-        # Create the series in TimeDB
-        series_id = self.create_series(series_name, **series_kwargs)
-
-        # Link it to the asset
-        with self._pool.connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO asset_series (asset_id, series_id, role)
-                VALUES (%s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                (asset_id, series_id, role or series_name),
-            )
-            conn.commit()
-
-        return series_id
-
-    def get_asset_series(self, asset_name: str, role: Optional[str] = None, asset_type: Optional[str] = None):
-        """Get TimeDB SeriesCollection(s) for an asset's linked series.
-
-        Args:
-            asset_name: Name of the asset
-            role: Optional role filter (e.g., 'active_power')
-            asset_type: Optional asset type filter
-
-        Returns:
-            A SeriesCollection if role is specified (single series),
-            or a list of (role, SeriesCollection) tuples if role is None.
-        """
-        row = self._fetch_asset_row(asset_name, asset_type)
-        if row is None:
-            raise ValueError(f"Asset not found: {asset_name}")
-        asset_id = row["asset_id"]
-
-        with self._pool.connection() as conn:
-            if role:
-                link = conn.execute(
-                    "SELECT series_id, role FROM asset_series WHERE asset_id = %s AND role = %s",
-                    (asset_id, role),
-                ).fetchone()
-                if link is None:
-                    raise ValueError(f"No series with role '{role}' on asset '{asset_name}'")
-                return self.get_series(series_id=link[0])
-            else:
-                links = conn.execute(
-                    "SELECT series_id, role FROM asset_series WHERE asset_id = %s ORDER BY role",
-                    (asset_id,),
-                ).fetchall()
-                return [(link[1], self.get_series(series_id=link[0])) for link in links]
-
-    # ── Cross-domain queries ────────────────────────────────
-
-    def query_assets(
-        self,
-        portfolio: Optional[str] = None,
-        site: Optional[str] = None,
-        asset_type: Optional[str] = None,
-        **property_filters,
-    ) -> List[edm.EnergyAsset]:
-        """Query assets across the hierarchy with filters.
-
-        Args:
-            portfolio: Filter by portfolio name
-            site: Filter by site name
-            asset_type: Filter by asset type (e.g., 'WindTurbine')
-            **property_filters: Filter by JSONB properties (e.g., capacity=3.5)
-        """
-        conditions = []
-        params: List[Any] = []
-        joins = []
-
-        if portfolio or site:
-            joins.append("JOIN collection_asset ca ON ca.asset_id = a.asset_id")
-            joins.append("JOIN collection c ON c.collection_id = ca.collection_id")
-            if portfolio:
-                # Find all collections under this portfolio (recursive)
-                conditions.append("""
-                    ca.collection_id IN (
-                        WITH RECURSIVE tree AS (
-                            SELECT collection_id FROM collection WHERE name = %s AND collection_type = 'Portfolio'
-                            UNION ALL
-                            SELECT c2.collection_id FROM collection c2 JOIN tree t ON c2.parent_id = t.collection_id
-                        )
-                        SELECT collection_id FROM tree
-                    )
-                """)
-                params.append(portfolio)
-            if site:
-                conditions.append("c.name = %s AND c.collection_type = 'Site'")
-                params.append(site)
-
-        if asset_type:
-            conditions.append("a.asset_type = %s")
-            params.append(asset_type)
-
-        for key, value in property_filters.items():
-            conditions.append(f"a.properties->>'{key}' = %s")
-            params.append(str(value))
-
-        where_clause = " AND ".join(conditions) if conditions else "TRUE"
-        join_clause = " ".join(joins)
-
-        query = f"""
-            SELECT DISTINCT a.asset_id, a.asset_type, a.name, a.properties,
-                   a.latitude, a.longitude, a.altitude, a.timezone
-            FROM asset a
-            {join_clause}
-            WHERE {where_clause}
-            ORDER BY a.asset_type, a.name
-        """
-
-        with self._pool.connection() as conn:
-            rows = conn.execute(query, params).fetchall()
-        return [reconstruct_asset(self._row_to_dict(r)) for r in rows]
-
-    # ── Internal helpers ────────────────────────────────────
-
-    def _load_tree_timeseries(self, collection):
-        """Recursively load timeseries for all collections and assets in a tree."""
-        # Load this collection's timeseries
-        col_id = self._get_collection_id(collection)
-        if col_id is not None:
-            self._load_collection_timeseries(col_id, collection)
-        # Load asset timeseries
-        for asset in getattr(collection, "assets", []) or []:
-            row = self._fetch_asset_row(asset.name)
-            if row:
-                self._load_asset_timeseries(row["asset_id"], asset)
-        # Recurse into sub-collections
-        for sub in getattr(collection, "collections", []) or []:
-            self._load_tree_timeseries(sub)
-
-    def _get_collection_id(self, collection) -> Optional[int]:
-        """Look up the collection_id for a reconstructed collection object."""
-        name = getattr(collection, "name", None)
-        if not name:
-            return None
-        col_type = type(collection).__name__
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                "SELECT collection_id FROM collection WHERE name = %s AND collection_type = %s",
-                (name, col_type),
-            ).fetchone()
-        return row[0] if row else None
-
-    def _save_timeseries(self, ts_data, entity_id: int, table: str, id_column: str):
-        """Persist TimeSeries to TimeDB and link to an entity."""
-        if not ts_data:
-            return
-        ts_list = ts_data if isinstance(ts_data, list) else [ts_data]
-        for ts in ts_list:
-            if ts.name is None or ts.df is None:
-                continue
-            series_id = self.create_series(ts.name)
-            self.get_series(series_id=series_id).insert(ts.to_pandas().reset_index())
-            with self._pool.connection() as conn:
-                conn.execute(
-                    f"""
-                    INSERT INTO {table} ({id_column}, series_id, role)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (entity_id, series_id, ts.name),
-                )
+            if parent_id is not None:
                 conn.commit()
+                node_id = row[0]
 
-    def _load_timeseries(self, entity_id: int, table: str, id_column: str) -> Optional[list]:
-        """Load linked time series from TimeDB."""
-        with self._pool.connection() as conn:
-            links = conn.execute(
-                f"SELECT series_id, role FROM {table} WHERE {id_column} = %s ORDER BY role",
-                (entity_id,),
-            ).fetchall()
-        if not links:
-            return None
-        ts_list = []
-        for series_id, role in links:
-            df = self.get_series(series_id=series_id).read()
-            ts_list.append(edm.TimeSeries.from_pandas(df.reset_index(), name=role))
-        return ts_list if len(ts_list) > 1 else ts_list[0]
+        pending = self.node(id=node_id)._register_descriptors(edm_obj)
+        return node_id, pending
 
-    def _save_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
-        """Persist any TimeSeries attached to an asset."""
-        self._save_timeseries(asset.timeseries, asset_id, "asset_series", "asset_id")
+    # ------------------------------------------------------------------
+    # Imperative CRUD — edges
+    # ------------------------------------------------------------------
 
-    def _save_collection_timeseries(self, collection_id: int, collection):
-        """Persist any TimeSeries attached to a collection."""
-        self._save_timeseries(
-            getattr(collection, "timeseries", None),
-            collection_id, "collection_series", "collection_id",
-        )
+    def create_edge(
+        self,
+        edm_obj,
+        *,
+        from_node: int | str | None = None,
+        to_node: int | str | None = None,
+    ) -> int:
+        """Create an edge between two nodes. Upsert semantics.
 
-    def _load_asset_timeseries(self, asset_id: int, asset: edm.EnergyAsset):
-        """Load linked time series from TimeDB and attach to the asset."""
-        result = self._load_timeseries(asset_id, "asset_series", "asset_id")
-        if result is not None:
-            asset.timeseries = result
+        Args:
+            edm_obj: An EDM Edge object (Line, Link, Transformer, etc.)
+            from_node: Source node — int (node_id) or str (name).
+                Falls back to edm_obj.from_entity Reference if not provided.
+            to_node: Target node — int (node_id) or str (name).
+                Falls back to edm_obj.to_entity Reference if not provided.
 
-    def _load_collection_timeseries(self, collection_id: int, collection):
-        """Load linked time series from TimeDB and attach to the collection."""
-        result = self._load_timeseries(collection_id, "collection_series", "collection_id")
-        if result is not None:
-            collection.timeseries = result
+        Returns:
+            edge_id of the created/existing edge.
+        """
+        data = serialize_edge(edm_obj)
 
-    def _fetch_asset_row(self, name: str, asset_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        with self._pool.connection() as conn:
-            if asset_type:
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            # Resolve from_node / to_node
+            from_id = _resolve_node_ref(conn, from_node, edm_obj, "from_entity")
+            to_id = _resolve_node_ref(conn, to_node, edm_obj, "to_entity")
+
+            row = conn.execute(
+                "INSERT INTO edge "
+                "(edge_type, name, from_node_id, to_node_id, "
+                "properties, directed) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT ON CONSTRAINT edge_uniq "
+                "DO UPDATE SET properties = EXCLUDED.properties, "
+                "name = EXCLUDED.name, directed = EXCLUDED.directed, "
+                "updated_at = now() "
+                "RETURNING edge_id",
+                (
+                    data["edge_type"], data["name"],
+                    from_id, to_id,
+                    data["properties"], data["directed"],
+                ),
+            ).fetchone()
+            conn.commit()
+            edge_id = row[0]
+
+        # Auto-register series from edm_obj.timeseries
+        ts_list = getattr(edm_obj, "timeseries", None)
+        if ts_list:
+            scope = EdgeScope(self.td, edge_id=edge_id)
+            for ts in ts_list:
+                if isinstance(ts, edm.TimeSeries):
+                    scope.register_series(ts.to_descriptor())
+                elif hasattr(ts, "name"):
+                    scope.register_series(ts)
+
+        return edge_id
+
+    def get_edge(self, name: str | None = None, *, id: int | None = None):
+        """Get a single edge as an EDM object.
+
+        Args:
+            name: Edge name (raises if ambiguous).
+            id: Edge id.
+        """
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            if id is not None:
                 row = conn.execute(
-                    "SELECT asset_id, asset_type, name, properties, latitude, longitude, altitude, timezone "
-                    "FROM asset WHERE name = %s AND asset_type = %s",
-                    (name, asset_type),
+                    "SELECT edge_id, edge_type, name, properties, "
+                    "directed, from_node_id, to_node_id "
+                    "FROM edge WHERE edge_id = %s",
+                    (id,),
                 ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT asset_id, asset_type, name, properties, latitude, longitude, altitude, timezone "
-                    "FROM asset WHERE name = %s",
+            elif name is not None:
+                rows = conn.execute(
+                    "SELECT edge_id, edge_type, name, properties, "
+                    "directed, from_node_id, to_node_id "
+                    "FROM edge WHERE name = %s",
                     (name,),
+                ).fetchall()
+                if len(rows) == 0:
+                    raise ValueError(f"Edge not found: {name}")
+                if len(rows) > 1:
+                    ids = [r[0] for r in rows]
+                    raise ValueError(
+                        f"Multiple edges named '{name}' (ids: {ids}). "
+                        f"Use get_edge(id=...) to disambiguate."
+                    )
+                row = rows[0]
+            else:
+                raise ValueError("Must provide name or id")
+
+            if row is None:
+                raise ValueError(f"Edge not found: id={id}")
+
+            # Resolve from/to node paths
+            from_path = resolve_path(conn, row[5])
+            to_path = resolve_path(conn, row[6])
+
+            return reconstruct_edge({
+                "edge_id": row[0],
+                "edge_type": row[1],
+                "name": row[2],
+                "properties": row[3],
+                "directed": row[4],
+                "from_node_path": from_path,
+                "to_node_path": to_path,
+            })
+
+    def query_edges(
+        self,
+        *,
+        type: str | None = None,
+        within: str | int | None = None,
+        **property_filters,
+    ) -> list:
+        """Query edges as a flat list of EDM objects.
+
+        Args:
+            type: Filter by edge_type.
+            within: Restrict to edges where from_node or to_node
+                is a descendant of this node (name or id).
+            **property_filters: Filter by JSONB properties.
+        """
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            conditions = []
+            params: list[Any] = []
+
+            if within is not None:
+                if isinstance(within, int):
+                    within_id = within
+                else:
+                    within_id = resolve_node_id_by_name(conn, within)
+                subtree_ids = resolve_subtree_ids(conn, within_id)
+                conditions.append(
+                    "(from_node_id = ANY(%s) OR to_node_id = ANY(%s))"
+                )
+                params.append(subtree_ids)
+                params.append(subtree_ids)
+
+            if type:
+                conditions.append("edge_type = %s")
+                params.append(type)
+
+            for key, value in property_filters.items():
+                conditions.append("properties->>%s = %s")
+                params.append(key)
+                params.append(str(value))
+
+            where = " AND ".join(conditions) if conditions else "TRUE"
+            rows = conn.execute(
+                f"SELECT edge_id, edge_type, name, properties, "
+                f"directed, from_node_id, to_node_id "
+                f"FROM edge WHERE {where} ORDER BY name",
+                params,
+            ).fetchall()
+
+            # Resolve all node paths in bulk
+            all_node_ids = list(
+                set(r[5] for r in rows) | set(r[6] for r in rows)
+            )
+            paths = resolve_paths_bulk(conn, all_node_ids)
+
+            return [
+                reconstruct_edge({
+                    "edge_id": r[0],
+                    "edge_type": r[1],
+                    "name": r[2],
+                    "properties": r[3],
+                    "directed": r[4],
+                    "from_node_path": paths.get(r[5], ""),
+                    "to_node_path": paths.get(r[6], ""),
+                })
+                for r in rows
+            ]
+
+    # ------------------------------------------------------------------
+    # Read hierarchy
+    # ------------------------------------------------------------------
+
+    def get_node(self, name: str | None = None, *, id: int | None = None):
+        """Get a single node as an EDM object (no children).
+
+        Args:
+            name: Node name (raises if ambiguous).
+            id: Node id.
+        """
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            if id is not None:
+                row = conn.execute(
+                    "SELECT node_id, node_type, name, properties, "
+                    "latitude, longitude, altitude, timezone "
+                    "FROM node WHERE node_id = %s",
+                    (id,),
                 ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_dict(row)
+            elif name is not None:
+                rows = conn.execute(
+                    "SELECT node_id, node_type, name, properties, "
+                    "latitude, longitude, altitude, timezone "
+                    "FROM node WHERE name = %s",
+                    (name,),
+                ).fetchall()
+                if len(rows) == 0:
+                    raise ValueError(f"Node not found: {name}")
+                if len(rows) > 1:
+                    ids = [r[0] for r in rows]
+                    raise ValueError(
+                        f"Multiple nodes named '{name}' (ids: {ids}). "
+                        f"Use get_node(id=...) to disambiguate."
+                    )
+                row = rows[0]
+            else:
+                raise ValueError("Must provide name or id")
 
-    @staticmethod
-    def _row_to_dict(row) -> Dict[str, Any]:
-        """Convert a psycopg row tuple to a dict."""
-        return {
-            "asset_id": row[0],
-            "asset_type": row[1],
-            "name": row[2],
-            "properties": row[3],
-            "latitude": row[4],
-            "longitude": row[5],
-            "altitude": row[6],
-            "timezone": row[7],
-        }
+            if row is None:
+                raise ValueError(f"Node not found: id={id}")
 
-    @staticmethod
-    def _collection_row_to_dict(row) -> Dict[str, Any]:
-        """Convert a collection row tuple to a dict."""
-        return {
-            "collection_id": row[0],
-            "collection_type": row[1],
-            "name": row[2],
-            "properties": row[3],
-            "parent_id": row[4],
-            "latitude": row[5],
-            "longitude": row[6],
-        }
+            return reconstruct_node(_row_to_dict(row))
+
+    def get_tree(
+        self,
+        name: str | None = None,
+        *,
+        id: int | None = None,
+        include_series: bool = False,
+    ):
+        """Get a full EDM tree with all descendants.
+
+        Args:
+            name: Root node name.
+            id: Root node id.
+            include_series: If True, attach TimeSeriesDescriptors to .timeseries.
+        """
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            # Resolve root
+            if id is not None:
+                root_id = id
+            elif name is not None:
+                root_id = resolve_node_id_by_name(conn, name)
+            else:
+                raise ValueError("Must provide name or id")
+
+            # Fetch entire subtree in one query
+            rows = conn.execute(
+                """
+                WITH RECURSIVE subtree AS (
+                    SELECT node_id, node_type, name, properties, parent_id,
+                           latitude, longitude, altitude, timezone
+                    FROM node WHERE node_id = %s
+                    UNION ALL
+                    SELECT n.node_id, n.node_type, n.name, n.properties, n.parent_id,
+                           n.latitude, n.longitude, n.altitude, n.timezone
+                    FROM node n JOIN subtree s ON n.parent_id = s.node_id
+                )
+                SELECT * FROM subtree
+                """,
+                (root_id,),
+            ).fetchall()
+
+            # Reconstruct each node as an EDM object
+            nodes: dict[int, Any] = {}
+            parent_map: dict[int, int | None] = {}
+            for r in rows:
+                node_id = r[0]
+                parent_map[node_id] = r[4]  # parent_id
+                nodes[node_id] = reconstruct_node(_row_to_dict_full(r))
+
+            # Optionally attach series descriptors
+            if include_series:
+                from timedatamodel import TimeSeriesDescriptor, DataType, TimeSeriesType
+
+                all_node_ids = list(nodes.keys())
+                series_rows = conn.execute(
+                    """
+                    SELECT ns.node_id, ns.data_type, ns.name,
+                           s.unit, s.overlapping, s.description
+                    FROM node_series ns
+                    JOIN series s ON ns.series_id = s.series_id
+                    WHERE ns.node_id = ANY(%s)
+                    """,
+                    (all_node_ids,),
+                ).fetchall()
+
+                for sr in series_rows:
+                    nid, dt, met, unit, overlapping, desc = sr
+                    node_obj = nodes.get(nid)
+                    if node_obj is None:
+                        continue
+                    descriptor = TimeSeriesDescriptor(
+                        name=met,
+                        unit=unit or "dimensionless",
+                        data_type=DataType(dt.upper()) if dt else None,
+                        timeseries_type=TimeSeriesType.OVERLAPPING if overlapping else TimeSeriesType.FLAT,
+                        description=desc,
+                    )
+                    if node_obj.timeseries is None:
+                        node_obj.timeseries = []
+                    node_obj.timeseries.append(descriptor)
+
+            # Build tree bottom-up using add_child
+            for node_id, parent_id in parent_map.items():
+                if parent_id is not None and parent_id in nodes:
+                    nodes[parent_id].add_child(nodes[node_id])
+
+            return nodes[root_id]
+
+    def query_nodes(
+        self,
+        *,
+        type: str | None = None,
+        within: str | int | None = None,
+        **property_filters,
+    ) -> list:
+        """Query nodes as a flat list of EDM objects.
+
+        Args:
+            type: Filter by node_type.
+            within: Restrict to descendants of this node (name or id).
+            **property_filters: Filter by JSONB properties.
+        """
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+
+            conditions = []
+            params: list[Any] = []
+
+            if within is not None:
+                if isinstance(within, int):
+                    within_id = within
+                else:
+                    within_id = resolve_node_id_by_name(conn, within)
+                subtree_ids = resolve_subtree_ids(conn, within_id)
+                conditions.append("node_id = ANY(%s)")
+                params.append(subtree_ids)
+
+            if type:
+                conditions.append("node_type = %s")
+                params.append(type)
+
+            for key, value in property_filters.items():
+                conditions.append("properties->>%s = %s")
+                params.append(key)
+                params.append(str(value))
+
+            where = " AND ".join(conditions) if conditions else "TRUE"
+            rows = conn.execute(
+                f"SELECT node_id, node_type, name, properties, "
+                f"latitude, longitude, altitude, timezone "
+                f"FROM node WHERE {where} ORDER BY name",
+                params,
+            ).fetchall()
+
+            return [reconstruct_node(_row_to_dict(r)) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Bulk I/O
+    # ------------------------------------------------------------------
+
+    def read(
+        self,
+        manifest: pl.DataFrame,
+        *,
+        start_valid=None,
+        end_valid=None,
+        **timedb_kwargs,
+    ) -> pl.DataFrame:
+        """Bulk read via manifest. Supports node_id, path, or edge_id columns."""
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+            resolved = resolve_manifest(conn, manifest)
+            series_ids = resolved["series_id"].unique().to_list()
+
+            result = self.td.read(
+                resolved.select(["series_id"]),
+                series_col="series_id",
+                start_valid=start_valid,
+                end_valid=end_valid,
+                **timedb_kwargs,
+            )
+
+            return join_hierarchy(conn, result, series_ids)
+
+    def write(self, target, *, parent: int | str | None = None, **timedb_kwargs):
+        """Persist either a manifest DataFrame or an EDM tree.
+
+        - **Manifest write** (``target`` is a ``polars.DataFrame``): the frame
+          carries routing columns (``node_id`` or ``path``) and timedb data
+          columns; series_ids are resolved server-side and written as a single
+          bulk write.
+        - **Tree write** (``target`` is an EDM ``Node``): walks the tree
+          depth-first in two passes:
+          1. Create all Nodes (skip Edges)
+          2. Create all Edges (from/to References now resolvable)
+          Both passes collect pending series data, single bulk write at the end.
+          Returns the root ``node_id``.
+
+        Both forms are idempotent.
+        """
+        if isinstance(target, pl.DataFrame):
+            return self._write_manifest(target, **timedb_kwargs)
+        return self._write_tree(target, parent=parent, **timedb_kwargs)
+
+    def _write_manifest(self, df: pl.DataFrame, **timedb_kwargs) -> list:
+        """Bulk write via DataFrame. Supports node_id or path routing columns."""
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+            resolved = resolve_manifest(conn, df)
+
+            # Keep only series_id + data columns for timedb
+            data_cols = ["series_id", "valid_time", "value"]
+            optional_cols = [
+                "knowledge_time", "valid_time_end", "change_time",
+                "changed_by", "annotation",
+            ]
+            for col in optional_cols:
+                if col in resolved.columns:
+                    data_cols.append(col)
+
+            write_df = resolved.select(
+                [c for c in data_cols if c in resolved.columns]
+            )
+            return self.td.write(write_df, series_col="series_id", **timedb_kwargs)
+
+    def _write_tree(
+        self, tree, *, parent: int | str | None = None, **timedb_kwargs
+    ) -> int:
+        """Walk an EDM tree, upsert every node + edge + series, bulk-write all data.
+
+        Two-pass approach:
+        1. Walk node.children(), create all Nodes (skip Edges)
+        2. Walk again, create all Edges (from/to References now resolvable)
+        Both passes collect pending series data for a single bulk write.
+        """
+        pending: list[tuple[int, pl.DataFrame]] = []
+        root_id: int | None = None
+
+        # Pass 1: Create all nodes
+        def _visit_nodes(obj, parent_ref):
+            nonlocal root_id
+            node_id, node_pending = self._create_node(obj, parent=parent_ref)
+            pending.extend(node_pending)
+            if root_id is None:
+                root_id = node_id
+            for child in obj.children():
+                if isinstance(child, edm.Edge):
+                    continue
+                _visit_nodes(child, node_id)
+
+        _visit_nodes(tree, parent)
+
+        # Pass 2: Create all edges
+        def _visit_edges(obj):
+            for child in obj.children():
+                if isinstance(child, edm.Edge):
+                    self.create_edge(child)
+                else:
+                    _visit_edges(child)
+
+        _visit_edges(tree)
+
+        if pending:
+            frames = [
+                df.with_columns(pl.lit(series_id).alias("series_id"))
+                for series_id, df in pending
+            ]
+            self.td.write(
+                pl.concat(frames, how="diagonal_relaxed"),
+                series_col="series_id",
+                **timedb_kwargs,
+            )
+
+        assert root_id is not None  # tree always has at least one node
+        return root_id
+
+    def read_relative(
+        self,
+        manifest: pl.DataFrame,
+        **timedb_kwargs,
+    ) -> pl.DataFrame:
+        """Bulk relative read via manifest."""
+        with self.td.connection() as conn:
+            conn.execute(_SEARCH_PATH)
+            resolved = resolve_manifest(conn, manifest)
+            series_ids = resolved["series_id"].unique().to_list()
+
+            result = self.td.read_relative(
+                resolved.select(["series_id"]),
+                series_col="series_id",
+                **timedb_kwargs,
+            )
+
+            return join_hierarchy(conn, result, series_ids)
+
+
+# ---------------------------------------------------------------------------
+# Row conversion helpers
+# ---------------------------------------------------------------------------
+
+
+def _row_to_dict(row) -> dict[str, Any]:
+    """Convert a (node_id, node_type, name, properties, lat, lon, alt, tz) tuple."""
+    return {
+        "node_id": row[0],
+        "node_type": row[1],
+        "name": row[2],
+        "properties": row[3],
+        "latitude": row[4],
+        "longitude": row[5],
+        "altitude": row[6],
+        "timezone": row[7],
+    }
+
+
+def _row_to_dict_full(row) -> dict[str, Any]:
+    """Convert a subtree CTE row (node_id, type, name, props, parent_id, lat, lon, alt, tz)."""
+    return {
+        "node_id": row[0],
+        "node_type": row[1],
+        "name": row[2],
+        "properties": row[3],
+        # row[4] is parent_id — not needed for reconstruction
+        "latitude": row[5],
+        "longitude": row[6],
+        "altitude": row[7],
+        "timezone": row[8],
+    }
+
+
+def _resolve_node_ref(
+    conn, explicit: int | str | None, edm_obj, attr: str
+) -> int:
+    """Resolve a node reference from explicit arg or edm_obj attribute.
+
+    Args:
+        conn: DB connection.
+        explicit: Explicitly provided node_id (int) or str (name or path).
+        edm_obj: EDM Edge object with from_entity/to_entity References.
+        attr: "from_entity" or "to_entity".
+    """
+    if isinstance(explicit, int):
+        return explicit
+    if isinstance(explicit, str):
+        return _resolve_name_or_path(conn, explicit)
+
+    # Fall back to EDM Reference
+    ref = getattr(edm_obj, attr, None)
+    if ref is None:
+        raise ValueError(
+            f"No {attr} provided and edm_obj.{attr} is None"
+        )
+    if isinstance(ref, Reference):
+        target = ref.target
+        if isinstance(target, str):
+            return _resolve_name_or_path(conn, target)
+        # Resolved Entity — look up by name
+        name = getattr(target, "name", None)
+        if name is None:
+            raise ValueError(f"Cannot resolve {attr}: Reference target has no name")
+        return resolve_node_id_by_name(conn, name)
+
+    raise ValueError(f"Cannot resolve {attr}: expected int, str, or Reference, got {type(ref)}")
+
+
+def _resolve_name_or_path(conn, value: str) -> int:
+    """Resolve a string that is either a simple name or a slash-separated path."""
+    if "/" in value:
+        from energydb._resolve import resolve_node_id
+        return resolve_node_id(conn, value.split("/"))
+    return resolve_node_id_by_name(conn, value)
