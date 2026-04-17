@@ -1,10 +1,20 @@
-# EnergyDB
+<div align="center">
+  <h1>⚡ EnergyDB</h1>
+  <p><b>Persistent storage for energy asset hierarchies and time series, built on PostgreSQL.</b></p>
 
-Energy database that stores both energy asset metadata and time series in PostgreSQL.
+  <a href="https://pypi.org/project/energydb/"><img alt="PyPI" src="https://img.shields.io/pypi/v/energydb?color=blue&style=flat-square"></a>
+  <a href="https://pypi.org/project/energydb/"><img alt="Python Versions" src="https://img.shields.io/pypi/pyversions/energydb?style=flat-square"></a>
+  <a href="https://github.com/rebase-energy/energydb/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-green.svg?style=flat-square"></a>
+  <a href="https://www.rebase.energy/join-slack"><img alt="Slack" src="https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&style=flat-square"></a>
+</div>
 
-EnergyDB extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies — portfolios, sites, and assets — links them to time series with full auditability, and models grid topology via typed edges.
+<br/>
 
-## How it works
+**EnergyDB** extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies — portfolios, sites, and assets — links them to time series with full auditability, and models grid topology via typed edges.
+
+---
+
+## 🏗️ How It Works
 
 EnergyDB bridges two libraries:
 
@@ -25,7 +35,19 @@ Portfolio
               └── Line "Cable-1" (BusA → BusB)  ←  edge with own TimeSeries
 ```
 
-## Quick start
+---
+
+## 🚀 Quick Start
+
+### 1. Installation
+
+```bash
+pip install energydb
+```
+
+Requires Python 3.9+ and a PostgreSQL database (e.g., [Neon](https://neon.tech), local Postgres, or any hosted provider).
+
+### 2. Usage Example
 
 ```python
 import energydb as edb
@@ -86,7 +108,7 @@ tree     = client.get_tree("My Portfolio", include_series=True)
 turbines = client.query_nodes(type="WindTurbine", within="My Portfolio")
 ```
 
-## Edges
+### 3. Edges
 
 Edges model typed links between nodes — lines, transformers, pipes, interconnections.
 
@@ -112,20 +134,35 @@ client.edge(id=line_id).from_node().read(data_type="actual")
 client.edge(id=line_id).to_node().read(data_type="actual")
 ```
 
-See [`examples/quickstart.ipynb`](examples/quickstart.ipynb) for a complete walkthrough.
+---
 
-## Installation
+## 🧪 Try It in Google Colab
 
-```bash
-pip install energydb
-```
+Want to try EnergyDB without a local setup? Open our Quickstart in Colab.
 
-Requires a PostgreSQL database (e.g., [Neon](https://neon.tech), local Postgres, or any hosted provider).
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rebase-energy/energydb/blob/main/examples/quickstart.ipynb)
 
-## Related projects
+> **Note:** Data persists only within the active Colab session. Additional notebooks are available in the `examples/` directory.
+
+---
+
+## 📦 Related Projects
 
 | Project | Description |
-|---------|-------------|
+| :------ | :---------- |
 | [TimeDB](https://github.com/rebase-energy/timedb) | Time series database with auditability and overlapping forecast support |
 | [TimeDataModel](https://github.com/rebase-energy/TimeDataModel) | Pythonic data model for time series |
 | [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) | Data model for energy assets (solar, wind, battery, grid, ...) |
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! If you're interested in improving EnergyDB, please open an issue or pull request.
+
+---
+
+<div align="center">
+<p>Licensed under the <a href="LICENSE">Apache-2.0 License</a>.</p>
+<p>Find a bug or have a feature request? <a href="https://github.com/rebase-energy/energydb/issues">Open an Issue</a>.</p>
+</div>
