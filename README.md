@@ -49,10 +49,12 @@ Requires Python 3.9+ and a PostgreSQL database (e.g., [Neon](https://neon.tech),
 
 ### 2. Usage Example
 
+Build the entire tree in Python — structure, series schemas, and data — then persist it in one call.
+
 ```python
 import energydb as edb
 import polars as pl
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from shapely.geometry import Point
 from timedb import TimeDataClient
 
@@ -60,37 +62,42 @@ td = TimeDataClient()
 client = edb.EnergyDataClient(td)
 client.create()   # creates the energydb schema + tables
 
-# Build the hierarchy imperatively. Series declared inline on an EDM object
-# via TimeSeriesDescriptors are auto-registered with the node.
-portfolio_id = client.create_node(edb.Portfolio(name="My Portfolio"))
+# Helper to build a simple hourly DataFrame
+base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+index = [base + timedelta(hours=i) for i in range(24)]
 
-site_id = client.create_node(
-    edb.Site(name="Offshore-1", geometry=Point(3.0, 55.0)),
-    parent=portfolio_id,
-)
+def hourly(values):
+    return pl.DataFrame({"valid_time": index, "value": values})
 
-t01_id = client.create_node(
-    edb.WindTurbine(name="T01", capacity=3.5, hub_height=80, timeseries=[
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.FORECAST,
-                                 timeseries_type=edb.TimeSeriesType.OVERLAPPING),
+# 1. Declare the full portfolio as an EDM tree
+#    TimeSeries carries data inline, TimeSeriesDescriptor is schema-only
+portfolio = edb.Portfolio(name="My Portfolio", members=[
+    edb.Site(name="Offshore-1", geometry=Point(3.0, 55.0), members=[
+        edb.WindTurbine(name="T01", capacity=3.5, hub_height=80, timeseries=[
+            edb.TimeSeries(hourly([2.5 + 0.1*h for h in range(24)]),
+                           name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+            edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.FORECAST,
+                                     timeseries_type=edb.TimeSeriesType.OVERLAPPING),
+        ]),
+        edb.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
+            edb.TimeSeries(hourly([2.8 + 0.1*h for h in range(24)]),
+                           name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+        ]),
     ]),
-    parent=site_id,
-)
+    edb.Site(name="Rooftop-1", geometry=Point(4.5, 52.0), members=[
+        edb.PVSystem(name="PV01", capacity=10, surface_tilt=25, surface_azimuth=180, timeseries=[
+            edb.TimeSeries(hourly([5.0 + 0.2*h for h in range(24)]),
+                           name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+        ]),
+        edb.Battery(name="B01", storage_capacity=1000, max_charge=500),
+    ]),
+])
 
-# Register a series after the fact using kwargs
-client.node(id=t01_id).register_series(name="wind_speed", unit="m/s", data_type="actual")
+# 2. Persist it — one call
+#    Upserts every node, registers every series, bulk-writes all data. Idempotent.
+root_id = client.write(portfolio)
 
-# Write time series via the fluent API
-df = pl.DataFrame({
-    "valid_time": [datetime(2025, 1, 1, h, tzinfo=timezone.utc) for h in range(24)],
-    "value":      [2.5 + 0.1 * h for h in range(24)],
-})
-client.node("My Portfolio").node("Offshore-1").node("T01").write(
-    df, name="power", data_type="actual",
-)
-
-# Read a single asset
+# 3. Read with the fluent API
 client.node("My Portfolio").node("Offshore-1").node("T01").read(
     data_type="actual", name="power",
     start_valid=datetime(2025, 1, 1, tzinfo=timezone.utc),
@@ -102,36 +109,8 @@ client.node("My Portfolio").read(data_type="actual", name="power")
 # Filter descendants by EDM type
 client.node("My Portfolio").find(type="WindTurbine").read(data_type="actual", name="power")
 
-# Hierarchy queries — return EDM objects
-turbine  = client.get_node("T01")
-tree     = client.get_tree("My Portfolio", include_series=True)
-turbines = client.query_nodes(type="WindTurbine", within="My Portfolio")
-```
-
-### 3. Edges
-
-Edges model typed links between nodes — lines, transformers, pipes, interconnections.
-
-```python
-from energydb import Line, JunctionPoint
-
-bus_a_id = client.create_node(JunctionPoint(name="BusA"), parent=site_id)
-bus_b_id = client.create_node(JunctionPoint(name="BusB"), parent=site_id)
-
-line_id = client.create_edge(
-    Line(name="Cable-1", capacity=500),
-    from_node=bus_a_id,
-    to_node=bus_b_id,
-)
-
-# Read back, query, and attach time series
-line = client.get_edge(id=line_id)
-client.edge(id=line_id).register_series(name="power_flow", unit="MW", data_type="actual")
-client.edge(id=line_id).write(df, name="power_flow", data_type="actual")
-
-# Navigate from an edge to its endpoints
-client.edge(id=line_id).from_node().read(data_type="actual")
-client.edge(id=line_id).to_node().read(data_type="actual")
+# 4. Reconstruct the full EDM tree from the database
+tree = client.get_tree("My Portfolio", include_series=True)
 ```
 
 ---
