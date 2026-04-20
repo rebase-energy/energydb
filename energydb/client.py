@@ -12,6 +12,7 @@ from sqlalchemy import create_engine
 from timedb import TimeDataClient
 
 from energydb._resolve import (
+    join_edge_hierarchy,
     join_hierarchy,
     resolve_node_id_by_name,
     resolve_manifest,
@@ -595,6 +596,7 @@ class EnergyDataClient:
         **timedb_kwargs,
     ) -> pl.DataFrame:
         """Bulk read via manifest. Supports node_id, path, or edge_id columns."""
+        is_edge = "edge_id" in manifest.columns
         with self.td.connection() as conn:
             conn.execute(_SEARCH_PATH)
             resolved = resolve_manifest(conn, manifest)
@@ -608,6 +610,8 @@ class EnergyDataClient:
                 **timedb_kwargs,
             )
 
+            if is_edge:
+                return join_edge_hierarchy(conn, result, series_ids)
             return join_hierarchy(conn, result, series_ids)
 
     def write(self, target, *, parent: int | str | None = None, **timedb_kwargs):
@@ -708,6 +712,7 @@ class EnergyDataClient:
         **timedb_kwargs,
     ) -> pl.DataFrame:
         """Bulk relative read via manifest."""
+        is_edge = "edge_id" in manifest.columns
         with self.td.connection() as conn:
             conn.execute(_SEARCH_PATH)
             resolved = resolve_manifest(conn, manifest)
@@ -719,6 +724,8 @@ class EnergyDataClient:
                 **timedb_kwargs,
             )
 
+            if is_edge:
+                return join_edge_hierarchy(conn, result, series_ids)
             return join_hierarchy(conn, result, series_ids)
 
 
