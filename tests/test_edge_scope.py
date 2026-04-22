@@ -59,7 +59,7 @@ class TestEdgeScopeDelete:
 
 
 class TestEdgeScopeUpdate:
-    def test_update_properties(self):
+    def test_update_data(self):
         td = MagicMock()
         scope = EdgeScope(td, edge_id=7)
 
@@ -67,12 +67,12 @@ class TestEdgeScopeUpdate:
         td.connection.return_value.__enter__ = MagicMock(return_value=mock_conn)
         td.connection.return_value.__exit__ = MagicMock(return_value=False)
 
-        scope.update(properties={"capacity": 999})
+        scope.update(data={"capacity": 999})
 
         # Should have called execute with UPDATE SQL
         sql = mock_conn.execute.call_args[0][0]
         assert "UPDATE energydb.edge SET" in sql
-        assert "properties = properties ||" in sql
+        assert "data = data ||" in sql
         mock_conn.commit.assert_called_once()
 
 

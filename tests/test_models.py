@@ -11,8 +11,7 @@ class TestNodeModel:
     def test_columns(self):
         col_names = {c.name for c in Node.__table__.columns}
         expected = {
-            "node_id", "node_type", "name", "parent_id", "properties",
-            "latitude", "longitude", "altitude", "timezone",
+            "node_id", "node_type", "name", "parent_id", "data",
             "created_at", "updated_at",
         }
         assert col_names == expected
@@ -33,7 +32,7 @@ class TestNodeModel:
     def test_indexes(self):
         index_names = {idx.name for idx in Node.__table__.indexes}
         assert "ix_node_parent_id" in index_names
-        assert "ix_node_properties_gin" in index_names
+        assert "ix_node_data_gin" in index_names
 
 
 class TestNodeSeriesModel:
@@ -68,7 +67,7 @@ class TestEdgeModel:
         expected = {
             "edge_id", "edge_type", "name",
             "from_node_id", "to_node_id",
-            "properties", "directed", "created_at", "updated_at",
+            "data", "created_at", "updated_at",
         }
         assert col_names == expected
 

@@ -24,7 +24,7 @@ from energydb.client import EnergyDataClient
 
 class TestReExports:
     def test_edm_core_classes_exposed(self):
-        assert edb.Entity is not None
+        assert edb.Element is not None
         assert edb.Node is not None
         assert edb.Edge is not None
         assert edb.Reference is not None
