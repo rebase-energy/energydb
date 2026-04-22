@@ -48,11 +48,7 @@ class Node(Base):
         sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
         nullable=True,
     )
-    properties = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
-    latitude = sa.Column(sa.Float, nullable=True)
-    longitude = sa.Column(sa.Float, nullable=True)
-    altitude = sa.Column(sa.Float, nullable=True)
-    timezone = sa.Column(sa.Text, nullable=True)
+    data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     created_at = sa.Column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )
@@ -73,7 +69,7 @@ class Node(Base):
         # The UNIQUE constraint with NULL parent_id naturally allows duplicates
         # because NULL != NULL in SQL.
         sa.Index("ix_node_parent_id", "parent_id"),
-        sa.Index("ix_node_properties_gin", "properties", postgresql_using="gin"),
+        sa.Index("ix_node_data_gin", "data", postgresql_using="gin"),
         {"schema": "energydb"},
     )
 
@@ -125,8 +121,7 @@ class Edge(Base):
         sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
         nullable=False,
     )
-    properties = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
-    directed = sa.Column(sa.Boolean, nullable=False, server_default=sa.text("true"))
+    data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     created_at = sa.Column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )

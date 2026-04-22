@@ -113,7 +113,7 @@ class NodeScope:
         for key, value in self._find_filters.items():
             if key in ("node_type", "name"):
                 continue
-            conditions.append("properties->>%s = %s")
+            conditions.append("data->>%s = %s")
             params.append(key)
             params.append(str(value))
 
@@ -133,8 +133,7 @@ class NodeScope:
         with self._td.connection() as conn:
             node_id = self._resolve_node_id(conn)
             row = conn.execute(
-                "SELECT node_id, node_type, name, properties, "
-                "latitude, longitude, altitude, timezone "
+                "SELECT node_id, node_type, name, data "
                 "FROM energydb.node WHERE node_id = %s",
                 (node_id,),
             ).fetchone()
@@ -144,11 +143,7 @@ class NodeScope:
                 "node_id": row[0],
                 "node_type": row[1],
                 "name": row[2],
-                "properties": row[3],
-                "latitude": row[4],
-                "longitude": row[5],
-                "altitude": row[6],
-                "timezone": row[7],
+                "data": row[3],
             })
 
     # ------------------------------------------------------------------
@@ -161,19 +156,19 @@ class NodeScope:
             node_id = self._resolve_node_id(conn)
             if type:
                 rows = conn.execute(
-                    "SELECT node_id, node_type, name, properties "
+                    "SELECT node_id, node_type, name, data "
                     "FROM energydb.node WHERE parent_id = %s AND node_type = %s "
                     "ORDER BY name",
                     (node_id, type),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT node_id, node_type, name, properties "
+                    "SELECT node_id, node_type, name, data "
                     "FROM energydb.node WHERE parent_id = %s ORDER BY name",
                     (node_id,),
                 ).fetchall()
             return [
-                {"node_id": r[0], "node_type": r[1], "name": r[2], "properties": r[3]}
+                {"node_id": r[0], "node_type": r[1], "name": r[2], "data": r[3]}
                 for r in rows
             ]
 
@@ -189,7 +184,7 @@ class NodeScope:
                     SELECT n.node_id FROM energydb.node n
                     JOIN subtree s ON n.parent_id = s.node_id
                 )
-                SELECT n.node_id, n.node_type, n.name, n.properties
+                SELECT n.node_id, n.node_type, n.name, n.data
                 FROM energydb.node n
                 JOIN subtree s ON n.node_id = s.node_id
                 WHERE n.node_id != %s
@@ -202,7 +197,7 @@ class NodeScope:
                 rows = [r for r in rows if r[1] == type]
 
             return [
-                {"node_id": r[0], "node_type": r[1], "name": r[2], "properties": r[3]}
+                {"node_id": r[0], "node_type": r[1], "name": r[2], "data": r[3]}
                 for r in rows
             ]
 
@@ -216,23 +211,20 @@ class NodeScope:
         If edm_obj.timeseries contains TimeSeriesDescriptors, they are
         automatically registered after the node is created.
         """
-        data = serialize_node(edm_obj)
+        row_data = serialize_node(edm_obj)
         with self._td.connection() as conn:
             parent_id = self._resolve_node_id(conn)
             row = conn.execute(
                 "INSERT INTO energydb.node "
-                "(node_type, name, parent_id, properties, latitude, longitude, altitude, timezone) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "(node_type, name, parent_id, data) "
+                "VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT ON CONSTRAINT node_child_uniq "
-                "DO UPDATE SET properties = EXCLUDED.properties, "
-                "latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, "
-                "altitude = EXCLUDED.altitude, timezone = EXCLUDED.timezone, "
+                "DO UPDATE SET data = EXCLUDED.data, "
                 "updated_at = now() "
                 "RETURNING node_id",
                 (
-                    data["node_type"], data["name"], parent_id,
-                    data["properties"], data["latitude"], data["longitude"],
-                    data["altitude"], data["timezone"],
+                    row_data["node_type"], row_data["name"], parent_id,
+                    row_data["data"],
                 ),
             ).fetchone()
             conn.commit()
@@ -251,19 +243,25 @@ class NodeScope:
             )
             conn.commit()
 
-    def update(self, *, properties: dict | None = None, **kwargs) -> None:
-        """Update node fields. Pass properties dict and/or individual fields."""
+    def update(self, *, data: dict | None = None, name: str | None = None) -> None:
+        """Update node fields.
+
+        Args:
+            data: Dict merged into the existing ``data`` JSONB via
+                ``||`` — top-level keys overwrite. Pass geometry/tz/
+                domain fields as a single dict.
+            name: New node name.
+        """
         sets = ["updated_at = now()"]
         params: list[Any] = []
 
-        if properties is not None:
-            sets.append("properties = properties || %s")
-            params.append(Jsonb(properties))
+        if data is not None:
+            sets.append("data = data || %s")
+            params.append(Jsonb(data))
 
-        for field in ("latitude", "longitude", "altitude", "timezone", "name"):
-            if field in kwargs:
-                sets.append(f"{field} = %s")
-                params.append(kwargs[field])
+        if name is not None:
+            sets.append("name = %s")
+            params.append(name)
 
         with self._td.connection() as conn:
             node_id = self._resolve_node_id(conn)
@@ -511,23 +509,22 @@ class EdgeScope:
         with self._td.connection() as conn:
             edge_id = self._resolve_edge_id(conn)
             row = conn.execute(
-                "SELECT edge_id, edge_type, name, properties, "
-                "directed, from_node_id, to_node_id "
+                "SELECT edge_id, edge_type, name, data, "
+                "from_node_id, to_node_id "
                 "FROM energydb.edge WHERE edge_id = %s",
                 (edge_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"Edge not found: id={edge_id}")
 
-            from_path = resolve_path(conn, row[5])
-            to_path = resolve_path(conn, row[6])
+            from_path = resolve_path(conn, row[4])
+            to_path = resolve_path(conn, row[5])
 
             return reconstruct_edge({
                 "edge_id": row[0],
                 "edge_type": row[1],
                 "name": row[2],
-                "properties": row[3],
-                "directed": row[4],
+                "data": row[3],
                 "from_node_path": from_path,
                 "to_node_path": to_path,
             })
@@ -564,19 +561,25 @@ class EdgeScope:
     # Terminal: CRUD mutations
     # ------------------------------------------------------------------
 
-    def update(self, *, properties: dict | None = None, **kwargs) -> None:
-        """Update edge fields. Pass properties dict and/or individual fields."""
+    def update(self, *, data: dict | None = None, name: str | None = None) -> None:
+        """Update edge fields.
+
+        Args:
+            data: Dict merged into the existing ``data`` JSONB via ``||``
+                (top-level keys overwrite). Pass ``directed`` or any domain
+                property here.
+            name: New edge name.
+        """
         sets = ["updated_at = now()"]
         params: list[Any] = []
 
-        if properties is not None:
-            sets.append("properties = properties || %s")
-            params.append(Jsonb(properties))
+        if data is not None:
+            sets.append("data = data || %s")
+            params.append(Jsonb(data))
 
-        for field in ("name", "directed"):
-            if field in kwargs:
-                sets.append(f"{field} = %s")
-                params.append(kwargs[field])
+        if name is not None:
+            sets.append("name = %s")
+            params.append(name)
 
         with self._td.connection() as conn:
             edge_id = self._resolve_edge_id(conn)
