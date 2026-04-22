@@ -2,12 +2,14 @@
 
 from energydatamodel import (
     # Core hierarchy
-    Entity,
+    Element,
     Node,
     Edge,
     Reference,
     # Semantic bases
     Asset,
+    NodeAsset,
+    EdgeAsset,
     GridNode,
     Sensor,
     Collection,
@@ -57,6 +59,30 @@ from energydatamodel import (
     RainSensor,
     TemperatureSensor,
     WindSpeedSensor,
+    # Geospatial
+    GeoLocation,
+    GeoMultiPolygon,
+    GeoPolygon,
+    Location,
+    # Powergrid value types
+    Carrier,
+    # Vocabulary constructors
+    cross_border_flow,
+    electricity_demand,
+    electricity_demand_area,
+    electricity_supply,
+    electricity_supply_area,
+    gas_demand,
+    gas_supply,
+    grid_frequency,
+    heating_demand,
+    spot_price,
+    temperature,
+    # Quantities
+    Kind,
+    Quantity,
+    Scope,
+    build_metric,
 )
 from timedatamodel import (
     DataShape,
@@ -76,12 +102,14 @@ __all__ = [
     "NodeScope",
     "EdgeScope",
     # Core hierarchy
-    "Entity",
+    "Element",
     "Node",
     "Edge",
     "Reference",
     # Semantic bases
     "Asset",
+    "NodeAsset",
+    "EdgeAsset",
     "GridNode",
     "Sensor",
     "Collection",
@@ -138,4 +166,28 @@ __all__ = [
     "DataShape",
     "Frequency",
     "TimeSeriesType",
+    # Geospatial
+    "GeoLocation",
+    "GeoMultiPolygon",
+    "GeoPolygon",
+    "Location",
+    # Powergrid value types
+    "Carrier",
+    # Vocabulary constructors
+    "cross_border_flow",
+    "electricity_demand",
+    "electricity_demand_area",
+    "electricity_supply",
+    "electricity_supply_area",
+    "gas_demand",
+    "gas_supply",
+    "grid_frequency",
+    "heating_demand",
+    "spot_price",
+    "temperature",
+    # Quantities
+    "Kind",
+    "Quantity",
+    "Scope",
+    "build_metric",
 ]

@@ -153,20 +153,13 @@ class EnergyDataClient:
                 # Child node — use child uniqueness constraint
                 row = conn.execute(
                     "INSERT INTO node "
-                    "(node_type, name, parent_id, properties, "
-                    "latitude, longitude, altitude, timezone) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                    "(node_type, name, parent_id, data) "
+                    "VALUES (%s, %s, %s, %s) "
                     "ON CONFLICT ON CONSTRAINT node_child_uniq "
-                    "DO UPDATE SET properties = EXCLUDED.properties, "
-                    "latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, "
-                    "altitude = EXCLUDED.altitude, timezone = EXCLUDED.timezone, "
+                    "DO UPDATE SET data = EXCLUDED.data, "
                     "updated_at = now() "
                     "RETURNING node_id",
-                    (
-                        data["node_type"], data["name"], parent_id,
-                        data["properties"], data["latitude"],
-                        data["longitude"], data["altitude"], data["timezone"],
-                    ),
+                    (data["node_type"], data["name"], parent_id, data["data"]),
                 ).fetchone()
             else:
                 # Root node — no unique constraint on roots (multi-tenant),
@@ -180,31 +173,19 @@ class EnergyDataClient:
                 if existing:
                     # Update existing root
                     conn.execute(
-                        "UPDATE node SET properties = %s, "
-                        "latitude = %s, longitude = %s, altitude = %s, "
-                        "timezone = %s, updated_at = now() "
+                        "UPDATE node SET data = %s, updated_at = now() "
                         "WHERE node_id = %s",
-                        (
-                            data["properties"], data["latitude"],
-                            data["longitude"], data["altitude"],
-                            data["timezone"], existing[0],
-                        ),
+                        (data["data"], existing[0]),
                     )
                     conn.commit()
                     node_id = existing[0]
                 else:
                     row = conn.execute(
                         "INSERT INTO node "
-                        "(node_type, name, parent_id, properties, "
-                        "latitude, longitude, altitude, timezone) "
-                        "VALUES (%s, %s, NULL, %s, %s, %s, %s, %s) "
+                        "(node_type, name, parent_id, data) "
+                        "VALUES (%s, %s, NULL, %s) "
                         "RETURNING node_id",
-                        (
-                            data["node_type"], data["name"],
-                            data["properties"], data["latitude"],
-                            data["longitude"], data["altitude"],
-                            data["timezone"],
-                        ),
+                        (data["node_type"], data["name"], data["data"]),
                     ).fetchone()
                     conn.commit()
                     node_id = row[0]
@@ -250,18 +231,17 @@ class EnergyDataClient:
 
             row = conn.execute(
                 "INSERT INTO edge "
-                "(edge_type, name, from_node_id, to_node_id, "
-                "properties, directed) "
-                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "(edge_type, name, from_node_id, to_node_id, data) "
+                "VALUES (%s, %s, %s, %s, %s) "
                 "ON CONFLICT ON CONSTRAINT edge_uniq "
-                "DO UPDATE SET properties = EXCLUDED.properties, "
-                "name = EXCLUDED.name, directed = EXCLUDED.directed, "
+                "DO UPDATE SET data = EXCLUDED.data, "
+                "name = EXCLUDED.name, "
                 "updated_at = now() "
                 "RETURNING edge_id",
                 (
                     data["edge_type"], data["name"],
                     from_id, to_id,
-                    data["properties"], data["directed"],
+                    data["data"],
                 ),
             ).fetchone()
             conn.commit()
@@ -291,15 +271,15 @@ class EnergyDataClient:
 
             if id is not None:
                 row = conn.execute(
-                    "SELECT edge_id, edge_type, name, properties, "
-                    "directed, from_node_id, to_node_id "
+                    "SELECT edge_id, edge_type, name, data, "
+                    "from_node_id, to_node_id "
                     "FROM edge WHERE edge_id = %s",
                     (id,),
                 ).fetchone()
             elif name is not None:
                 rows = conn.execute(
-                    "SELECT edge_id, edge_type, name, properties, "
-                    "directed, from_node_id, to_node_id "
+                    "SELECT edge_id, edge_type, name, data, "
+                    "from_node_id, to_node_id "
                     "FROM edge WHERE name = %s",
                     (name,),
                 ).fetchall()
@@ -319,15 +299,14 @@ class EnergyDataClient:
                 raise ValueError(f"Edge not found: id={id}")
 
             # Resolve from/to node paths
-            from_path = resolve_path(conn, row[5])
-            to_path = resolve_path(conn, row[6])
+            from_path = resolve_path(conn, row[4])
+            to_path = resolve_path(conn, row[5])
 
             return reconstruct_edge({
                 "edge_id": row[0],
                 "edge_type": row[1],
                 "name": row[2],
-                "properties": row[3],
-                "directed": row[4],
+                "data": row[3],
                 "from_node_path": from_path,
                 "to_node_path": to_path,
             })
@@ -370,21 +349,21 @@ class EnergyDataClient:
                 params.append(type)
 
             for key, value in property_filters.items():
-                conditions.append("properties->>%s = %s")
+                conditions.append("data->>%s = %s")
                 params.append(key)
                 params.append(str(value))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
-                f"SELECT edge_id, edge_type, name, properties, "
-                f"directed, from_node_id, to_node_id "
+                f"SELECT edge_id, edge_type, name, data, "
+                f"from_node_id, to_node_id "
                 f"FROM edge WHERE {where} ORDER BY name",
                 params,
             ).fetchall()
 
             # Resolve all node paths in bulk
             all_node_ids = list(
-                set(r[5] for r in rows) | set(r[6] for r in rows)
+                set(r[4] for r in rows) | set(r[5] for r in rows)
             )
             paths = resolve_paths_bulk(conn, all_node_ids)
 
@@ -393,10 +372,9 @@ class EnergyDataClient:
                     "edge_id": r[0],
                     "edge_type": r[1],
                     "name": r[2],
-                    "properties": r[3],
-                    "directed": r[4],
-                    "from_node_path": paths.get(r[5], ""),
-                    "to_node_path": paths.get(r[6], ""),
+                    "data": r[3],
+                    "from_node_path": paths.get(r[4], ""),
+                    "to_node_path": paths.get(r[5], ""),
                 })
                 for r in rows
             ]
@@ -417,15 +395,13 @@ class EnergyDataClient:
 
             if id is not None:
                 row = conn.execute(
-                    "SELECT node_id, node_type, name, properties, "
-                    "latitude, longitude, altitude, timezone "
+                    "SELECT node_id, node_type, name, data "
                     "FROM node WHERE node_id = %s",
                     (id,),
                 ).fetchone()
             elif name is not None:
                 rows = conn.execute(
-                    "SELECT node_id, node_type, name, properties, "
-                    "latitude, longitude, altitude, timezone "
+                    "SELECT node_id, node_type, name, data "
                     "FROM node WHERE name = %s",
                     (name,),
                 ).fetchall()
@@ -475,12 +451,10 @@ class EnergyDataClient:
             rows = conn.execute(
                 """
                 WITH RECURSIVE subtree AS (
-                    SELECT node_id, node_type, name, properties, parent_id,
-                           latitude, longitude, altitude, timezone
+                    SELECT node_id, node_type, name, data, parent_id
                     FROM node WHERE node_id = %s
                     UNION ALL
-                    SELECT n.node_id, n.node_type, n.name, n.properties, n.parent_id,
-                           n.latitude, n.longitude, n.altitude, n.timezone
+                    SELECT n.node_id, n.node_type, n.name, n.data, n.parent_id
                     FROM node n JOIN subtree s ON n.parent_id = s.node_id
                 )
                 SELECT * FROM subtree
@@ -494,7 +468,7 @@ class EnergyDataClient:
             for r in rows:
                 node_id = r[0]
                 parent_map[node_id] = r[4]  # parent_id
-                nodes[node_id] = reconstruct_node(_row_to_dict_full(r))
+                nodes[node_id] = reconstruct_node(_row_to_dict(r))
 
             # Optionally attach series descriptors
             if include_series:
@@ -569,14 +543,13 @@ class EnergyDataClient:
                 params.append(type)
 
             for key, value in property_filters.items():
-                conditions.append("properties->>%s = %s")
+                conditions.append("data->>%s = %s")
                 params.append(key)
                 params.append(str(value))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
-                f"SELECT node_id, node_type, name, properties, "
-                f"latitude, longitude, altitude, timezone "
+                f"SELECT node_id, node_type, name, data "
                 f"FROM node WHERE {where} ORDER BY name",
                 params,
             ).fetchall()
@@ -735,31 +708,16 @@ class EnergyDataClient:
 
 
 def _row_to_dict(row) -> dict[str, Any]:
-    """Convert a (node_id, node_type, name, properties, lat, lon, alt, tz) tuple."""
+    """Convert a ``(node_id, node_type, name, data, ...)`` tuple to a dict.
+
+    Extra trailing elements (e.g. ``parent_id`` in the subtree CTE) are
+    ignored — :func:`reconstruct_node` only reads the named keys.
+    """
     return {
         "node_id": row[0],
         "node_type": row[1],
         "name": row[2],
-        "properties": row[3],
-        "latitude": row[4],
-        "longitude": row[5],
-        "altitude": row[6],
-        "timezone": row[7],
-    }
-
-
-def _row_to_dict_full(row) -> dict[str, Any]:
-    """Convert a subtree CTE row (node_id, type, name, props, parent_id, lat, lon, alt, tz)."""
-    return {
-        "node_id": row[0],
-        "node_type": row[1],
-        "name": row[2],
-        "properties": row[3],
-        # row[4] is parent_id — not needed for reconstruction
-        "latitude": row[5],
-        "longitude": row[6],
-        "altitude": row[7],
-        "timezone": row[8],
+        "data": row[3],
     }
 
 
@@ -789,7 +747,7 @@ def _resolve_node_ref(
         target = ref.target
         if isinstance(target, str):
             return _resolve_name_or_path(conn, target)
-        # Resolved Entity — look up by name
+        # Resolved Element — look up by name
         name = getattr(target, "name", None)
         if name is None:
             raise ValueError(f"Cannot resolve {attr}: Reference target has no name")
