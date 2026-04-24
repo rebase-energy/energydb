@@ -16,7 +16,6 @@ from energydatamodel.json_io import get_registry
 from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
 
-
 _EDGE_EXCLUDES = {"from_entity", "to_entity"}  # stored as FK columns
 
 
@@ -59,9 +58,7 @@ def reconstruct_node(row: dict[str, Any]):
     if cls is None:
         raise ValueError(f"Unknown node type: {node_type}")
     if not issubclass(cls, (edm.Node, edm.Collection)):
-        raise TypeError(
-            f"node table row has type {node_type} which is not a Node or Collection subclass"
-        )
+        raise TypeError(f"node table row has type {node_type} which is not a Node or Collection subclass")
 
     data = dict(row.get("data") or {})
     data["__type__"] = node_type
@@ -104,9 +101,7 @@ def reconstruct_edge(row: dict[str, Any]):
     if cls is None:
         raise ValueError(f"Unknown edge type: {edge_type}")
     if not issubclass(cls, edm.Edge):
-        raise TypeError(
-            f"edge table row has type {edge_type} which is not an Edge subclass"
-        )
+        raise TypeError(f"edge table row has type {edge_type} which is not an Edge subclass")
 
     data = dict(row.get("data") or {})
     data["__type__"] = edge_type

@@ -1,71 +1,76 @@
 """EnergyDB — Energy database extending TimeDB with hierarchical asset management."""
 
 from energydatamodel import (
-    # Core hierarchy
-    Element,
-    Node,
-    Edge,
-    Reference,
+    Area,
     # Semantic bases
     Asset,
-    NodeAsset,
-    EdgeAsset,
-    GridNode,
-    Sensor,
-    Collection,
-    Area,
     # Assets
     Battery,
-    Building,
-    House,
-    HeatPump,
-    HydroPowerPlant,
-    HydroTurbine,
-    Reservoir,
-    PVSystem,
-    PVArray,
-    SolarPowerArea,
-    WindFarm,
-    WindTurbine,
-    WindPowerArea,
-    # Grid nodes
-    JunctionPoint,
-    Meter,
-    DeliveryPoint,
-    # Edges
-    Interconnection,
-    Line,
-    Link,
-    Pipe,
-    Transformer,
     # Areas
     BiddingZone,
+    Building,
+    # Powergrid value types
+    Carrier,
+    Collection,
     ControlArea,
     Country,
-    SynchronousArea,
-    WeatherCell,
+    DeliveryPoint,
+    Edge,
+    EdgeAsset,
+    # Core hierarchy
+    Element,
     # Containers
     EnergyCommunity,
-    MultiSite,
-    Portfolio,
-    Region,
-    Site,
-    VirtualPowerPlant,
-    SubNetwork,
-    Network,
-    # Sensors
-    HumiditySensor,
-    RadiationSensor,
-    RainSensor,
-    TemperatureSensor,
-    WindSpeedSensor,
     # Geospatial
     GeoLocation,
     GeoMultiPolygon,
     GeoPolygon,
+    GridNode,
+    HeatPump,
+    House,
+    # Sensors
+    HumiditySensor,
+    HydroPowerPlant,
+    HydroTurbine,
+    # Edges
+    Interconnection,
+    # Grid nodes
+    JunctionPoint,
+    # Quantities
+    Kind,
+    Line,
+    Link,
     Location,
-    # Powergrid value types
-    Carrier,
+    Meter,
+    MultiSite,
+    Network,
+    Node,
+    NodeAsset,
+    Pipe,
+    Portfolio,
+    PVArray,
+    PVSystem,
+    Quantity,
+    RadiationSensor,
+    RainSensor,
+    Reference,
+    Region,
+    Reservoir,
+    Scope,
+    Sensor,
+    Site,
+    SolarPowerArea,
+    SubNetwork,
+    SynchronousArea,
+    TemperatureSensor,
+    Transformer,
+    VirtualPowerPlant,
+    WeatherCell,
+    WindFarm,
+    WindPowerArea,
+    WindSpeedSensor,
+    WindTurbine,
+    build_metric,
     # Vocabulary constructors
     cross_border_flow,
     electricity_demand,
@@ -78,11 +83,6 @@ from energydatamodel import (
     heating_demand,
     spot_price,
     temperature,
-    # Quantities
-    Kind,
-    Quantity,
-    Scope,
-    build_metric,
 )
 from timedatamodel import (
     DataShape,
@@ -93,12 +93,14 @@ from timedatamodel import (
     TimeSeriesType,
 )
 
-from energydb.client import EnergyDataClient
+from energydb.client import EnergyDBClient
 from energydb.scope import EdgeScope, NodeScope
+from energydb.units import IncompatibleUnitError
 
 __all__ = [
     # Client
-    "EnergyDataClient",
+    "EnergyDBClient",
+    "IncompatibleUnitError",
     "NodeScope",
     "EdgeScope",
     # Core hierarchy

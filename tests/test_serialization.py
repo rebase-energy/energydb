@@ -8,12 +8,9 @@ Row shape: ``{"node_type": str, "name": str, "data": dict}`` for nodes (plus
 from datetime import date
 from zoneinfo import ZoneInfo
 
-import pytest
-from shapely.geometry import Point, Polygon
-
 import energydatamodel as edm
+import pytest
 from energydatamodel.reference import Reference
-
 from energydb.serialization import (
     _type_registry,
     reconstruct_edge,
@@ -21,6 +18,7 @@ from energydb.serialization import (
     serialize_edge,
     serialize_node,
 )
+from shapely.geometry import Point, Polygon
 
 
 def _node_row(serialized: dict) -> dict:
@@ -46,16 +44,32 @@ class TestTypeRegistry:
     def test_all_common_types_present(self):
         type_map = _type_registry()
         expected = [
-            "Portfolio", "Site", "EnergyCommunity",
-            "WindTurbine", "WindFarm", "PVSystem", "SolarPowerArea",
-            "Battery", "HydroPowerPlant", "HeatPump", "PVArray",
-            "Building", "House",
+            "Portfolio",
+            "Site",
+            "EnergyCommunity",
+            "WindTurbine",
+            "WindFarm",
+            "PVSystem",
+            "SolarPowerArea",
+            "Battery",
+            "HydroPowerPlant",
+            "HeatPump",
+            "PVArray",
+            "Building",
+            "House",
             # Areas:
-            "BiddingZone", "SynchronousArea", "Country",
+            "BiddingZone",
+            "SynchronousArea",
+            "Country",
             # Grid nodes:
-            "JunctionPoint", "Meter", "Interconnection",
+            "JunctionPoint",
+            "Meter",
+            "Interconnection",
             # Edges:
-            "Line", "Link", "Transformer", "Pipe",
+            "Line",
+            "Link",
+            "Transformer",
+            "Pipe",
         ]
         for t in expected:
             assert t in type_map, f"Missing type: {t}"
@@ -68,7 +82,9 @@ class TestTypeRegistry:
 class TestSerializeNode:
     def test_wind_turbine(self):
         t = edm.WindTurbine(
-            name="T01", capacity=3.5, hub_height=80,
+            name="T01",
+            capacity=3.5,
+            hub_height=80,
             geometry=Point(3.0, 55.0),
         )
         row = serialize_node(t)
@@ -132,7 +148,8 @@ class TestReconstructNode:
             "node_type": "WindTurbine",
             "name": "T01",
             "data": {
-                "capacity": 3.5, "hub_height": 80,
+                "capacity": 3.5,
+                "hub_height": 80,
                 "geometry": {"__geometry__": True, "type": "Point", "coordinates": [3.0, 55.0]},
             },
         }
@@ -190,15 +207,18 @@ class TestReconstructNode:
 class TestSerializeReconstructRoundTrip:
     """Verify that serialize → reconstruct preserves the essential data."""
 
-    @pytest.mark.parametrize("edm_obj", [
-        edm.WindTurbine(name="T01", capacity=3.5, hub_height=80),
-        edm.Battery(name="B01", storage_capacity=100),
-        edm.HeatPump(name="HP01", capacity=10, cop=3.0, energy_source="air"),
-        edm.Portfolio(name="Europe"),
-        edm.Site(name="Sweden", geometry=Point(13.0, 55.0)),
-        edm.BiddingZone(name="SE-SE1"),
-        edm.SynchronousArea(name="NSA", nominal_frequency=50.0),
-    ])
+    @pytest.mark.parametrize(
+        "edm_obj",
+        [
+            edm.WindTurbine(name="T01", capacity=3.5, hub_height=80),
+            edm.Battery(name="B01", storage_capacity=100),
+            edm.HeatPump(name="HP01", capacity=10, cop=3.0, energy_source="air"),
+            edm.Portfolio(name="Europe"),
+            edm.Site(name="Sweden", geometry=Point(13.0, 55.0)),
+            edm.BiddingZone(name="SE-SE1"),
+            edm.SynchronousArea(name="NSA", nominal_frequency=50.0),
+        ],
+    )
     def test_round_trip(self, edm_obj):
         reconstructed = reconstruct_node(_node_row(serialize_node(edm_obj)))
         assert type(reconstructed).__name__ == type(edm_obj).__name__
@@ -284,13 +304,16 @@ class TestReconstructEdge:
 
 
 class TestEdgeRoundTrip:
-    @pytest.mark.parametrize("edm_obj", [
-        edm.Line(name="L1", capacity=500),
-        edm.Link(name="LK1", capacity=100),
-        edm.Transformer(name="T1", capacity=200),
-        edm.Pipe(name="P1", capacity=300, medium="gas"),
-        edm.Interconnection(name="IC1", capacity_forward=1000, capacity_backward=500),
-    ])
+    @pytest.mark.parametrize(
+        "edm_obj",
+        [
+            edm.Line(name="L1", capacity=500),
+            edm.Link(name="LK1", capacity=100),
+            edm.Transformer(name="T1", capacity=200),
+            edm.Pipe(name="P1", capacity=300, medium="gas"),
+            edm.Interconnection(name="IC1", capacity_forward=1000, capacity_backward=500),
+        ],
+    )
     def test_round_trip(self, edm_obj):
         row = _edge_row(serialize_edge(edm_obj), from_path="A/B", to_path="C/D")
         reconstructed = reconstruct_edge(row)
@@ -372,9 +395,7 @@ def _roundtrip_tree(root):
         to_ref = edge.to_entity
         from_path = from_ref.target if isinstance(from_ref, Reference) else from_ref
         to_path = to_ref.target if isinstance(to_ref, Reference) else to_ref
-        new_edge = reconstruct_edge(
-            _edge_row(serialize_edge(edge), from_path=from_path, to_path=to_path)
-        )
+        new_edge = reconstruct_edge(_edge_row(serialize_edge(edge), from_path=from_path, to_path=to_path))
         rebuilt[id(parent)].add_child(new_edge)
 
     return rebuilt_root
@@ -384,19 +405,32 @@ class TestComplexTreeRoundTrip:
     """End-to-end tree round-trip: serialize → reconstruct → add_child."""
 
     def test_portfolio_with_sites_and_assets(self):
-        original = edm.Portfolio(name="Europe", members=[
-            edm.Site(name="Offshore-1", geometry=Point(3.0, 55.0), members=[
-                edm.WindTurbine(name="T01", capacity=3.5, hub_height=80),
-                edm.WindTurbine(name="T02", capacity=3.5, hub_height=90),
-            ]),
-            edm.Site(name="Rooftop-1", geometry=Point(4.5, 52.0), members=[
-                edm.PVSystem(
-                    name="PV01", capacity=10,
-                    surface_tilt=25, surface_azimuth=180,
+        original = edm.Portfolio(
+            name="Europe",
+            members=[
+                edm.Site(
+                    name="Offshore-1",
+                    geometry=Point(3.0, 55.0),
+                    members=[
+                        edm.WindTurbine(name="T01", capacity=3.5, hub_height=80),
+                        edm.WindTurbine(name="T02", capacity=3.5, hub_height=90),
+                    ],
                 ),
-                edm.Battery(name="B01", storage_capacity=100),
-            ]),
-        ])
+                edm.Site(
+                    name="Rooftop-1",
+                    geometry=Point(4.5, 52.0),
+                    members=[
+                        edm.PVSystem(
+                            name="PV01",
+                            capacity=10,
+                            surface_tilt=25,
+                            surface_azimuth=180,
+                        ),
+                        edm.Battery(name="B01", storage_capacity=100),
+                    ],
+                ),
+            ],
+        )
 
         rebuilt = _roundtrip_tree(original)
 
@@ -421,11 +455,15 @@ class TestComplexTreeRoundTrip:
         assert site2.members[1].storage_capacity == 100
 
     def test_windfarm_with_nested_turbines(self):
-        original = edm.WindFarm(name="Lillgrund", capacity=110, members=[
-            edm.WindTurbine(name="T01", capacity=2.3),
-            edm.WindTurbine(name="T02", capacity=2.3),
-            edm.WindTurbine(name="T03", capacity=2.3),
-        ])
+        original = edm.WindFarm(
+            name="Lillgrund",
+            capacity=110,
+            members=[
+                edm.WindTurbine(name="T01", capacity=2.3),
+                edm.WindTurbine(name="T02", capacity=2.3),
+                edm.WindTurbine(name="T03", capacity=2.3),
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         assert isinstance(rebuilt, edm.WindFarm)
@@ -436,21 +474,33 @@ class TestComplexTreeRoundTrip:
             assert t.capacity == 2.3
 
     def test_mixed_collection_and_node_children(self):
-        original = edm.Portfolio(name="Nordic", members=[
-            edm.BiddingZone(name="SE4"),
-            edm.SynchronousArea(name="Nordic-Sync", nominal_frequency=50.0),
-            edm.Site(name="Lillgrund-Site", members=[
-                edm.WindFarm(name="Lillgrund", capacity=110, members=[
-                    edm.WindTurbine(name="T01", capacity=2.3),
-                ]),
-                edm.TemperatureSensor(name="TempSensor-1", height=10),
-            ]),
-        ])
+        original = edm.Portfolio(
+            name="Nordic",
+            members=[
+                edm.BiddingZone(name="SE4"),
+                edm.SynchronousArea(name="Nordic-Sync", nominal_frequency=50.0),
+                edm.Site(
+                    name="Lillgrund-Site",
+                    members=[
+                        edm.WindFarm(
+                            name="Lillgrund",
+                            capacity=110,
+                            members=[
+                                edm.WindTurbine(name="T01", capacity=2.3),
+                            ],
+                        ),
+                        edm.TemperatureSensor(name="TempSensor-1", height=10),
+                    ],
+                ),
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         assert isinstance(rebuilt, edm.Portfolio)
         assert [type(m).__name__ for m in rebuilt.members] == [
-            "BiddingZone", "SynchronousArea", "Site",
+            "BiddingZone",
+            "SynchronousArea",
+            "Site",
         ]
         sync_area = rebuilt.members[1]
         assert sync_area.nominal_frequency == 50.0
@@ -469,13 +519,17 @@ class TestComplexTreeRoundTrip:
         bus_a = edm.JunctionPoint(name="BusA")
         bus_b = edm.JunctionPoint(name="BusB")
         line = edm.Line(
-            name="Cable-1", capacity=500,
+            name="Cable-1",
+            capacity=500,
             from_entity=Reference("Europe/Offshore-1/BusA"),
             to_entity=Reference("Europe/Offshore-1/BusB"),
         )
-        original = edm.Portfolio(name="Europe", members=[
-            edm.Site(name="Offshore-1", members=[bus_a, bus_b, line]),
-        ])
+        original = edm.Portfolio(
+            name="Europe",
+            members=[
+                edm.Site(name="Offshore-1", members=[bus_a, bus_b, line]),
+            ],
+        )
 
         rebuilt = _roundtrip_tree(original)
 
@@ -492,10 +546,13 @@ class TestComplexTreeRoundTrip:
 
     def test_geometry_round_trip(self):
         """Point geometries (2D + 3D) survive GeoJSON round-trip."""
-        original = edm.Portfolio(name="Europe", members=[
-            edm.Site(name="A", geometry=Point(10.0, 60.0)),
-            edm.Site(name="B", geometry=Point(11.0, 61.0, 50.0)),  # 3D
-        ])
+        original = edm.Portfolio(
+            name="Europe",
+            members=[
+                edm.Site(name="A", geometry=Point(10.0, 60.0)),
+                edm.Site(name="B", geometry=Point(11.0, 61.0, 50.0)),  # 3D
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         a, b = rebuilt.members
@@ -505,16 +562,28 @@ class TestComplexTreeRoundTrip:
         assert b.geometry.z == 50.0
 
     def test_to_properties_preserved_for_every_node(self):
-        original = edm.Portfolio(name="Europe", members=[
-            edm.Site(name="Offshore-1", members=[
-                edm.WindTurbine(
-                    name="T01", capacity=3.5, hub_height=80, rotor_diameter=120,
+        original = edm.Portfolio(
+            name="Europe",
+            members=[
+                edm.Site(
+                    name="Offshore-1",
+                    members=[
+                        edm.WindTurbine(
+                            name="T01",
+                            capacity=3.5,
+                            hub_height=80,
+                            rotor_diameter=120,
+                        ),
+                        edm.Battery(
+                            name="B01",
+                            storage_capacity=1000,
+                            max_charge=500,
+                            max_discharge=500,
+                        ),
+                    ],
                 ),
-                edm.Battery(
-                    name="B01", storage_capacity=1000, max_charge=500, max_discharge=500,
-                ),
-            ]),
-        ])
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         def flatten(obj, out):
@@ -539,18 +608,34 @@ class TestComplexTreeRoundTrip:
     # ------------------------------------------------------------------
 
     def test_deeply_nested_tree(self):
-        original = edm.Portfolio(name="Global", members=[
-            edm.Country(name="SE", members=[
-                edm.BiddingZone(name="SE3", members=[
-                    edm.Site(name="LillgrundSite", members=[
-                        edm.WindFarm(name="Lillgrund", capacity=110, members=[
-                            edm.WindTurbine(name="T01", capacity=2.3, hub_height=65),
-                            edm.WindTurbine(name="T02", capacity=2.3, hub_height=65),
-                        ]),
-                    ]),
-                ]),
-            ]),
-        ])
+        original = edm.Portfolio(
+            name="Global",
+            members=[
+                edm.Country(
+                    name="SE",
+                    members=[
+                        edm.BiddingZone(
+                            name="SE3",
+                            members=[
+                                edm.Site(
+                                    name="LillgrundSite",
+                                    members=[
+                                        edm.WindFarm(
+                                            name="Lillgrund",
+                                            capacity=110,
+                                            members=[
+                                                edm.WindTurbine(name="T01", capacity=2.3, hub_height=65),
+                                                edm.WindTurbine(name="T02", capacity=2.3, hub_height=65),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         country = rebuilt.members[0]
@@ -570,22 +655,31 @@ class TestComplexTreeRoundTrip:
         c = edm.JunctionPoint(name="C")
         d = edm.JunctionPoint(name="D")
         line = edm.Line(
-            name="AB-Line", capacity=500, directed=True,
+            name="AB-Line",
+            capacity=500,
+            directed=True,
             from_entity=Reference("Grid/A"),
             to_entity=Reference("Grid/B"),
         )
         link = edm.Link(
-            name="BC-Link", capacity=100, directed=False,
+            name="BC-Link",
+            capacity=100,
+            directed=False,
             from_entity=Reference("Grid/B"),
             to_entity=Reference("Grid/C"),
         )
         trafo = edm.Transformer(
-            name="CD-Tx", capacity=200, directed=True,
+            name="CD-Tx",
+            capacity=200,
+            directed=True,
             from_entity=Reference("Grid/C"),
             to_entity=Reference("Grid/D"),
         )
         pipe = edm.Pipe(
-            name="AD-Pipe", capacity=300, medium="gas", directed=True,
+            name="AD-Pipe",
+            capacity=300,
+            medium="gas",
+            directed=True,
             from_entity=Reference("Grid/A"),
             to_entity=Reference("Grid/D"),
         )
@@ -605,17 +699,24 @@ class TestComplexTreeRoundTrip:
         assert by_name["AD-Pipe"].medium == "gas"
 
     def test_edges_across_subtrees(self):
-        original = edm.Portfolio(name="Nordic", members=[
-            edm.Site(name="SiteA", members=[edm.JunctionPoint(name="BusA")]),
-            edm.Site(name="SiteB", members=[
-                edm.JunctionPoint(name="BusB"),
-                edm.Line(
-                    name="CrossLink", capacity=800,
-                    from_entity=Reference("Nordic/SiteA/BusA"),
-                    to_entity=Reference("Nordic/SiteB/BusB"),
+        original = edm.Portfolio(
+            name="Nordic",
+            members=[
+                edm.Site(name="SiteA", members=[edm.JunctionPoint(name="BusA")]),
+                edm.Site(
+                    name="SiteB",
+                    members=[
+                        edm.JunctionPoint(name="BusB"),
+                        edm.Line(
+                            name="CrossLink",
+                            capacity=800,
+                            from_entity=Reference("Nordic/SiteA/BusA"),
+                            to_entity=Reference("Nordic/SiteB/BusB"),
+                        ),
+                    ],
                 ),
-            ]),
-        ])
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         site_b = rebuilt.members[1]
@@ -625,15 +726,26 @@ class TestComplexTreeRoundTrip:
         assert line.capacity == 800
 
     def test_energy_community_buildings_houses(self):
-        original = edm.EnergyCommunity(name="EC-1", members=[
-            edm.Building(name="BuildingA", type="commercial", members=[
-                edm.House(name="Unit-1", type="apartment", members=[
-                    edm.HeatPump(name="HP1", capacity=10, cop=3.5, energy_source="air"),
-                    edm.PVArray(name="PVA1", capacity=5, surface_tilt=30),
-                    edm.Battery(name="Bat1", storage_capacity=20),
-                ]),
-            ]),
-        ])
+        original = edm.EnergyCommunity(
+            name="EC-1",
+            members=[
+                edm.Building(
+                    name="BuildingA",
+                    type="commercial",
+                    members=[
+                        edm.House(
+                            name="Unit-1",
+                            type="apartment",
+                            members=[
+                                edm.HeatPump(name="HP1", capacity=10, cop=3.5, energy_source="air"),
+                                edm.PVArray(name="PVA1", capacity=5, surface_tilt=30),
+                                edm.Battery(name="Bat1", storage_capacity=20),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         assert isinstance(rebuilt, edm.EnergyCommunity)
@@ -650,15 +762,20 @@ class TestComplexTreeRoundTrip:
         assert bat.storage_capacity == 20
 
     def test_interconnection_between_countries(self):
-        original = edm.Portfolio(name="EU", members=[
-            edm.Country(name="DE"),
-            edm.Country(name="FR"),
-            edm.Interconnection(
-                name="DE-FR", capacity_forward=1500, capacity_backward=1200,
-                from_entity=Reference("EU/DE"),
-                to_entity=Reference("EU/FR"),
-            ),
-        ])
+        original = edm.Portfolio(
+            name="EU",
+            members=[
+                edm.Country(name="DE"),
+                edm.Country(name="FR"),
+                edm.Interconnection(
+                    name="DE-FR",
+                    capacity_forward=1500,
+                    capacity_backward=1200,
+                    from_entity=Reference("EU/DE"),
+                    to_entity=Reference("EU/FR"),
+                ),
+            ],
+        )
         rebuilt = _roundtrip_tree(original)
 
         ic = next(c for c in rebuilt.children() if isinstance(c, edm.Interconnection))
@@ -668,12 +785,19 @@ class TestComplexTreeRoundTrip:
         assert ic.to_entity.target == "EU/FR"
 
     def test_round_trip_idempotence(self):
-        tree = edm.Portfolio(name="Europe", members=[
-            edm.Site(name="Offshore-1", geometry=Point(3.0, 55.0), members=[
-                edm.WindTurbine(name="T01", capacity=3.5, hub_height=80),
-                edm.Battery(name="B01", storage_capacity=100, max_charge=50),
-            ]),
-        ])
+        tree = edm.Portfolio(
+            name="Europe",
+            members=[
+                edm.Site(
+                    name="Offshore-1",
+                    geometry=Point(3.0, 55.0),
+                    members=[
+                        edm.WindTurbine(name="T01", capacity=3.5, hub_height=80),
+                        edm.Battery(name="B01", storage_capacity=100, max_charge=50),
+                    ],
+                ),
+            ],
+        )
 
         def all_nodes(obj, out):
             out.append(obj)
@@ -705,9 +829,12 @@ class TestComplexTreeRoundTrip:
         line = edm.Line(name="Cable", capacity=400)
         line.from_entity = a
         line.to_entity = b
-        original = edm.Portfolio(name="EU", members=[
-            edm.Site(name="Offshore", members=[a, b, line]),
-        ])
+        original = edm.Portfolio(
+            name="EU",
+            members=[
+                edm.Site(name="Offshore", members=[a, b, line]),
+            ],
+        )
 
         path_map = _build_path_map(original)
         assert path_map[id(a)] == "EU/Offshore/BusA"
@@ -762,7 +889,9 @@ class TestPreviouslyDroppedFields:
 
     def test_commissioning_date(self):
         t = edm.WindTurbine(
-            name="T01", capacity=3.5, commissioning_date=date(2020, 1, 15),
+            name="T01",
+            capacity=3.5,
+            commissioning_date=date(2020, 1, 15),
         )
         rebuilt = reconstruct_node(_node_row(serialize_node(t)))
         assert rebuilt.commissioning_date == date(2020, 1, 15)
@@ -786,9 +915,15 @@ class TestPreviouslyDroppedFields:
 
 
 _ABSTRACT_OR_UNION = {
-    "Node", "Edge", "Collection",
-    "Area", "Asset", "EdgeAsset", "NodeAsset",
-    "GridNode", "Sensor",
+    "Node",
+    "Edge",
+    "Collection",
+    "Area",
+    "Asset",
+    "EdgeAsset",
+    "NodeAsset",
+    "GridNode",
+    "Sensor",
 }
 
 
@@ -798,11 +933,16 @@ def _concrete_classes(kind: str):
     for name, cls in sorted(registry.items()):
         if name in _ABSTRACT_OR_UNION:
             continue
-        if kind == "edge" and issubclass(cls, edm.Edge):
-            out.append((name, cls))
-        elif kind == "collection" and issubclass(cls, edm.Collection) and not issubclass(cls, edm.Edge):
-            out.append((name, cls))
-        elif kind == "node" and issubclass(cls, edm.Node) and not issubclass(cls, edm.Edge):
+        if (
+            kind == "edge"
+            and issubclass(cls, edm.Edge)
+            or kind == "collection"
+            and issubclass(cls, edm.Collection)
+            and not issubclass(cls, edm.Edge)
+            or kind == "node"
+            and issubclass(cls, edm.Node)
+            and not issubclass(cls, edm.Edge)
+        ):
             out.append((name, cls))
     return out
 

@@ -1,16 +1,21 @@
 [project]
 name = "energydb"
-version = "0.2.0"
-description = "Energy database extending TimeDB with hierarchical asset management"
+version = "0.3.0"
+description = "Energy database: hierarchy + series metadata on Postgres, bitemporal I/O via timedb"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "timedb>=0.1.4",
+    "timedb>=0.2.0",
     "energydatamodel>=0.0.3",
     "psycopg[binary]>=3.1",
+    "psycopg_pool>=3.1",
     "sqlalchemy>=2.0",
     "polars>=1.0",
+    "pint>=0.23",
 ]
+
+[tool.setuptools.package-data]
+energydb = ["sql/*.sql"]
 
 [project.optional-dependencies]
 docs = [

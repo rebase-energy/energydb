@@ -1,16 +1,6 @@
-"""
-SQLAlchemy declarative models for EnergyDB PostgreSQL tables.
+"""SQLAlchemy declarative models for EnergyDB PostgreSQL tables."""
 
-All tables live in the ``energydb`` Postgres schema. Cross-schema FK
-references point to ``series.series_id`` (in the public schema).
-
-Usage in an Alembic-managed monorepo::
-
-    from energydb.models import Base as EnergyDBBase
-    from timedb.models import Base as TimeDBBase
-
-    target_metadata = [TimeDBBase.metadata, EnergyDBBase.metadata]
-"""
+from typing import cast
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -21,23 +11,7 @@ class Base(DeclarativeBase):
     pass
 
 
-# Proxy: register public.series in this MetaData so cross-schema FKs resolve.
-# Only declares the PK — the real table is created by timedb.
-_series_proxy = sa.Table(
-    "series",
-    Base.metadata,
-    sa.Column("series_id", sa.BigInteger, primary_key=True),
-)
-
-
-# ---------------------------------------------------------------------------
-# Operational tables
-# ---------------------------------------------------------------------------
-
-
 class Node(Base):
-    """Any node in the hierarchy — Portfolio, Site, WindFarm, WindTurbine, etc."""
-
     __tablename__ = "node"
 
     node_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
@@ -49,63 +23,21 @@ class Node(Base):
         nullable=True,
     )
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
-    created_at = sa.Column(
-        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
-    )
-    updated_at = sa.Column(
-        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
-    )
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
-    # Self-referential relationship
     parent = relationship("Node", remote_side=[node_id], back_populates="children_rel")
-    children_rel = relationship(
-        "Node", back_populates="parent", cascade="all, delete-orphan"
-    )
+    children_rel = relationship("Node", back_populates="parent", cascade="all, delete-orphan")
 
     __table_args__ = (
-        # Two children of the same parent can't share (name, type)
         sa.UniqueConstraint("name", "node_type", "parent_id", name="node_child_uniq"),
-        # No uniqueness on root names — platform handles multi-tenant scoping.
-        # The UNIQUE constraint with NULL parent_id naturally allows duplicates
-        # because NULL != NULL in SQL.
         sa.Index("ix_node_parent_id", "parent_id"),
         sa.Index("ix_node_data_gin", "data", postgresql_using="gin"),
         {"schema": "energydb"},
     )
 
 
-class NodeSeries(Base):
-    """Links a node to a timedb series."""
-
-    __tablename__ = "node_series"
-
-    node_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    series_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("series.series_id"),
-        primary_key=True,
-    )
-    data_type = sa.Column(sa.Text, nullable=False)
-    name = sa.Column(sa.Text, nullable=False)
-
-    __table_args__ = (
-        sa.Index("ix_node_series_series_id", "series_id"),
-        {"schema": "energydb"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Edge tables
-# ---------------------------------------------------------------------------
-
-
 class Edge(Base):
-    """Typed edge between two nodes (grid topology, power flow, etc.)."""
-
     __tablename__ = "edge"
 
     edge_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
@@ -122,50 +54,54 @@ class Edge(Base):
         nullable=False,
     )
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
-    created_at = sa.Column(
-        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
-    )
-    updated_at = sa.Column(
-        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
-    )
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
-        sa.UniqueConstraint(
-            "edge_type", "from_node_id", "to_node_id", name="edge_uniq"
-        ),
+        sa.UniqueConstraint("edge_type", "from_node_id", "to_node_id", name="edge_uniq"),
         {"schema": "energydb"},
     )
 
 
-class EdgeSeries(Base):
-    """Links an edge to a timedb series (power flow, thermal data, etc.)."""
+class Series(Base):
+    """Polymorphic series owned by either a node or an edge (exactly one).
 
-    __tablename__ = "edge_series"
+    target_table, canonical_unit, and the owner columns are immutable after
+    insert (enforced by DB trigger). Reclassification = register a new series.
+    """
 
+    __tablename__ = "series"
+
+    series_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
+    node_id = sa.Column(
+        sa.BigInteger,
+        sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
+        nullable=True,
+    )
     edge_id = sa.Column(
         sa.BigInteger,
         sa.ForeignKey("energydb.edge.edge_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    series_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("series.series_id"),
-        primary_key=True,
+        nullable=True,
     )
     data_type = sa.Column(sa.Text, nullable=False)
     name = sa.Column(sa.Text, nullable=False)
+    canonical_unit = sa.Column(sa.Text, nullable=False)
+    target_table = sa.Column(sa.Text, nullable=False)
+    description = sa.Column(sa.Text, nullable=True)
+    inserted_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
-        sa.Index("ix_edge_series_series_id", "series_id"),
+        sa.CheckConstraint("(node_id IS NULL) <> (edge_id IS NULL)", name="series_owner_xor"),
+        sa.UniqueConstraint("node_id", "data_type", "name", name="series_node_uniq"),
+        sa.UniqueConstraint("edge_id", "data_type", "name", name="series_edge_uniq"),
+        sa.Index("ix_series_node", "node_id", postgresql_where=sa.text("node_id IS NOT NULL")),
+        sa.Index("ix_series_edge", "edge_id", postgresql_where=sa.text("edge_id IS NOT NULL")),
         {"schema": "energydb"},
     )
 
 
-# Tables that EnergyDB owns and should create. Excludes the series proxy
-# (owned by TimeDB) so create_all() never creates an incomplete public.series.
-ENERGYDB_TABLES = [
-    Node.__table__,
-    NodeSeries.__table__,
-    Edge.__table__,
-    EdgeSeries.__table__,
+ENERGYDB_TABLES: list[sa.Table] = [
+    cast(sa.Table, Node.__table__),
+    cast(sa.Table, Edge.__table__),
+    cast(sa.Table, Series.__table__),
 ]
