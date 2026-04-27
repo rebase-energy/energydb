@@ -48,10 +48,7 @@ def main() -> None:
         a = after.get((op, scale))
         b_med = statistics.median(b) if b else float("nan")
         a_med = statistics.median(a) if a else float("nan")
-        if b and a and a_med > 0:
-            ratio = f"{b_med / a_med:>8.2f}x"
-        else:
-            ratio = "       -"
+        ratio = f"{b_med / a_med:>8.2f}x" if b and a and a_med > 0 else "       -"
         print(f"{op:<28} {scale:>6} {_fmt(b_med)} {_fmt(a_med)} {ratio:>10}")
 
 

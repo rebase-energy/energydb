@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 from importlib import resources
+from typing import Any
 
 from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine
 from timedb import TimeDBClient
 
+from energydb import runs as runs_mod
 from energydb.models import ENERGYDB_TABLES, Base
 from energydb.scope import EdgeScope, NodeScope
 
@@ -35,6 +37,7 @@ class EnergyDBClient:
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
             raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
+
         def _configure(conn):
             conn.execute(_SEARCH_PATH)
             conn.commit()
@@ -93,6 +96,22 @@ class EnergyDBClient:
         if name is not None:
             return EdgeScope(self._pool, self.td, name=name)
         raise ValueError("Must provide name or id")
+
+    # ------------------------------------------------------------------
+    # Runs
+    # ------------------------------------------------------------------
+
+    def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
+        """Return runs that wrote data for a given series_id, latest first.
+
+        Two-step: ClickHouse ``run_series`` mapping gives the run_ids, then PG
+        hydrates the metadata. Replaces the old ``td.read_runs`` FINAL-join.
+        """
+        run_ids = self.td.read_run_series(series_id=series_id)
+        if not run_ids:
+            return []
+        with self._pool.connection() as conn:
+            return runs_mod.get_runs(conn, run_ids)
 
     # ------------------------------------------------------------------
     # Internals

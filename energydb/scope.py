@@ -7,12 +7,16 @@ Resolution happens in a single query when a terminal operation is called.
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime
 from typing import Any
 
 import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesDescriptor, TimeSeriesType
+from timedb import profiling
 
+from energydb import runs as runs_mod
 from energydb import series as series_mod
 from energydb._resolve import (
     join_edge_hierarchy,
@@ -25,15 +29,17 @@ from energydb._resolve import (
 from energydb.serialization import reconstruct_edge, reconstruct_node, serialize_node
 from energydb.units import apply_unit_factor
 
-# ---------------------------------------------------------------------------
-# Descriptor → target_table default
-# ---------------------------------------------------------------------------
+# Default retention tier when the caller does not specify one. 'medium' is the
+# least surprising default (~3 years of history).
+_DEFAULT_RETENTION = "medium"
 
 
-def _default_target_table(ts_type: TimeSeriesType | None) -> str:
-    if ts_type is not None and ts_type.value == "OVERLAPPING":
-        return "overlapping_medium"
-    return "flat"
+def _timeseries_type_from_descriptor(desc: TimeSeriesDescriptor) -> str | None:
+    """Extract timeseries_type from a descriptor as 'FLAT' or 'OVERLAPPING'."""
+    ts_type = desc.timeseries_type
+    if ts_type is None:
+        return None
+    return ts_type.value if isinstance(ts_type, TimeSeriesType) else str(ts_type)
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +206,7 @@ class NodeScope:
         row_data = serialize_node(edm_obj)
         with self._pool.connection() as conn:
             # Empty scope (no id, no name chain) = create a root node.
-            if self._node_id is None and not self._name_chain:
-                parent_id = None
-            else:
-                parent_id = self._resolve_node_id(conn)
+            parent_id = None if self._node_id is None and not self._name_chain else self._resolve_node_id(conn)
             row = conn.execute(
                 "INSERT INTO energydb.node "
                 "(node_type, name, parent_id, data) "
@@ -281,13 +284,15 @@ class NodeScope:
         name: str | None = None,
         canonical_unit: str | None = None,
         data_type: str | None = None,
-        target_table: str | None = None,
+        timeseries_type: str | None = None,
+        retention: str = _DEFAULT_RETENTION,
         description: str | None = None,
     ) -> int:
-        """Register a time series for this node.
+        """Register a time series on this node.
 
-        Accepts either a TimeSeriesDescriptor (unit+type extracted) or explicit
-        kwargs. ``target_table`` is validated against ``timedb.TABLES``.
+        Accepts a ``TimeSeriesDescriptor`` (unit + data_type + timeseries_type
+        extracted) or explicit kwargs. ``retention`` defaults to ``'medium'``
+        if not specified.
         """
         if isinstance(descriptor_or_name, TimeSeriesDescriptor):
             desc = descriptor_or_name
@@ -295,8 +300,8 @@ class NodeScope:
             canonical_unit = canonical_unit or desc.unit
             if data_type is None and desc.data_type is not None:
                 data_type = str(desc.data_type).lower()
-            if target_table is None:
-                target_table = _default_target_table(desc.timeseries_type)
+            if timeseries_type is None:
+                timeseries_type = _timeseries_type_from_descriptor(desc)
             description = description or desc.description
         elif isinstance(descriptor_or_name, str):
             name = descriptor_or_name
@@ -307,8 +312,8 @@ class NodeScope:
             raise ValueError("data_type is required")
         if canonical_unit is None:
             raise ValueError("canonical_unit is required")
-        if target_table is None:
-            raise ValueError("target_table is required")
+        if timeseries_type is None:
+            raise ValueError("timeseries_type is required (FLAT | OVERLAPPING)")
 
         data_type_str = str(data_type).lower()
 
@@ -321,7 +326,8 @@ class NodeScope:
                 data_type=data_type_str,
                 name=name,
                 canonical_unit=canonical_unit,
-                target_table=target_table,
+                timeseries_type=timeseries_type,
+                retention=retention,
                 description=description,
             )
             conn.commit()
@@ -338,11 +344,24 @@ class NodeScope:
         data_type: str,
         name: str,
         unit: str | None = None,
-        **td_write_kwargs,
-    ) -> list:
-        """Write time series data for a single series on this node."""
+        knowledge_time: datetime | None = None,
+        run_id: int | None = None,
+        workflow_id: str | None = None,
+        model_name: str | None = None,
+        run_start_time: datetime | None = None,
+        run_finish_time: datetime | None = None,
+        run_params: dict | None = None,
+    ) -> int:
+        """Write time series data for a single series on this node.
+
+        Returns the ``run_id`` used for this write (client-generated if not
+        supplied). The caller can use it to correlate downstream operations
+        with the ``energydb.runs`` PG row.
+        """
+        _prof = profiling._enabled
         data_type_str = str(data_type).lower()
 
+        _t = time.perf_counter() if _prof else 0.0
         with self._pool.connection() as conn:
             node_id = self._resolve_node_id(conn)
             meta = series_mod.resolve_for_write(
@@ -351,11 +370,23 @@ class NodeScope:
                 data_type=data_type_str,
                 name=name,
             )
+        if _prof:
+            profiling._record(profiling.PHASE_EDB_RESOLVE, time.perf_counter() - _t)
 
-        if unit is not None:
-            df = apply_unit_factor(df, unit, meta["canonical_unit"])
-        df = df.with_columns(pl.lit(meta["series_id"], dtype=pl.Int64).alias("series_id"))
-        return self._td.write(df, target_table=meta["target_table"], **td_write_kwargs)
+        return _write_one_series(
+            self._td,
+            self._pool,
+            df=df,
+            meta=meta,
+            unit=unit,
+            knowledge_time=knowledge_time,
+            run_id=run_id,
+            workflow_id=workflow_id,
+            model_name=model_name,
+            run_start_time=run_start_time,
+            run_finish_time=run_finish_time,
+            run_params=run_params,
+        )
 
     def read(
         self,
@@ -363,9 +394,17 @@ class NodeScope:
         data_type: str | None = None,
         name: str | None = None,
         unit: str | None = None,
-        **td_read_kwargs,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        start_known: datetime | None = None,
+        end_known: datetime | None = None,
+        include_updates: bool = False,
+        include_knowledge_time: bool = False,
     ) -> pl.DataFrame:
         """Read time series data for this scope (node + descendants)."""
+        _prof = profiling._enabled
+
+        _t = time.perf_counter() if _prof else 0.0
         with self._pool.connection() as conn:
             target_ids = self._resolve_target_node_ids(conn)
             if not target_ids:
@@ -378,11 +417,28 @@ class NodeScope:
                 data_type=data_type_str,
                 name=name,
             )
+            if _prof:
+                profiling._record(profiling.PHASE_EDB_RESOLVE, time.perf_counter() - _t)
             if meta.is_empty():
                 return pl.DataFrame()
 
-            result = _read_and_convert(self._td, meta, unit, td_read_kwargs)
-            return join_hierarchy(conn, result, meta)
+            result = _read_and_convert(
+                self._td,
+                meta,
+                unit,
+                start_valid=start_valid,
+                end_valid=end_valid,
+                start_known=start_known,
+                end_known=end_known,
+                include_updates=include_updates,
+                include_knowledge_time=include_knowledge_time,
+            )
+
+            _t = time.perf_counter() if _prof else 0.0
+            out = join_hierarchy(conn, result, meta)
+            if _prof:
+                profiling._record(profiling.PHASE_EDB_HIERARCHY_JOIN, time.perf_counter() - _t)
+            return out
 
     def read_relative(
         self,
@@ -520,7 +576,8 @@ class EdgeScope:
         name: str | None = None,
         canonical_unit: str | None = None,
         data_type: str | None = None,
-        target_table: str | None = None,
+        timeseries_type: str | None = None,
+        retention: str = _DEFAULT_RETENTION,
         description: str | None = None,
     ) -> int:
         if isinstance(descriptor_or_name, TimeSeriesDescriptor):
@@ -529,8 +586,8 @@ class EdgeScope:
             canonical_unit = canonical_unit or desc.unit
             if data_type is None and desc.data_type is not None:
                 data_type = str(desc.data_type).lower()
-            if target_table is None:
-                target_table = _default_target_table(desc.timeseries_type)
+            if timeseries_type is None:
+                timeseries_type = _timeseries_type_from_descriptor(desc)
             description = description or desc.description
         elif isinstance(descriptor_or_name, str):
             name = descriptor_or_name
@@ -541,8 +598,8 @@ class EdgeScope:
             raise ValueError("data_type is required")
         if canonical_unit is None:
             raise ValueError("canonical_unit is required")
-        if target_table is None:
-            raise ValueError("target_table is required")
+        if timeseries_type is None:
+            raise ValueError("timeseries_type is required (FLAT | OVERLAPPING)")
 
         data_type_str = str(data_type).lower()
 
@@ -555,7 +612,8 @@ class EdgeScope:
                 data_type=data_type_str,
                 name=name,
                 canonical_unit=canonical_unit,
-                target_table=target_table,
+                timeseries_type=timeseries_type,
+                retention=retention,
                 description=description,
             )
             conn.commit()
@@ -568,8 +626,14 @@ class EdgeScope:
         data_type: str,
         name: str,
         unit: str | None = None,
-        **td_write_kwargs,
-    ) -> list:
+        knowledge_time: datetime | None = None,
+        run_id: int | None = None,
+        workflow_id: str | None = None,
+        model_name: str | None = None,
+        run_start_time: datetime | None = None,
+        run_finish_time: datetime | None = None,
+        run_params: dict | None = None,
+    ) -> int:
         data_type_str = str(data_type).lower()
         with self._pool.connection() as conn:
             edge_id = self._resolve_edge_id(conn)
@@ -579,10 +643,20 @@ class EdgeScope:
                 data_type=data_type_str,
                 name=name,
             )
-        if unit is not None:
-            df = apply_unit_factor(df, unit, meta["canonical_unit"])
-        df = df.with_columns(pl.lit(meta["series_id"], dtype=pl.Int64).alias("series_id"))
-        return self._td.write(df, target_table=meta["target_table"], **td_write_kwargs)
+        return _write_one_series(
+            self._td,
+            self._pool,
+            df=df,
+            meta=meta,
+            unit=unit,
+            knowledge_time=knowledge_time,
+            run_id=run_id,
+            workflow_id=workflow_id,
+            model_name=model_name,
+            run_start_time=run_start_time,
+            run_finish_time=run_finish_time,
+            run_params=run_params,
+        )
 
     def read(
         self,
@@ -590,7 +664,12 @@ class EdgeScope:
         data_type: str | None = None,
         name: str | None = None,
         unit: str | None = None,
-        **td_read_kwargs,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        start_known: datetime | None = None,
+        end_known: datetime | None = None,
+        include_updates: bool = False,
+        include_knowledge_time: bool = False,
     ) -> pl.DataFrame:
         with self._pool.connection() as conn:
             edge_id = self._resolve_edge_id(conn)
@@ -604,37 +683,124 @@ class EdgeScope:
             if meta.is_empty():
                 return pl.DataFrame()
 
-            result = _read_and_convert(self._td, meta, unit, td_read_kwargs)
+            result = _read_and_convert(
+                self._td,
+                meta,
+                unit,
+                start_valid=start_valid,
+                end_valid=end_valid,
+                start_known=start_known,
+                end_known=end_known,
+                include_updates=include_updates,
+                include_knowledge_time=include_knowledge_time,
+            )
             return join_edge_hierarchy(conn, result, meta)
 
 
 # ---------------------------------------------------------------------------
-# Shared read helpers
+# Shared write/read helpers
 # ---------------------------------------------------------------------------
+
+
+def _write_one_series(
+    td,
+    pool,
+    *,
+    df: pl.DataFrame,
+    meta: dict,
+    unit: str | None,
+    knowledge_time: datetime | None,
+    run_id: int | None,
+    workflow_id: str | None,
+    model_name: str | None,
+    run_start_time: datetime | None,
+    run_finish_time: datetime | None,
+    run_params: dict | None,
+) -> int:
+    """Unit-convert, enforce the OVERLAPPING contract, upsert the run, then
+    call td.write. Returns the run_id.
+    """
+    # OVERLAPPING contract: knowledge_time must be supplied.
+    if meta["timeseries_type"] == "OVERLAPPING":
+        kt_in_df = "knowledge_time" in df.columns
+        if knowledge_time is None and not kt_in_df:
+            raise ValueError(
+                f"knowledge_time is required for OVERLAPPING series "
+                f"(series_id={meta['series_id']}). Pass it as a kwarg or as a "
+                f"'knowledge_time' column."
+            )
+
+    _prof = profiling._enabled
+
+    if unit is not None:
+        _t = time.perf_counter() if _prof else 0.0
+        df = apply_unit_factor(df, unit, meta["canonical_unit"])
+        if _prof:
+            profiling._record(profiling.PHASE_EDB_UNIT_CONVERT, time.perf_counter() - _t)
+
+    rid = run_id if run_id is not None else runs_mod.generate_run_id()
+    df = df.with_columns(
+        pl.lit(meta["series_id"], dtype=pl.Int64).alias("series_id"),
+        pl.lit(rid, dtype=pl.Int64).alias("run_id"),
+    )
+
+    _t = time.perf_counter() if _prof else 0.0
+    with pool.connection() as conn:
+        runs_mod.upsert_run(
+            conn,
+            run_id=rid,
+            workflow_id=workflow_id,
+            model_name=model_name,
+            run_start_time=run_start_time or datetime.now(UTC),
+            run_finish_time=run_finish_time,
+            run_params=run_params,
+        )
+        conn.commit()
+    if _prof:
+        profiling._record(profiling.PHASE_EDB_RUNS_UPSERT, time.perf_counter() - _t)
+
+    td.write(df, retention=meta["retention"], knowledge_time=knowledge_time)
+    return rid
 
 
 def _read_and_convert(
     td,
     meta: pl.DataFrame,
     requested_unit: str | None,
-    td_kwargs: dict,
+    *,
+    start_valid: datetime | None = None,
+    end_valid: datetime | None = None,
+    start_known: datetime | None = None,
+    end_known: datetime | None = None,
+    include_updates: bool = False,
+    include_knowledge_time: bool = False,
 ) -> pl.DataFrame:
-    """Group meta by target_table, issue one td.read per group, concat, unit-convert."""
-    parts: list[pl.DataFrame] = []
-    for group in meta.partition_by("target_table"):
-        target_table = group["target_table"][0]
-        series_ids = group["series_id"].to_list()
-        part = td.read(series_ids=series_ids, target_table=target_table, **td_kwargs)
-        if part.is_empty():
-            continue
-        parts.append(part)
+    """Single td.read over all resolved series_ids, across their retentions.
 
-    if not parts:
-        return pl.DataFrame()
-    result = pl.concat(parts, how="diagonal_relaxed")
+    The unified events table means one CH query handles cross-retention reads;
+    the retention predicate is just for partition pruning.
+    """
+    series_ids = meta["series_id"].to_list()
+    retentions = meta["retention"].unique().to_list()
+    result = td.read(
+        series_ids=series_ids,
+        retention=retentions,
+        start_valid=start_valid,
+        end_valid=end_valid,
+        start_known=start_known,
+        end_known=end_known,
+        include_updates=include_updates,
+        include_knowledge_time=include_knowledge_time,
+    )
+    if result.is_empty():
+        return result
 
     if requested_unit is not None:
+        _prof = profiling._enabled
+        _t = time.perf_counter() if _prof else 0.0
         result = _apply_per_series_unit(result, meta, requested_unit)
+        if _prof:
+            profiling._record(profiling.PHASE_EDB_UNIT_CONVERT, time.perf_counter() - _t)
     return result
 
 
@@ -644,21 +810,18 @@ def _read_relative_and_convert(
     requested_unit: str | None,
     td_kwargs: dict,
 ) -> pl.DataFrame:
-    parts: list[pl.DataFrame] = []
-    for group in meta.partition_by("target_table"):
-        target_table = group["target_table"][0]
-        series_ids = group["series_id"].to_list()
-        part = td.read_relative(series_ids=series_ids, target_table=target_table, **td_kwargs)
-        if part.is_empty():
-            continue
-        parts.append(part)
-
-    if not parts:
-        return pl.DataFrame()
-    result = pl.concat(parts, how="diagonal_relaxed")
+    series_ids = meta["series_id"].to_list()
+    retentions = meta["retention"].unique().to_list()
+    result = td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
+    if result.is_empty():
+        return result
 
     if requested_unit is not None:
+        _prof = profiling._enabled
+        _t = time.perf_counter() if _prof else 0.0
         result = _apply_per_series_unit(result, meta, requested_unit)
+        if _prof:
+            profiling._record(profiling.PHASE_EDB_UNIT_CONVERT, time.perf_counter() - _t)
     return result
 
 

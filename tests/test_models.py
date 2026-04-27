@@ -1,6 +1,6 @@
 """Tests for energydb SQLAlchemy models (no DB required)."""
 
-from energydb.models import Base, Edge, Node, Series
+from energydb.models import Base, Edge, Node, Run, Series
 
 
 class TestNodeModel:
@@ -66,7 +66,8 @@ class TestSeriesModel:
             "data_type",
             "name",
             "canonical_unit",
-            "target_table",
+            "timeseries_type",
+            "retention",
             "description",
             "inserted_at",
         }
@@ -81,12 +82,45 @@ class TestSeriesModel:
         assert Series.__table__.c.node_id.nullable is True
         assert Series.__table__.c.edge_id.nullable is True
 
-    def test_target_table_not_nullable(self):
-        assert Series.__table__.c.target_table.nullable is False
+    def test_immutable_fields_not_nullable(self):
+        assert Series.__table__.c.retention.nullable is False
         assert Series.__table__.c.canonical_unit.nullable is False
+        assert Series.__table__.c.timeseries_type.nullable is False
+
+    def test_no_target_table_column(self):
+        """target_table was removed in the unified-events redesign."""
+        col_names = {c.name for c in Series.__table__.columns}
+        assert "target_table" not in col_names
+
+    def test_check_constraints(self):
+        names = {c.name for c in Series.__table__.constraints if hasattr(c, "name") and c.name}
+        assert "valid_timeseries_type" in names
+        assert "valid_retention" in names
+
+
+class TestRunModel:
+    def test_table_name(self):
+        assert Run.__tablename__ == "runs"
+        assert Run.__table__.schema == "energydb"
+
+    def test_columns(self):
+        col_names = {c.name for c in Run.__table__.columns}
+        assert col_names == {
+            "run_id",
+            "workflow_id",
+            "model_name",
+            "run_start_time",
+            "run_finish_time",
+            "run_params",
+            "inserted_at",
+        }
+
+    def test_primary_key(self):
+        assert [c.name for c in Run.__table__.primary_key.columns] == ["run_id"]
 
 
 def test_base_has_expected_tables():
     assert "energydb.node" in Base.metadata.tables
     assert "energydb.edge" in Base.metadata.tables
     assert "energydb.series" in Base.metadata.tables
+    assert "energydb.runs" in Base.metadata.tables
