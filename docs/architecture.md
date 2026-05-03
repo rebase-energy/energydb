@@ -5,200 +5,225 @@ arbitrary-depth hierarchy (adjacency list) and typed edges with series routing o
 of TimeDB's three-dimensional temporal storage. Users only import from `energydb`; TimeDB
 is internal.
 
+## Identity model — UUID end-to-end
+
+Every EDM `Element` carries a `uuid: UUID` (UUID7) generated at construction. That same
+UUID is the primary key on `energydb.node` (or `energydb.edge`). FKs and references all
+hold UUIDs directly — no separate bigint identifier, no translation step at any boundary:
+
+| Layer | Identifier |
+|-------|------------|
+| EDM in-memory | `Element.id: UUID` |
+| EDM JSON wire format | `{"id": "<uuid>"}`; refs as `{"__ref__": "<uuid>"}` |
+| Postgres (`node`, `edge`) | `uuid UUID PRIMARY KEY` |
+| FKs (`parent_uuid`, `from_node_uuid`, …) | `UUID REFERENCES …(uuid)` |
+| Series ownership | `series.node_uuid` / `series.edge_uuid` |
+
+Path-based addressing (`client.node("Europe", "Sweden", "Lillgrund")`) is preserved as a
+user-friendly fluent CLI; resolution walks `(parent_uuid, name)` via one indexed
+recursive CTE. Names stay convenient for navigation and remain unique under a parent
+(`UNIQUE (parent_uuid, name)`), but identity is the UUID.
+
 ## Module layout
 
 | Module | Responsibility |
 |--------|---------------|
 | `energydb.models` | SQLAlchemy ORM tables (source of truth for schema) |
 | `energydb.serialization` | EDM object ↔ DB row conversion (nodes + edges) |
-| `energydb._resolve` | Internal: subtree CTE, series-id / path resolution, hierarchy join-back, edge resolution |
-| `energydb.scope` | `NodeScope` — fluent node navigation, CRUD, and time-series I/O (lazy); `EdgeScope` — edge CRUD, time-series I/O, and endpoint navigation |
-| `energydb.client` | `EnergyDataClient` — schema, imperative CRUD, bulk I/O, tree reads, edge management |
-| `energydb.__init__` | Public exports: `EnergyDataClient`, `NodeScope`, `EdgeScope`, EDM types |
-
-Dependency flow: `client → scope → _resolve → models`. No cycles.
+| `energydb._persist` | `create_node` / `create_edge` upserts + diff-aware `register_tree_under` |
+| `energydb.diff` | `TreeDiff`, `NodeChange`, `EdgeChange`, `NodeSnapshot`, `EdgeSnapshot` |
+| `energydb.paths` | Path → uuid resolution (recursive CTE on `(parent_uuid, name)`) for the fluent CLI |
+| `energydb._io`, `energydb._join` | Manifest read/write pipeline + post-read hierarchy hydration |
+| `energydb.scope` | `NodeScope` / `EdgeScope` — fluent navigation, CRUD, timeseries I/O |
+| `energydb.client` | `EnergyDBClient` — schema, register_tree, queries, bulk I/O |
+| `energydb.__init__` | Public exports |
 
 ## Schema
 
-All tables live in the `energydb` Postgres schema. Cross-schema FKs point at
-`series.series_id`. SQLAlchemy models are the single source of truth — no raw
-SQL files. Platform imports `energydb.models.Base` for Alembic.
+All tables live in the `energydb` Postgres schema. SQLAlchemy models are the single
+source of truth — no raw SQL files. Platform imports `energydb.models.Base` for Alembic.
 
-### Node tables
-
-**`energydb.node`** — any EDM Node type in one table (adjacency list):
+### `energydb.node`
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `node_id` | `BIGINT` identity PK | |
-| `node_type` | `TEXT NOT NULL` | Portfolio, Site, WindFarm, WindTurbine, PVSystem, Battery, JunctionPoint, Meter, … |
-| `name` | `TEXT NOT NULL` | |
-| `parent_id` | FK → `node` `ON DELETE CASCADE`, nullable | `NULL` = root |
-| `properties` | `JSONB NOT NULL DEFAULT '{}'` | domain-specific fields |
-| `latitude`, `longitude`, `altitude` | `DOUBLE PRECISION` nullable | |
-| `timezone` | `TEXT` nullable | |
+| `uuid` | `UUID PRIMARY KEY` | EDM `Element.id` round-tripped as the row PK |
+| `node_type` | `TEXT NOT NULL` | `Portfolio`, `Site`, `WindFarm`, `WindTurbine`, `JunctionPoint`, … |
+| `name` | `TEXT NOT NULL` | Mutable display label |
+| `parent_uuid` | `UUID FK` → `node(uuid)` `ON DELETE CASCADE`, nullable | `NULL` = root |
+| `data` | `JSONB NOT NULL DEFAULT '{}'` | All non-structural fields (geometry, tz, capacity, …) |
 | `created_at`, `updated_at` | `TIMESTAMPTZ NOT NULL` | server default `now()` |
 
 Constraints / indexes:
-- `UNIQUE (name, node_type, parent_id)` — child uniqueness. Root names collide freely
-  (NULL != NULL in SQL) so the platform can scope multi-tenant isolation by node id.
-- `INDEX (parent_id)`
-- `GIN INDEX (properties)`
+- `UNIQUE (parent_uuid, name)` — children of a parent are uniquely addressable by name
+  (the fluent CLI's contract).
+- partial unique index `(name) WHERE parent_uuid IS NULL` — root names are unique too.
+- `INDEX (parent_uuid)`
+- `GIN INDEX (data)`
 
-**`energydb.node_series`** — links nodes to TimeDB series:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `node_id` | FK → `node` `ON DELETE CASCADE`, PK part | |
-| `series_id` | FK → `series`, PK part | |
-| `data_type` | `TEXT NOT NULL` | `"forecast"`, `"actual"`, `"observation"`, … |
-| `name` | `TEXT NOT NULL` | denormalized copy of `series.name` for fast local queries |
-
-### Edge tables
-
-**`energydb.edge`** — typed edges between two nodes (grid topology, power flow, etc.):
+### `energydb.edge`
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `edge_id` | `BIGINT` identity PK | |
-| `edge_type` | `TEXT NOT NULL` | Line, Link, Transformer, Pipe, Interconnection |
-| `name` | `TEXT` nullable | human-readable name |
-| `from_node_id` | FK → `node` `ON DELETE CASCADE` | source node |
-| `to_node_id` | FK → `node` `ON DELETE CASCADE` | target node |
-| `properties` | `JSONB NOT NULL DEFAULT '{}'` | domain-specific fields (capacity, medium, …) |
-| `directed` | `BOOLEAN NOT NULL DEFAULT true` | |
+| `uuid` | `UUID PRIMARY KEY` | EDM edge `Element.id` |
+| `edge_type` | `TEXT NOT NULL` | `Line`, `Link`, `Pipe`, `Interconnection` |
+| `label` | `TEXT` nullable | Human label (the EDM `Edge.name`) |
+| `from_node_uuid` | `UUID FK` → `node(uuid)` `ON DELETE CASCADE` | Source endpoint |
+| `to_node_uuid` | `UUID FK` → `node(uuid)` `ON DELETE CASCADE` | Target endpoint |
+| `data` | `JSONB NOT NULL DEFAULT '{}'` | All non-structural fields (capacity, medium, directed, …) |
 | `created_at`, `updated_at` | `TIMESTAMPTZ NOT NULL` | server default `now()` |
 
 Constraints:
-- `UNIQUE (edge_type, from_node_id, to_node_id)` — upsert key
+- `UNIQUE (edge_type, from_node_uuid, to_node_uuid)` — natural key for human-addressed
+  edges (the `(from_path, to_path, type)` triple in `client.get_edge`).
 
-**`energydb.edge_series`** — links edges to TimeDB series (power flow, thermal data, etc.):
+### `energydb.series`
+
+Polymorphic series owned by exactly one of `node_uuid` / `edge_uuid` (DB CHECK enforces).
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `edge_id` | FK → `edge` `ON DELETE CASCADE`, PK part | |
-| `series_id` | FK → `series`, PK part | |
-| `data_type` | `TEXT NOT NULL` | |
-| `name` | `TEXT NOT NULL` | |
+| `series_id` | `BIGINT identity PK` | timedb-internal handle; stays bigint |
+| `node_uuid` | `UUID FK` → `node(uuid)` `ON DELETE CASCADE`, nullable | |
+| `edge_uuid` | `UUID FK` → `edge(uuid)` `ON DELETE CASCADE`, nullable | |
+| `data_type` | `TEXT NOT NULL` | `"forecast"`, `"actual"`, `"observation"`, … |
+| `name`, `canonical_unit`, `timeseries_type`, `retention`, `description` | | |
 
-## Series architecture
+Constraints:
+- `(node_uuid IS NULL) <> (edge_uuid IS NULL)` — exclusive ownership.
+- `UNIQUE (node_uuid, data_type, name)` / `UNIQUE (edge_uuid, data_type, name)`.
+- Trigger `_series_guard_immutable`: `retention`, `canonical_unit`, and the owner
+  columns can't change after insert.
 
-### Single source of truth, no duplication
+### `energydb.runs`
 
-Each fact lives in exactly one authoritative location:
+Run metadata. `run_id BIGINT` is client-generated (uuid7 truncated to 63 bits) so writes
+don't wait on a PG allocation round-trip.
 
-| Fact | Authoritative source | Denormalized copy |
-|------|----------------------|-------------------|
-| Series name (`"power"`) | `series.name` | `node_series.name` / `edge_series.name` |
-| Unit (`"MW"`) | `series.unit` | — |
-| Data type (`"forecast"`) | `node_series.data_type` | `series.labels["data_type"]` |
-| Overlapping? | `series.overlapping` | — |
-| Retention | `series.retention` | — |
-| Description | `series.description` | — |
-| Hierarchy context | `energydb.node` tree | `series.labels` |
-| Node identity | `energydb.node.node_id` | `series.labels["node_id"]` |
-| Edge identity | `energydb.edge.edge_id` | `series.labels["edge_id"]` |
-| Asset ↔ series link | `energydb.node_series` | — |
-| Edge ↔ series link | `energydb.edge_series` | — |
-| Actual data | ClickHouse (via TimeDB) | — |
+## `register_tree` modes
 
-### `TimeSeriesDescriptor`
+The single entry point for structure persistence — every node, every edge, every series
+descriptor — driven by an in-memory EDM tree.
 
-Structure-only metadata (no data) — a frozen dataclass imported from `timedatamodel`:
+### Modes
 
 ```python
-from timedatamodel import TimeSeriesDescriptor, DataType, TimeSeriesType
-
-TimeSeriesDescriptor(
-    name="power",
-    unit="MW",
-    data_type=DataType.FORECAST,
-    timeseries_type=TimeSeriesType.OVERLAPPING,
-)
+client.register_tree(tree)                                        # additive (default)
+client.register_tree(tree, mode="additive")                       # explicit
+client.register_tree(tree, mode="replace_subtree", allow_delete=True)
+client.register_tree(tree, mode="replace_subtree", allow_delete=True, dry_run=True)
 ```
 
-EDM's `Node.timeseries` accepts `TimeSeriesDescriptor | TimeSeries | TimeSeriesTable`.
-When EnergyDB sees a descriptor on an EDM object during `create_node()`, it auto-registers
-the corresponding series.
+| Mode | What happens to rows under the subtree root that aren't in the target tree |
+|------|----------------------------------------------------------------------------|
+| `"additive"` (default) | Left untouched. Re-running with a smaller tree does not delete anything. |
+| `"replace_subtree"` | Candidates for deletion. Pass `allow_delete=True` to apply; otherwise raises with the orphan list. |
 
-### Retention is a TimeDB concern
+### How identity choices play out
 
-Retention is not in the descriptor or the energydb schema — it's passed through at
-registration:
+With UUID identity, conflicts on the in-memory tree resolve in one statement at the DB
+layer. `create_node` uses `ON CONFLICT (uuid) DO UPDATE` so:
 
-```python
-client.node("T01").register_series(descriptor, retention="long")
+- **Renames** (same uuid, different `name`) → silent UPDATE.
+- **Moves** (same uuid, different `parent_uuid`) → silent UPDATE.
+- **Property edits** (same uuid, different `data`) → silent UPDATE.
+- **Type changes** (same uuid, different `node_type`) → rejected. Element type is
+  immutable for a given id.
+- **Cross-tree edge endpoints** (an edge whose endpoint uuid is not in the tree) →
+  rejected pre-write.
+
+### Dry run
+
+`dry_run=True` returns a `TreeDiff` and rolls back. The diff has flat `node_changes` /
+`edge_changes` lists plus binned views (`node_inserts`, `node_renames`, `node_moves`,
+`node_data_edits`, `node_deletes`, `edge_inserts`/`updates`/`deletes`). Each change
+exposes `kind` (`insert` / `update` / `delete`) and convenience flags (`renamed`,
+`moved`, `data_changed`, `endpoints_changed`).
+
+`TreeDiff.print()` renders a tree-shaped textual preview:
+
+```
+Portfolio 'P'
+├── ~ Site 'NewName'                          [rename 'OldName' → 'NewName']
+│   ├── + WindTurbine 'T03'                   [insert]
+│   ├──   WindTurbine 'T01'
+│   ├── ~ WindTurbine 'T02'                   [capacity: 3.5 → 4.0]
+│   └── - Battery 'B1'                        [delete] (allow_delete required)
+└── → Site 'Other'                            [moved (parent <a> → <b>)]
+edges:
+  + Line 'Cable-1' <a-uuid> → <b-uuid>        [insert]
 ```
 
-TimeDB's default is `"medium"`.
+### Application order
+
+When the diff is applied:
+
+1. Edge deletes — so node deletes don't trip FK constraints (although `ON DELETE
+   CASCADE` would handle it, this is cleaner).
+2. Node upserts in DFS order — parent_uuid FKs always resolve.
+3. Edge upserts — endpoints exist now.
+4. Node deletes — `ON DELETE CASCADE` handles descendants and any remaining attached
+   edges + series.
+
+The whole walk runs in one Postgres transaction so partial application can't leak.
 
 ## `NodeScope` resolution
 
-All `.node()` and `.find()` calls are **lazy** — they accumulate a path / filter without
-hitting the DB. Resolution happens in a single query when a terminal operation runs
-(`.read()`, `.write()`, `.get()`, `.children()`, `.rename()`, `.delete()`, …):
+`.node()` and `.where()` calls are **lazy** — they accumulate path / filter without
+hitting the DB. Resolution happens in one query when a terminal operation runs
+(`.read()`, `.write_series()`, `.get()`, `.children()`, `.rename()`, `.delete()`, …):
 
 ```
 client.node("Europe").node("Sweden").node("Lillgrund").read(data_type="forecast")
        │              │               │                      │
-       └── lazy ──────┴── lazy ───────┴── lazy               └── terminal: resolves full path in one query
+       └── lazy ──────┴── lazy ───────┴── lazy               └── terminal: 1 CTE on (parent_uuid, name)
 ```
 
-Ambiguity is rejected at resolution time: `node("name").read()` raises
-`ValueError("Multiple nodes named 'X' (ids: [...]). Use node(id=...) to disambiguate.")`.
+Identity-form lookup is `client.node(uuid=...)`. Path-form is the user-friendly
+default; both produce the same `NodeScope`.
 
 ## `EdgeScope`
 
-`EdgeScope` provides CRUD, time-series I/O, and endpoint navigation for a single edge.
-Unlike `NodeScope`, edges are flat (no hierarchy navigation). Resolution is by
-`edge_id` or `name`.
+`EdgeScope` provides CRUD, timeseries I/O, and endpoint navigation for a single edge.
+Identity is `edge_uuid` or the `(from_path, to_path, edge_type)` triple.
 
 ```python
-client.edge(id=42).read(data_type="actual", name="power_flow")
-client.edge(name="Cable-1").write(df, name="power_flow", data_type="actual")
-client.edge(id=42).update(properties={"capacity": 600})
-client.edge(id=42).delete()
-
-# Get the reconstructed EDM Edge object
-line = client.edge(id=42).get()
-
-# Navigate to endpoint nodes
-client.edge(id=42).from_node().read(data_type="actual")
-client.edge(id=42).to_node().read(data_type="actual")
+client.edge(uuid=...).read(data_type="actual", name="power_flow")
+client.edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get()
+client.edge(uuid=...).update(data={"capacity": 600})
+client.edge(uuid=...).delete()
+client.edge(uuid=...).from_node().read(data_type="actual")
+client.edge(uuid=...).to_node().read(data_type="actual")
 ```
 
-## Two-pass tree write
+## Manifest I/O
 
-When `client.write(tree)` receives an EDM tree that contains both Node and Edge
-children, it uses a two-pass approach:
-
-1. **Pass 1 (nodes):** Walk `node.children()`, create all Nodes (skip Edges)
-2. **Pass 2 (edges):** Walk again, create all Edges (from/to References now resolvable)
-
-Both passes collect pending series data; a single bulk timedb write happens at the end.
+`client.read()` and `client.write()` accept a Polars manifest. Routing column is one of
+`node_uuid`, `edge_uuid`, or `path` (`List(Utf8)`); detected automatically. Same
+pipeline for both single-series and bulk operations — the scope helpers
+(`scope.read_series` etc.) build a one-row manifest and delegate.
 
 ## Transaction boundaries
 
-- `create_node()`, `create_edge()`, `register_series()`, `rename()`, `update()`,
-  `delete()`, `create_child()` — one transaction each.
+- `register_tree()`, `register_tree(dry_run=True)`, `create_edge()`, `register_series()`,
+  `rename()`, `update()`, `delete()` — one transaction each.
 - `read()` / `write()` — delegate to TimeDB, which manages its own transactions.
-- Bulk `client.read()` / `client.write()` — resolve the manifest in the energydb connection,
-  then hand off to TimeDB.
+- Bulk `client.read()` / `client.write()` — resolve the manifest in the energydb
+  connection, then hand off to TimeDB.
 
 ## Key decisions
 
 | Decision | Choice |
 |----------|--------|
-| Hierarchy | Arbitrary-depth tree, adjacency list (`parent_id`) |
-| Edges | Full CRUD + series I/O + endpoint navigation. Typed, directed, with JSONB properties. |
-| Setup | Imperative CRUD only, all upsert (idempotent) |
+| Identity | `UUID` end-to-end. `Element.id` is the row PK. No bigint shadow. |
+| Hierarchy | Arbitrary-depth tree, adjacency list (`parent_uuid`) |
+| Edges | Full CRUD + series I/O + endpoint navigation. Typed, directed, with JSONB `data`. |
+| Setup | `register_tree(tree)` is the single entry point — declarative, idempotent, mode-aware |
+| Mutation | Renames / moves / property edits via the same uuid-keyed upsert. Imperative single-element ops on `NodeScope` for surgical changes. |
 | Series descriptor | `TimeSeriesDescriptor` lives in `timedatamodel` (upstream) |
-| `data_type` vs. `role` | `data_type` everywhere — `role` eliminated |
-| Retention | TimeDB concern; default `"medium"`, override at registration |
+| Retention | TimeDB concern; default by series shape (FLAT → forever, OVERLAPPING → medium), override at registration |
 | Fluent scope | `NodeScope`: full CRUD + series + `get()`. `EdgeScope`: CRUD + series + `get()` + `from_node()` / `to_node()`. |
-| Multi-tenancy | Tenant-blind. No unique on root name. Platform scopes via node id. |
-| Renames | Supported. Label sync deferred (node_id in labels provides an immutable anchor). |
-| TimeDB labels | Include `node_id` / `edge_id` as immutable anchor alongside human-readable hierarchy names |
-| Read results | Include full ancestor `path` and `node_id` columns |
+| Multi-tenancy | Tenant-blind. No unique on root name. Platform scopes via uuid. |
+| Read results | Include full ancestor `path` and `node_uuid` columns |
 | Schema source of truth | SQLAlchemy models. No raw SQL files. |
-| Manifest routing | `node_id`, `path`, or `edge_id` — mutually exclusive, autodetected |
+| Manifest routing | `node_uuid`, `path`, or `edge_uuid` — mutually exclusive, autodetected |

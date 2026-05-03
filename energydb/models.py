@@ -1,10 +1,25 @@
-"""SQLAlchemy declarative models for EnergyDB PostgreSQL tables."""
+"""SQLAlchemy declarative models for EnergyDB PostgreSQL tables.
 
-from typing import cast
+These models are the single schema source of truth — Alembic-friendly. The
+``energydb`` schema, the immutability trigger on ``series``, and the partial
+unique index on root names are all attached as ``DDL`` events on
+``Base.metadata``.
+
+UUID is the primary identity for every row in ``node`` and ``edge``.
+``parent_uuid`` and ``edge.from_node_uuid`` / ``to_node_uuid`` are FKs by
+UUID — the application Reference holds a UUID and writes it directly into
+the FK column, no translation step. ``series.series_id`` stays BIGINT (it's
+timedb-internal, not an EDM identity).
+
+Retention tier names are owned by :data:`timedb.RETENTION_TIERS`; energydb
+does **not** encode them in a CHECK constraint, so adding a tier in timedb
+does not require an energydb migration.
+"""
 
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy import event
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
@@ -14,24 +29,27 @@ class Base(DeclarativeBase):
 class Node(Base):
     __tablename__ = "node"
 
-    node_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
+    uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
     node_type = sa.Column(sa.Text, nullable=False)
     name = sa.Column(sa.Text, nullable=False)
-    parent_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
+    parent_uuid = sa.Column(
+        UUID(as_uuid=True),
+        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
         nullable=True,
     )
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
-    parent = relationship("Node", remote_side=[node_id], back_populates="children_rel")
-    children_rel = relationship("Node", back_populates="parent", cascade="all, delete-orphan")
-
     __table_args__ = (
-        sa.UniqueConstraint("name", "node_type", "parent_id", name="node_child_uniq"),
-        sa.Index("ix_node_parent_id", "parent_id"),
+        sa.UniqueConstraint("parent_uuid", "name", name="node_child_uniq"),
+        sa.Index(
+            "ix_node_root_uniq",
+            "name",
+            unique=True,
+            postgresql_where=sa.text("parent_uuid IS NULL"),
+        ),
+        sa.Index("ix_node_parent_uuid", "parent_uuid"),
         sa.Index("ix_node_data_gin", "data", postgresql_using="gin"),
         {"schema": "energydb"},
     )
@@ -40,17 +58,17 @@ class Node(Base):
 class Edge(Base):
     __tablename__ = "edge"
 
-    edge_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
+    uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
     edge_type = sa.Column(sa.Text, nullable=False)
-    name = sa.Column(sa.Text, nullable=True)
-    from_node_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
+    label = sa.Column(sa.Text, nullable=True)
+    from_node_uuid = sa.Column(
+        UUID(as_uuid=True),
+        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
         nullable=False,
     )
-    to_node_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
+    to_node_uuid = sa.Column(
+        UUID(as_uuid=True),
+        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
         nullable=False,
     )
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
@@ -58,7 +76,7 @@ class Edge(Base):
     updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
-        sa.UniqueConstraint("edge_type", "from_node_id", "to_node_id", name="edge_uniq"),
+        sa.UniqueConstraint("edge_type", "from_node_uuid", "to_node_uuid", name="edge_uniq"),
         {"schema": "energydb"},
     )
 
@@ -70,19 +88,22 @@ class Series(Base):
     after insert (enforced by DB trigger). ``timeseries_type`` is mutable — a
     series can legitimately transition from flat to overlapping if the
     producer changes behavior.
+
+    ``series_id`` stays BIGINT — it's the timedb-internal handle and never
+    leaves the energydb / timedb pair.
     """
 
     __tablename__ = "series"
 
     series_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
-    node_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("energydb.node.node_id", ondelete="CASCADE"),
+    node_uuid = sa.Column(
+        UUID(as_uuid=True),
+        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
         nullable=True,
     )
-    edge_id = sa.Column(
-        sa.BigInteger,
-        sa.ForeignKey("energydb.edge.edge_id", ondelete="CASCADE"),
+    edge_uuid = sa.Column(
+        UUID(as_uuid=True),
+        sa.ForeignKey("energydb.edge.uuid", ondelete="CASCADE"),
         nullable=True,
     )
     data_type = sa.Column(sa.Text, nullable=False)
@@ -94,13 +115,12 @@ class Series(Base):
     inserted_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
-        sa.CheckConstraint("(node_id IS NULL) <> (edge_id IS NULL)", name="series_owner_xor"),
-        sa.UniqueConstraint("node_id", "data_type", "name", name="series_node_uniq"),
-        sa.UniqueConstraint("edge_id", "data_type", "name", name="series_edge_uniq"),
+        sa.CheckConstraint("(node_uuid IS NULL) <> (edge_uuid IS NULL)", name="series_owner_xor"),
+        sa.UniqueConstraint("node_uuid", "data_type", "name", name="series_node_uniq"),
+        sa.UniqueConstraint("edge_uuid", "data_type", "name", name="series_edge_uniq"),
         sa.CheckConstraint("timeseries_type IN ('FLAT','OVERLAPPING')", name="valid_timeseries_type"),
-        sa.CheckConstraint("retention IN ('short','medium','long')", name="valid_retention"),
-        sa.Index("ix_series_node", "node_id", postgresql_where=sa.text("node_id IS NOT NULL")),
-        sa.Index("ix_series_edge", "edge_id", postgresql_where=sa.text("edge_id IS NOT NULL")),
+        sa.Index("ix_series_node_uuid", "node_uuid", postgresql_where=sa.text("node_uuid IS NOT NULL")),
+        sa.Index("ix_series_edge_uuid", "edge_uuid", postgresql_where=sa.text("edge_uuid IS NOT NULL")),
         {"schema": "energydb"},
     )
 
@@ -126,9 +146,57 @@ class Run(Base):
     )
 
 
-ENERGYDB_TABLES: list[sa.Table] = [
-    cast(sa.Table, Node.__table__),
-    cast(sa.Table, Edge.__table__),
-    cast(sa.Table, Series.__table__),
-    cast(sa.Table, Run.__table__),
-]
+# ---------------------------------------------------------------------------
+# DDL events — schema, trigger function, immutability trigger
+# ---------------------------------------------------------------------------
+
+# The ``energydb`` schema has to exist before any of the tables (which all
+# carry ``schema="energydb"`` in their __table_args__) can be created.
+event.listen(
+    Base.metadata,
+    "before_create",
+    sa.DDL("CREATE SCHEMA IF NOT EXISTS energydb"),
+)
+
+# Immutability guard on ``series``: retention, canonical_unit, and the owner
+# columns can't change after insert. Reclassifying a series means registering
+# a new one (preserves CH-side data integrity).
+_SERIES_GUARD_TRIGGER_FN = sa.DDL(
+    """
+    CREATE OR REPLACE FUNCTION energydb._series_guard_immutable()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.retention      IS DISTINCT FROM OLD.retention
+        OR NEW.canonical_unit IS DISTINCT FROM OLD.canonical_unit
+        OR NEW.node_uuid      IS DISTINCT FROM OLD.node_uuid
+        OR NEW.edge_uuid      IS DISTINCT FROM OLD.edge_uuid THEN
+            RAISE EXCEPTION
+                'energydb.series: retention, canonical_unit, and owner columns '
+                'are immutable. Register a new series to change tier, unit, or '
+                'ownership.';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """
+)
+
+_SERIES_GUARD_TRIGGER = sa.DDL(
+    """
+    DROP TRIGGER IF EXISTS series_guard_immutable ON energydb.series;
+    CREATE TRIGGER series_guard_immutable
+        BEFORE UPDATE ON energydb.series
+        FOR EACH ROW EXECUTE FUNCTION energydb._series_guard_immutable();
+    """
+)
+
+event.listen(
+    Series.__table__,
+    "after_create",
+    _SERIES_GUARD_TRIGGER_FN,
+)
+event.listen(
+    Series.__table__,
+    "after_create",
+    _SERIES_GUARD_TRIGGER,
+)

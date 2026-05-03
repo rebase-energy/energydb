@@ -1,75 +1,35 @@
 """EnergyDB — Energy database extending TimeDB with hierarchical asset management."""
 
 from energydatamodel import (
+    # Areas
     Area,
     # Semantic bases
     Asset,
-    # Assets
-    Battery,
-    # Areas
     BiddingZone,
-    Building,
-    # Powergrid value types
-    Carrier,
     Collection,
     ControlArea,
     Country,
-    DeliveryPoint,
     Edge,
-    EdgeAsset,
     # Core hierarchy
     Element,
     # Containers
     EnergyCommunity,
-    # Geospatial
-    GeoLocation,
-    GeoMultiPolygon,
-    GeoPolygon,
     GridNode,
-    HeatPump,
-    House,
-    # Sensors
-    HumiditySensor,
-    HydroPowerPlant,
-    HydroTurbine,
-    # Edges
-    Interconnection,
-    # Grid nodes
-    JunctionPoint,
     # Quantities
     Kind,
-    Line,
-    Link,
-    Location,
-    Meter,
     MultiSite,
-    Network,
     Node,
     NodeAsset,
-    Pipe,
     Portfolio,
-    PVArray,
-    PVSystem,
     Quantity,
-    RadiationSensor,
-    RainSensor,
     Reference,
     Region,
-    Reservoir,
     Scope,
     Sensor,
     Site,
-    SolarPowerArea,
-    SubNetwork,
     SynchronousArea,
-    TemperatureSensor,
-    Transformer,
     VirtualPowerPlant,
     WeatherCell,
-    WindFarm,
-    WindPowerArea,
-    WindSpeedSensor,
-    WindTurbine,
     build_metric,
     # Vocabulary constructors
     cross_border_flow,
@@ -84,6 +44,33 @@ from energydatamodel import (
     spot_price,
     temperature,
 )
+from energydatamodel.battery import Battery
+from energydatamodel.building import Building, House
+from energydatamodel.grid import (
+    Carrier,
+    DeliveryPoint,
+    EdgeAsset,
+    Interconnection,
+    JunctionPoint,
+    Line,
+    Link,
+    Meter,
+    Network,
+    Pipe,
+    SubNetwork,
+    Transformer,
+)
+from energydatamodel.heatpump import HeatPump
+from energydatamodel.hydro import HydroPowerPlant, HydroTurbine, Reservoir
+from energydatamodel.solar import PVArray, PVSystem, SolarPowerArea
+from energydatamodel.weather import (
+    HumiditySensor,
+    RadiationSensor,
+    RainSensor,
+    TemperatureSensor,
+    WindSpeedSensor,
+)
+from energydatamodel.wind import WindFarm, WindPowerArea, WindTurbine
 from timedatamodel import (
     DataShape,
     DataType,
@@ -94,6 +81,7 @@ from timedatamodel import (
 )
 
 from energydb.client import EnergyDBClient
+from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.scope import EdgeScope, NodeScope
 from energydb.units import IncompatibleUnitError
 
@@ -103,6 +91,12 @@ __all__ = [
     "IncompatibleUnitError",
     "NodeScope",
     "EdgeScope",
+    # Diff
+    "TreeDiff",
+    "NodeChange",
+    "EdgeChange",
+    "NodeSnapshot",
+    "EdgeSnapshot",
     # Core hierarchy
     "Element",
     "Node",
@@ -168,11 +162,6 @@ __all__ = [
     "DataShape",
     "Frequency",
     "TimeSeriesType",
-    # Geospatial
-    "GeoLocation",
-    "GeoMultiPolygon",
-    "GeoPolygon",
-    "Location",
     # Powergrid value types
     "Carrier",
     # Vocabulary constructors

@@ -1,13 +1,31 @@
-"""Series-table operations: register, resolve for write, resolve for read."""
+"""Series-table operations: register, resolve for write, resolve for read.
+
+The series table is owned by exactly one of ``node_uuid`` / ``edge_uuid``
+(DB CHECK enforces). ``series_id BIGINT`` stays as the timedb-internal
+handle — it never leaves the energydb / timedb pair.
+
+Retention tier names are owned by timedb (see :data:`timedb.RETENTION_TIERS`).
+energydb consumes the set as a runtime guard but does not encode the values
+into its PG schema — adding a tier in timedb does not require an energydb
+migration.
+"""
 
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import polars as pl
+from timedb import RETENTION_TIERS
 
 _VALID_TIMESERIES_TYPES = {"FLAT", "OVERLAPPING"}
-_VALID_RETENTIONS = {"short", "medium", "long"}
+
+# Defaults are picked by series shape: actuals (FLAT) should never expire,
+# forecasts (OVERLAPPING) age out under the medium tier.
+_DEFAULT_RETENTION_BY_SHAPE = {
+    "FLAT": "forever",
+    "OVERLAPPING": "medium",
+}
 
 
 def _validate_timeseries_type(ts_type: str) -> None:
@@ -16,52 +34,57 @@ def _validate_timeseries_type(ts_type: str) -> None:
 
 
 def _validate_retention(retention: str) -> None:
-    if retention not in _VALID_RETENTIONS:
-        raise ValueError(f"Unknown retention {retention!r}. Valid values: {sorted(_VALID_RETENTIONS)}")
+    if retention not in RETENTION_TIERS:
+        raise ValueError(f"Unknown retention {retention!r}. Valid values: {sorted(RETENTION_TIERS)}")
 
 
 def register_series(
     conn,
     *,
-    node_id: int | None,
-    edge_id: int | None,
+    node_uuid: UUID | None,
+    edge_uuid: UUID | None,
     data_type: str,
     name: str,
     canonical_unit: str,
     timeseries_type: str,
-    retention: str,
+    retention: str | None = None,
     description: str | None = None,
 ) -> int:
     """Insert a new series row; return its series_id.
 
-    Owner is exactly one of node_id/edge_id (DB CHECK enforces).
+    Owner is exactly one of node_uuid/edge_uuid (DB CHECK enforces).
     ``retention``, ``canonical_unit``, and the owner are immutable after
     insert (DB trigger enforces). ``timeseries_type`` is mutable.
+
+    If ``retention`` is omitted, it is derived from ``timeseries_type``:
+    FLAT (actuals) → ``"forever"``, OVERLAPPING (forecasts) → ``"medium"``.
     """
-    if (node_id is None) == (edge_id is None):
-        raise ValueError("Exactly one of node_id or edge_id must be set.")
+    if (node_uuid is None) == (edge_uuid is None):
+        raise ValueError("Exactly one of node_uuid or edge_uuid must be set.")
     _validate_timeseries_type(timeseries_type)
+    if retention is None:
+        retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
     _validate_retention(retention)
 
-    conflict_constraint = "series_node_uniq" if node_id is not None else "series_edge_uniq"
+    conflict_constraint = "series_node_uniq" if node_uuid is not None else "series_edge_uniq"
     row = conn.execute(
         f"""
         INSERT INTO energydb.series
-            (node_id, edge_id, data_type, name, canonical_unit,
+            (node_uuid, edge_uuid, data_type, name, canonical_unit,
              timeseries_type, retention, description)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
         RETURNING series_id
         """,
-        (node_id, edge_id, data_type, name, canonical_unit, timeseries_type, retention, description),
+        (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
     ).fetchone()
 
     if row is not None:
         return row[0]
 
     # Conflict: fetch the existing row and verify the immutable fields agree.
-    owner_col = "node_id" if node_id is not None else "edge_id"
-    owner_val = node_id if node_id is not None else edge_id
+    owner_col = "node_uuid" if node_uuid is not None else "edge_uuid"
+    owner_val = node_uuid if node_uuid is not None else edge_uuid
     existing = conn.execute(
         f"SELECT series_id, canonical_unit, retention "
         f"FROM energydb.series "
@@ -85,8 +108,8 @@ def register_series(
 def resolve_for_write(
     conn,
     *,
-    node_id: int | None = None,
-    edge_id: int | None = None,
+    node_uuid: UUID | None = None,
+    edge_uuid: UUID | None = None,
     data_type: str,
     name: str,
 ) -> dict[str, Any]:
@@ -95,10 +118,10 @@ def resolve_for_write(
     Returns dict with series_id, canonical_unit, timeseries_type, retention.
     Raises if not found.
     """
-    if (node_id is None) == (edge_id is None):
-        raise ValueError("Exactly one of node_id or edge_id must be set.")
-    owner_col = "node_id" if node_id is not None else "edge_id"
-    owner_val = node_id if node_id is not None else edge_id
+    if (node_uuid is None) == (edge_uuid is None):
+        raise ValueError("Exactly one of node_uuid or edge_uuid must be set.")
+    owner_col = "node_uuid" if node_uuid is not None else "edge_uuid"
+    owner_val = node_uuid if node_uuid is not None else edge_uuid
     row = conn.execute(
         f"SELECT series_id, canonical_unit, timeseries_type, retention "
         f"FROM energydb.series "
@@ -118,22 +141,24 @@ def resolve_for_write(
 def resolve_for_read(
     conn,
     *,
-    node_ids: list[int] | None = None,
-    edge_ids: list[int] | None = None,
+    node_uuids: list[UUID] | None = None,
+    edge_uuids: list[UUID] | None = None,
     data_type: str | None = None,
     name: str | None = None,
 ) -> pl.DataFrame:
     """Bulk resolve series rows for a read.
 
     Returns Polars DataFrame with columns series_id, canonical_unit,
-    timeseries_type, retention, node_id, edge_id, data_type, name.
-    Empty df if nothing matches.
+    timeseries_type, retention, node_uuid, edge_uuid, data_type, name.
+    UUIDs are returned as ``Utf8`` so they join cleanly against the
+    string-form ids the manifest pipeline carries. Empty df if nothing
+    matches.
     """
-    if (node_ids is None) == (edge_ids is None):
-        raise ValueError("Exactly one of node_ids or edge_ids must be set.")
+    if (node_uuids is None) == (edge_uuids is None):
+        raise ValueError("Exactly one of node_uuids or edge_uuids must be set.")
 
-    owner_col = "node_id" if node_ids is not None else "edge_id"
-    owner_vals = node_ids if node_ids is not None else edge_ids
+    owner_col = "node_uuid" if node_uuids is not None else "edge_uuid"
+    owner_vals = node_uuids if node_uuids is not None else edge_uuids
 
     conditions = [f"{owner_col} = ANY(%s)"]
     params: list[Any] = [owner_vals]
@@ -147,7 +172,7 @@ def resolve_for_read(
 
     sql = (
         "SELECT series_id, canonical_unit, timeseries_type, retention, "
-        "node_id, edge_id, data_type, name "
+        "node_uuid, edge_uuid, data_type, name "
         "FROM energydb.series WHERE " + " AND ".join(conditions)
     )
     rows = conn.execute(sql, params).fetchall()
@@ -158,8 +183,8 @@ def resolve_for_read(
             "canonical_unit": [r[1] for r in rows],
             "timeseries_type": [r[2] for r in rows],
             "retention": [r[3] for r in rows],
-            "node_id": [r[4] for r in rows],
-            "edge_id": [r[5] for r in rows],
+            "node_uuid": [str(r[4]) if r[4] is not None else None for r in rows],
+            "edge_uuid": [str(r[5]) if r[5] is not None else None for r in rows],
             "data_type": [r[6] for r in rows],
             "name": [r[7] for r in rows],
         },
@@ -168,8 +193,8 @@ def resolve_for_read(
             "canonical_unit": pl.Utf8,
             "timeseries_type": pl.Utf8,
             "retention": pl.Utf8,
-            "node_id": pl.Int64,
-            "edge_id": pl.Int64,
+            "node_uuid": pl.Utf8,
+            "edge_uuid": pl.Utf8,
             "data_type": pl.Utf8,
             "name": pl.Utf8,
         },

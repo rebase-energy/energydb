@@ -49,68 +49,96 @@ Requires Python 3.9+ and a PostgreSQL database (e.g., [Neon](https://neon.tech),
 
 ### 2. Usage Example
 
-Build the entire tree in Python — structure, series schemas, and data — then persist it in one call.
+Structure and data live in two separate calls so each can be re-run on its own
+cadence. Identity is a UUID7 generated on every `Element` at construction; that same
+UUID is the row PK in Postgres, so renames / moves / property edits round-trip in
+place.
 
 ```python
 import energydb as edb
 import polars as pl
 from datetime import datetime, timezone, timedelta
 from shapely.geometry import Point
-from timedb import TimeDataClient
 
-td = TimeDataClient()
-client = edb.EnergyDataClient(td)
-client.create()   # creates the energydb schema + tables
+client = edb.EnergyDBClient()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
+client.create()                # PG schema + CH series_values table
 
-# Helper to build a simple hourly DataFrame
 base = datetime(2025, 1, 1, tzinfo=timezone.utc)
-index = [base + timedelta(hours=i) for i in range(24)]
+hours = [base + timedelta(hours=i) for i in range(24)]
 
-def hourly(values):
-    return pl.DataFrame({"valid_time": index, "value": values})
-
-# 1. Declare the full portfolio as an EDM tree
-#    TimeSeries carries data inline, TimeSeriesDescriptor is schema-only
+# 1. Declare the full portfolio as an EDM tree.
+#    TimeSeriesDescriptor is structure-only (schema), no data inline.
 portfolio = edb.Portfolio(name="My Portfolio", members=[
     edb.Site(name="Offshore-1", geometry=Point(3.0, 55.0), members=[
         edb.WindTurbine(name="T01", capacity=3.5, hub_height=80, timeseries=[
-            edb.TimeSeries(hourly([2.5 + 0.1*h for h in range(24)]),
-                           name="power", unit="MW", data_type=edb.DataType.ACTUAL),
-            edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.FORECAST,
+            edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                     data_type=edb.DataType.ACTUAL),
+            edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                     data_type=edb.DataType.FORECAST,
                                      timeseries_type=edb.TimeSeriesType.OVERLAPPING),
         ]),
         edb.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
-            edb.TimeSeries(hourly([2.8 + 0.1*h for h in range(24)]),
-                           name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+            edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                     data_type=edb.DataType.ACTUAL),
         ]),
     ]),
     edb.Site(name="Rooftop-1", geometry=Point(4.5, 52.0), members=[
-        edb.PVSystem(name="PV01", capacity=10, surface_tilt=25, surface_azimuth=180, timeseries=[
-            edb.TimeSeries(hourly([5.0 + 0.2*h for h in range(24)]),
-                           name="power", unit="MW", data_type=edb.DataType.ACTUAL),
-        ]),
+        edb.PVSystem(name="PV01", capacity=10, surface_tilt=25, surface_azimuth=180,
+                     timeseries=[
+                         edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                                  data_type=edb.DataType.ACTUAL),
+                     ]),
         edb.Battery(name="B01", storage_capacity=1000, max_charge=500),
     ]),
 ])
 
-# 2. Persist it — one call
-#    Upserts every node, registers every series, bulk-writes all data. Idempotent.
-root_id = client.write(portfolio)
+# 2. Persist the structure + series schemas. Idempotent.
+root_uuid = client.register_tree(portfolio)
 
-# 3. Read with the fluent API
-client.node("My Portfolio").node("Offshore-1").node("T01").read(
-    data_type="actual", name="power",
-    start_valid=datetime(2025, 1, 1, tzinfo=timezone.utc),
+# 3. Bulk-load timeseries data via a Polars manifest.
+manifest = pl.DataFrame({
+    "path":       [["My Portfolio", "Offshore-1", "T01"]] * 24,
+    "data_type":  ["actual"] * 24,
+    "name":       ["power"] * 24,
+    "valid_time": hours,
+    "value":      [2.5 + 0.1*h for h in range(24)],
+})
+client.write(manifest)
+
+# 4. Read with the fluent API
+client.node("My Portfolio", "Offshore-1", "T01").read(
+    data_type="actual", name="power", start_valid=base,
 )
 
 # Subtree read — all actuals for 'power' across the portfolio
 client.node("My Portfolio").read(data_type="actual", name="power")
 
 # Filter descendants by EDM type
-client.node("My Portfolio").find(type="WindTurbine").read(data_type="actual", name="power")
+client.node("My Portfolio").where(type="WindTurbine").read(data_type="actual", name="power")
 
-# 4. Reconstruct the full EDM tree from the database
+# 5. Reconstruct the full EDM tree from the database
 tree = client.get_tree("My Portfolio", include_series=True)
+```
+
+### 3. Read → modify → write back
+
+Because identity is the UUID, the round-trip preserves it. Renames, moves, and
+property edits become silent UPDATEs; explicit confirmation gates destructive ops.
+
+```python
+tree = client.get_tree("My Portfolio")     # uuids populated from PG
+tree.members[0].name = "Renamed-Site"      # silent rename
+tree.members[0].members[0].capacity = 4.0  # silent property edit
+del tree.members[0].members[1]              # remove a turbine
+
+# Preview before applying
+diff = client.register_tree(
+    tree, mode="replace_subtree", allow_delete=True, dry_run=True,
+)
+diff.print()
+
+# Apply
+client.register_tree(tree, mode="replace_subtree", allow_delete=True)
 ```
 
 ---

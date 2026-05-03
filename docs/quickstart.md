@@ -1,8 +1,10 @@
 # Quickstart
 
-EnergyDB extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for
-[EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies and links them
-to time series with full auditability.
+EnergyDB extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent
+storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) trees,
+links them to time series, and models grid topology via typed edges. Every node and
+edge is identified by a UUID — the same UUID lives on the in-memory `Element`, in the
+JSON wire format, and as the row PK in Postgres.
 
 ## Installation
 
@@ -15,161 +17,212 @@ or any hosted provider) and a running ClickHouse instance for TimeDB's series st
 
 ## Connecting
 
-`EnergyDataClient` uses composition: it holds a reference to a `TimeDataClient` and shares
-its connection pool. Schema management happens via `.create()` / `.delete()`.
-
 ```python
-from timedb import TimeDataClient
-from energydb import EnergyDataClient
+from energydb import EnergyDBClient
 
-td = TimeDataClient()
-client = EnergyDataClient(td)
-client.create()   # CREATE SCHEMA + Base.metadata.create_all
+client = EnergyDBClient()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
+client.create()            # CREATE SCHEMA + Base.metadata.create_all + CH series_values
 ```
 
-## Building the hierarchy
+## Building the hierarchy with `register_tree`
 
-Setup is **imperative** and **idempotent** — every `create_node` call is an upsert.
-Series declared inline on an EDM object via `TimeSeriesDescriptor` are auto-registered.
+`register_tree(tree)` is the single entry point for structure. Build the whole portfolio
+top-down as one nested expression and persist it in one call. Idempotent.
 
 ```python
 import energydb as edb
-from shapely.geometry import Point
 
-portfolio_id = client.create_node(edb.Portfolio(name="My Portfolio"))
-
-site_id = client.create_node(
-    edb.Site(name="Offshore-1", geometry=Point(3.0, 55.0)),
-    parent=portfolio_id,
+portfolio = edb.Portfolio(
+    name="My Portfolio",
+    members=[
+        edb.Site(
+            name="Offshore-1",
+            lat=55.0, lon=3.0,
+            members=[
+                edb.WindTurbine(
+                    name="T01", capacity=3.5, hub_height=80,
+                    timeseries=[
+                        edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                                 data_type=edb.DataType.ACTUAL),
+                        edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                                 data_type=edb.DataType.FORECAST,
+                                                 timeseries_type=edb.TimeSeriesType.OVERLAPPING),
+                    ],
+                ),
+                edb.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
+                    edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                             data_type=edb.DataType.ACTUAL),
+                ]),
+            ],
+        ),
+    ],
 )
 
-t01_id = client.create_node(
-    edb.WindTurbine(name="T01", capacity=3.5, hub_height=80, timeseries=[
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.FORECAST,
-                                 timeseries_type=edb.TimeSeriesType.OVERLAPPING),
-    ]),
-    parent=site_id,
-)
-
-# Register a series after the fact using kwargs
-client.node(id=t01_id).register_series(name="wind_speed", unit="m/s", data_type="actual")
+root_uuid = client.register_tree(portfolio)
 ```
 
-## Writing and reading time series
+Every `Element` got its `uuid` at construction; `register_tree` writes them straight
+into the row PK. Re-running with the same tree is a no-op.
 
-Terminal operations on a `NodeScope` resolve the lazy path in a single query and dispatch
-to TimeDB.
+## `register_tree` modes
+
+```python
+client.register_tree(tree)                                            # additive (default)
+client.register_tree(tree, mode="additive")                           # explicit
+client.register_tree(tree, mode="replace_subtree", allow_delete=True) # authoritative
+client.register_tree(tree, mode="replace_subtree", allow_delete=True, dry_run=True)
+```
+
+| Mode | Rows under the subtree root not in the target tree |
+|------|-----------------------------------------------------|
+| `"additive"` | Left untouched. Re-running with a smaller tree never deletes. |
+| `"replace_subtree"` | Candidates for deletion. `allow_delete=True` applies; otherwise raises. |
+
+With UUID identity, **renames / moves / property edits all upsert in place** (same uuid,
+different `name` / `parent_uuid` / `data`). Type changes raise — element type is
+immutable for a given id.
+
+```python
+# Read existing tree, modify, write back authoritatively.
+tree = client.get_tree("My Portfolio")
+tree.members[0].name = "Renamed-Site"          # silent rename
+tree.members[0].members[0].capacity = 4.0      # silent property edit
+del tree.members[0].members[1]                  # remove a turbine
+
+# Preview before applying.
+diff = client.register_tree(tree, mode="replace_subtree",
+                            allow_delete=True, dry_run=True)
+diff.print()
+
+# Apply.
+client.register_tree(tree, mode="replace_subtree", allow_delete=True)
+```
+
+## Bulk timeseries write
+
+`client.write(manifest)` loads timeseries via a Polars manifest. Routing column is one
+of `node_uuid`, `edge_uuid`, or `path` (`List(Utf8)`).
 
 ```python
 import polars as pl
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-df = pl.DataFrame({
-    "valid_time": [datetime(2025, 1, 1, h, tzinfo=timezone.utc) for h in range(24)],
+base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+hours = [base + timedelta(hours=h) for h in range(24)]
+
+manifest = pl.DataFrame({
+    "path":       [["My Portfolio", "Offshore-1", "T01"]] * 24,
+    "data_type":  ["actual"] * 24,
+    "name":       ["power"] * 24,
+    "valid_time": hours,
     "value":      [2.5 + 0.1 * h for h in range(24)],
 })
+client.write(manifest)
+```
 
-# Single-series write
-client.node("My Portfolio").node("Offshore-1").node("T01").write(
-    df, name="power", data_type="actual",
-)
+## Reading
 
-# Single-series read
-client.node("My Portfolio").node("Offshore-1").node("T01").read(
+```python
+# Single-series read (path-based fluent CLI)
+df = client.node("My Portfolio", "Offshore-1", "T01").read(
     data_type="actual", name="power",
-    start_valid=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    start_valid=base,
 )
 
-# Subtree read — every matching series below the scope
-client.node("My Portfolio").read(data_type="actual", name="power")
+# Subtree read — every actual `power` across the whole portfolio
+df = client.node("My Portfolio").read(data_type="actual", name="power")
 
 # Filter descendants by EDM type
-client.node("My Portfolio").find(type="WindTurbine").read(
+df = client.node("My Portfolio").where(type="WindTurbine").read(
     data_type="actual", name="power",
 )
 ```
 
-Read results always include full ancestor context (`path`, `node_id`, `node`, `node_type`,
-`data_type`, `name`, `unit`, `series_id`, `valid_time`, `value`).
+Read results include `path` (List(Utf8)), `node` (name), `node_type`, `node_uuid`,
+`data_type`, `name`, `series_id`, `valid_time`, `value`.
 
-## Hierarchy queries
+## Tree reconstruction
 
 ```python
-# Single node (no children), reconstructed as an EDM object
-turbine = client.get_node("T01")
+# Single node reconstructed as an EDM object — uuid populated from the DB
+turbine = client.get_node("T01")           # by name (within scope)
+turbine = client.node("My Portfolio", "Offshore-1", "T01").get()
+turbine = client.node(uuid=...).get()      # by uuid
 
-# Same thing via the fluent API
-turbine = client.node("My Portfolio").node("Offshore-1").node("T01").get()
-
-# Full EDM tree with descendants; optionally attach TimeSeriesDescriptors
+# Full subtree as an EDM tree
 tree = client.get_tree("My Portfolio", include_series=True)
 
-# Flat list — EDM objects filtered by type / subtree / properties
+# Flat list filtered by type / subtree / properties
 turbines = client.query_nodes(type="WindTurbine", within="My Portfolio")
 ```
 
 ## Edges
 
-Edges model typed links between nodes (lines, transformers, pipes, interconnections).
-They carry their own properties and can have time series attached (e.g. power flow).
+Edges model typed cross-tree links — lines, transformers, pipes, interconnections.
 
 ```python
-# Create grid nodes
-bus_a_id = client.create_node(edb.JunctionPoint(name="BusA"), parent=site_id)
-bus_b_id = client.create_node(edb.JunctionPoint(name="BusB"), parent=site_id)
+from energydatamodel.reference import Reference
 
-# Create an edge between them
-line_id = client.create_edge(
-    edb.Line(name="Cable-1", capacity=500),
-    from_node=bus_a_id,
-    to_node=bus_b_id,
+bus_a = edb.JunctionPoint(name="BusA")
+bus_b = edb.JunctionPoint(name="BusB")
+line = edb.Line(
+    name="Cable-1",
+    capacity=500,
+    from_element=Reference(bus_a),
+    to_element=Reference(bus_b),
 )
 
-# Read it back — from/to are Reference objects with node paths
-line = client.get_edge(id=line_id)
+# Persist the topology in one call — register_tree handles nodes then edges.
+client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b, line]))
 
-# Same thing via the fluent API
-line = client.edge(id=line_id).get()
+# Lookup by uuid or by triple
+e = client.get_edge(uuid=line.id)
+e = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line")
 
-# Query edges within a subtree
-lines = client.query_edges(type="Line", within="Offshore-1")
-
-# Register and write time series on an edge
-client.edge(id=line_id).register_series(name="power_flow", unit="MW", data_type="actual")
-client.edge(id=line_id).write(df, name="power_flow", data_type="actual")
-client.edge(id=line_id).read(data_type="actual", name="power_flow")
-
-# Navigate from an edge to its endpoints
-client.edge(id=line_id).from_node().read(data_type="actual")
-client.edge(id=line_id).to_node().read(data_type="actual")
+# Series on an edge
+scope = client.edge(uuid=line.id)
+scope.register_series(name="power_flow", canonical_unit="MW",
+                      data_type="actual", timeseries_type="FLAT")
+scope.write_series(df, name="power_flow", data_type="actual")
+scope.read(name="power_flow", data_type="actual")
 ```
 
-## Bulk I/O
-
-`client.read()` and `client.write()` accept a Polars manifest keyed by `node_id`, `path`,
-or `edge_id`. The modes are mutually exclusive and autodetected by column name.
+## Manifest routing — three forms
 
 ```python
-# Read by node_id (best performance, what platform uses)
+# By uuid (programmatic)
 manifest = pl.DataFrame({
-    "node_id":   [t01_id, t02_id],
-    "data_type": ["forecast", "forecast"],
-    "name":    ["power", "power"],
+    "node_uuid": [str(t01.id), str(t02.id)],
+    "data_type": ["forecast"] * 2,
+    "name":      ["power"] * 2,
 })
-df = client.read(manifest, start_valid=dt1, end_valid=dt2)
 
-# Read by path (human-readable, always unambiguous)
+# By path (human-readable; List(Utf8) preserves names with `/`, `.`, spaces)
+manifest = pl.DataFrame([
+    {"path": ("My Portfolio", "Offshore-1", "T01"), "data_type": "forecast", "name": "power"},
+    {"path": ("My Portfolio", "Offshore-1", "T02"), "data_type": "forecast", "name": "power"},
+])
+
+# By edge_uuid (for edge-attached series)
 manifest = pl.DataFrame({
-    "path":      ["My Portfolio/Offshore-1/T01", "My Portfolio/Offshore-1/T02"],
-    "data_type": ["forecast", "forecast"],
-    "name":    ["power", "power"],
+    "edge_uuid": [str(line.id)],
+    "data_type": ["actual"],
+    "name":      ["power_flow"],
 })
-df = client.read(manifest, start_valid=dt1, end_valid=dt2)
 ```
 
-Write mirrors the same modes; the only extra requirement is the `valid_time` and
-`value` columns per row.
+Routing modes are mutually exclusive — autodetected by column name.
+
+## Imperative single-element ops
+
+For surgical edits, fluent scope ops:
+
+```python
+client.node("My Portfolio", "Offshore-1", "T01").rename("T01-A")
+client.node("My Portfolio", "Offshore-1", "T01-A").update(data={"capacity": 4.5})
+client.node("My Portfolio", "Offshore-1", "T01-A").move_to(client.node("My Portfolio", "Onshore-1"))
+client.node("My Portfolio", "Offshore-1", "T01-A").delete()
+```
 
 See [`examples/quickstart.ipynb`](https://github.com/rebase-energy/energydb/blob/main/examples/quickstart.ipynb)
 for a complete walkthrough.

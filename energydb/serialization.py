@@ -2,21 +2,29 @@
 
 Thin layer over EDM's JSON round-trip system (``energydatamodel.json_io``).
 Each EDM element maps to a single DB row with structural columns
-(``node_type``/``edge_type``, ``name``, FKs) plus a single ``data`` JSONB
-column carrying every remaining field — geometry (GeoJSON), tz (ZoneInfo),
-commissioning_date (ISO), sensor height, and all domain properties.
+(``uuid``, ``node_type`` / ``edge_type``, ``name`` / ``label``, FK uuids)
+plus a single ``data`` JSONB column carrying every remaining field —
+geometry (GeoJSON), tz (ZoneInfo), commissioning_date (ISO), sensor
+height, and all domain properties.
+
+Identity is the EDM ``Element.id`` (UUID7) — round-tripped as the row's
+``uuid`` PK on both ``node`` and ``edge``.
 """
 
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import energydatamodel as edm
 from energydatamodel.json_io import get_registry
 from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
 
-_EDGE_EXCLUDES = {"from_entity", "to_entity"}  # stored as FK columns
+# ``id`` is round-tripped via the dedicated ``uuid`` column, not through the
+# ``data`` JSONB blob. Same for fields stored as their own columns.
+_NODE_EXCLUDES = {"id", "timeseries"}
+_EDGE_EXCLUDES = {"id", "from_element", "to_element", "timeseries"}
 
 
 def _type_registry() -> dict[str, type]:
@@ -32,15 +40,15 @@ def _type_registry() -> dict[str, type]:
 def serialize_node(edm_obj) -> dict[str, Any]:
     """Convert any EDM Node to a dict suitable for database insertion.
 
-    ``data`` carries everything except the structural ``node_type`` and
-    ``name`` columns (which live as dedicated fields for uniqueness and
-    lookup). Children are excluded — tree structure is stored via the
-    ``parent_id`` column.
+    Returns a dict with structural columns (``uuid``, ``node_type``, ``name``)
+    and a JSONB-wrapped ``data`` blob carrying everything else. Children are
+    excluded — tree structure is stored via the ``parent_uuid`` column.
     """
-    storage = edm.element_to_storage_dict(edm_obj)
+    storage = edm.element_to_storage_dict(edm_obj, extra_excludes=_NODE_EXCLUDES)
     node_type = storage.pop("__type__")
     name = storage.pop("name", None) or node_type
     return {
+        "uuid": edm_obj.id,
         "node_type": node_type,
         "name": name,
         "data": Jsonb(storage),
@@ -50,8 +58,11 @@ def serialize_node(edm_obj) -> dict[str, Any]:
 def reconstruct_node(row: dict[str, Any]):
     """Reconstruct an EDM Node from a database row dict.
 
-    Expects ``row`` to have ``node_type``, ``name``, and ``data`` (a plain
-    dict as returned by psycopg for JSONB columns).
+    Expects ``row`` to have ``uuid``, ``node_type``, ``name``, and ``data`` (a
+    plain dict as returned by psycopg for JSONB columns).
+
+    The reconstructed element's ``id`` is populated from ``row["uuid"]`` so
+    the in-memory identity matches the persistent identity.
     """
     node_type = row["node_type"]
     cls = _type_registry().get(node_type)
@@ -64,6 +75,9 @@ def reconstruct_node(row: dict[str, Any]):
     data["__type__"] = node_type
     if row.get("name"):
         data["name"] = row["name"]
+    # Carry the persistent uuid into the EDM ``id`` field via the wire format.
+    uuid_val = row["uuid"]
+    data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
     return edm.element_from_json(data)
 
 
@@ -75,16 +89,19 @@ def reconstruct_node(row: dict[str, Any]):
 def serialize_edge(edm_obj) -> dict[str, Any]:
     """Convert an EDM Edge to a dict suitable for database insertion.
 
-    ``from_entity`` / ``to_entity`` are excluded from ``data`` — they're
-    stored as ``from_node_id`` / ``to_node_id`` FK columns and resolved by
-    the caller.
+    The EDM-side ``name`` field maps to the DB column ``label`` — the edge
+    name is a human label, not an identifier (the triple
+    ``(edge_type, from_node_uuid, to_node_uuid)`` is the upsert key).
+    ``from_element`` / ``to_element`` are excluded from ``data`` — they're
+    stored as ``from_node_uuid`` / ``to_node_uuid`` FK columns.
     """
     storage = edm.element_to_storage_dict(edm_obj, extra_excludes=_EDGE_EXCLUDES)
     edge_type = storage.pop("__type__")
-    name = storage.pop("name", None)
+    label = storage.pop("name", None)
     return {
+        "uuid": edm_obj.id,
         "edge_type": edge_type,
-        "name": name,
+        "label": label,
         "data": Jsonb(storage),
     }
 
@@ -92,9 +109,10 @@ def serialize_edge(edm_obj) -> dict[str, Any]:
 def reconstruct_edge(row: dict[str, Any]):
     """Reconstruct an EDM Edge from a database row dict.
 
-    Sets ``from_entity`` / ``to_entity`` as :class:`Reference` objects
-    pointing to the slash-joined node paths provided by the caller (which
-    resolved them from the FK ``from_node_id`` / ``to_node_id`` columns).
+    Expects ``row`` to have ``uuid``, ``edge_type``, ``label``, ``data``,
+    ``from_node_uuid``, ``to_node_uuid``. Endpoints are returned as
+    :class:`Reference` objects holding the endpoint uuids — no path round-
+    trip needed.
     """
     edge_type = row["edge_type"]
     cls = _type_registry().get(edge_type)
@@ -105,12 +123,23 @@ def reconstruct_edge(row: dict[str, Any]):
 
     data = dict(row.get("data") or {})
     data["__type__"] = edge_type
-    if row.get("name"):
-        data["name"] = row["name"]
-    obj = edm.element_from_json(data)
+    if row.get("label"):
+        data["name"] = row["label"]
+    uuid_val = row["uuid"]
+    data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
 
-    if row.get("from_node_path"):
-        obj.from_entity = Reference(row["from_node_path"])
-    if row.get("to_node_path"):
-        obj.to_entity = Reference(row["to_node_path"])
+    from_uuid = row.get("from_node_uuid")
+    to_uuid = row.get("to_node_uuid")
+    if from_uuid is not None:
+        data["from_element"] = {"__ref__": str(from_uuid) if isinstance(from_uuid, UUID) else from_uuid}
+    if to_uuid is not None:
+        data["to_element"] = {"__ref__": str(to_uuid) if isinstance(to_uuid, UUID) else to_uuid}
+
+    obj = edm.element_from_json(data)
+    # Defensive: if the JSON blob carried stale endpoint refs, the FK columns
+    # we just attached are authoritative — overwrite.
+    if from_uuid is not None:
+        obj.from_element = Reference(from_uuid if isinstance(from_uuid, UUID) else UUID(str(from_uuid)))
+    if to_uuid is not None:
+        obj.to_element = Reference(to_uuid if isinstance(to_uuid, UUID) else UUID(str(to_uuid)))
     return obj
