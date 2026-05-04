@@ -20,7 +20,9 @@ print("1/4  Installing energydb …")
 _run(f'"{sys.executable}" -m pip install -q energydb')
 
 print("2/4  Configuring and starting PostgreSQL …")
-subprocess.run("service postgresql start", shell=True, check=True)
+_run("apt-get -qq update")
+_run("DEBIAN_FRONTEND=noninteractive apt-get -qq install -y postgresql postgresql-contrib")
+_run("service postgresql start")
 with open("/tmp/init_energydb.sql", "w") as f:
     f.write("ALTER USER postgres PASSWORD 'energydb';\nCREATE DATABASE energydb;\n")
 _run('su - postgres -c "psql -f /tmp/init_energydb.sql"')
@@ -37,8 +39,8 @@ _run(
     " | tee /etc/apt/sources.list.d/clickhouse.list"
 )
 _run("apt-get -qq update")
-_run("apt-get -qq install -y clickhouse-server clickhouse-client")
-subprocess.run("service clickhouse-server start", shell=True, check=True)
+_run("DEBIAN_FRONTEND=noninteractive apt-get -qq install -y clickhouse-server clickhouse-client")
+_run("service clickhouse-server start")
 
 print("4/4  Setting environment variables …")
 os.environ["TIMEDB_PG_DSN"] = "postgresql://postgres:energydb@localhost/energydb"
