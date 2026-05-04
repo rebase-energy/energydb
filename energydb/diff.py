@@ -250,18 +250,19 @@ class TreeDiff:
         #   note    — bracketed annotation (rename, move, insert, delete, ...)
         #   parent  — uuid of parent in the rendered tree
         view: dict[UUID, _RenderRow] = {}
-        roots: list[UUID] = []
         children_by_parent: dict[UUID | None, list[UUID]] = {}
 
         for change in self.node_changes:
             row = _render_row_for_node(change)
             view[change.uuid] = row
             children_by_parent.setdefault(row.parent_uuid, []).append(change.uuid)
-            if row.parent_uuid is None:
-                roots.append(change.uuid)
 
-        # Render each root subtree.
-        if not view:
+        # A change is a render trunk if its parent isn't itself a change —
+        # either parent_uuid is None, or the parent is an unchanged ancestor
+        # (e.g. a renamed Site whose Portfolio parent was not modified).
+        roots = [uid for uid, row in view.items() if row.parent_uuid not in view]
+
+        if not view and not self.edge_changes:
             out.write("(no changes)\n")
         else:
             for root in roots:

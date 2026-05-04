@@ -275,8 +275,8 @@ class TestTreeDiffPrint:
         out = self._capture(d)
         # Root line precedes child line; child appears with a tree connector.
         lines = out.splitlines()
-        p_idx = next(i for i, l in enumerate(lines) if "Portfolio" in l)
-        s_idx = next(i for i, l in enumerate(lines) if "Site" in l)
+        p_idx = next(i for i, line in enumerate(lines) if "Portfolio" in line)
+        s_idx = next(i for i, line in enumerate(lines) if "Site" in line)
         assert p_idx < s_idx
         assert "└──" in lines[s_idx] or "├──" in lines[s_idx]
 
@@ -291,3 +291,67 @@ class TestTreeDiffPrint:
         out = self._capture(d)
         assert "edges:" in out
         assert "+ Line 'Cable'" in out
+
+    def test_change_under_unchanged_ancestor_renders(self):
+        """A change whose parent is unchanged (and thus absent from the diff)
+        must still render — it becomes a render trunk in its own right.
+        Regression for `diff.print()` silently producing no output when
+        ``replace_subtree`` only edits a deep node."""
+        unchanged_portfolio = uuid4()
+        site_uuid = uuid4()
+        d = TreeDiff(
+            node_changes=[
+                NodeChange(
+                    old=_node(site_uuid, type="Site", name="Old", parent=unchanged_portfolio),
+                    new=_node(site_uuid, type="Site", name="New", parent=unchanged_portfolio),
+                ),
+            ]
+        )
+        out = self._capture(d)
+        assert "~ Site 'New'" in out
+        assert "rename 'Old' → 'New'" in out
+
+    def test_mixed_subtree_edit_under_unchanged_root(self):
+        """Mirrors the notebook flow: rename a Site, edit a child's data,
+        delete a sibling — all under an unchanged Portfolio. The Site is
+        the render trunk; the two children nest under it."""
+        portfolio = uuid4()
+        site = uuid4()
+        t01 = uuid4()
+        t02 = uuid4()
+        d = TreeDiff(
+            node_changes=[
+                NodeChange(
+                    old=_node(site, type="Site", name="Offshore-1", parent=portfolio),
+                    new=_node(site, type="Site", name="Offshore-Renamed", parent=portfolio),
+                ),
+                NodeChange(
+                    old=_node(t01, type="WindTurbine", name="T01", parent=site, data={"capacity": 3.5}),
+                    new=_node(t01, type="WindTurbine", name="T01", parent=site, data={"capacity": 4.0}),
+                ),
+                NodeChange(
+                    old=_node(t02, type="WindTurbine", name="T02", parent=site),
+                    new=None,
+                ),
+            ]
+        )
+        out = self._capture(d)
+        lines = out.splitlines()
+        site_idx = next(i for i, line in enumerate(lines) if "Site 'Offshore-Renamed'" in line)
+        t01_idx = next(i for i, line in enumerate(lines) if "WindTurbine 'T01'" in line)
+        t02_idx = next(i for i, line in enumerate(lines) if "WindTurbine 'T02'" in line)
+        # Site comes first (no indent), children below indented under it.
+        assert site_idx < t01_idx < t02_idx
+        assert lines[site_idx].lstrip().startswith("~")
+        for child_line in (lines[t01_idx], lines[t02_idx]):
+            assert "├──" in child_line or "└──" in child_line
+        assert "capacity: 3.5 → 4.0" in out
+        assert "- WindTurbine 'T02'" in out
+
+    def test_edges_only_diff_does_not_say_no_changes(self):
+        """A diff with only edge changes must not also print '(no changes)'."""
+        edge_uuid = uuid4()
+        d = TreeDiff(edge_changes=[EdgeChange(old=None, new=_edge(edge_uuid, type="Line", label="L"))])
+        out = self._capture(d)
+        assert "no changes" not in out
+        assert "edges:" in out
