@@ -70,7 +70,7 @@ def test_register_flat_series_and_write_read(edb):
     )
     assert isinstance(sid, int) and sid > 0
 
-    edb.node("root").node("asset_a").write_series(
+    edb.node("root").node("asset_a").write(
         _ts_df(3),
         data_type="actual",
         name="capacity",
@@ -98,7 +98,7 @@ def test_register_overlapping_series_requires_knowledge_time(edb):
     )
 
     with pytest.raises(ValueError, match="knowledge_time is required for OVERLAPPING"):
-        edb.node("root").node("asset_a").write_series(
+        edb.node("root").node("asset_a").write(
             _ts_df(2),
             data_type="forecast",
             name="power",
@@ -114,13 +114,13 @@ def test_overlapping_write_read_with_kt(edb):
         retention="medium",
     )
 
-    edb.node("root").node("asset_a").write_series(
+    edb.node("root").node("asset_a").write(
         _ts_df(2),
         data_type="forecast",
         name="power",
         knowledge_time=KT_1,
     )
-    edb.node("root").node("asset_a").write_series(
+    edb.node("root").node("asset_a").write(
         _ts_df(2).with_columns(pl.col("value") + 100),
         data_type="forecast",
         name="power",
@@ -170,8 +170,8 @@ def test_cross_retention_read_is_single_query(edb):
         timeseries_type="OVERLAPPING",
         retention="medium",
     )
-    asset.write_series(_ts_df(2), data_type="actual", name="capacity")
-    asset.write_series(_ts_df(2), data_type="forecast", name="power", knowledge_time=KT_1)
+    asset.write(_ts_df(2), data_type="actual", name="capacity")
+    asset.write(_ts_df(2), data_type="forecast", name="power", knowledge_time=KT_1)
 
     result = asset.read()
     # Two series × 2 rows = 4 rows
@@ -194,7 +194,7 @@ def test_read_runs_for_series_hydrates_pg_metadata(edb):
     run_id = (
         edb.node("root")
         .node("asset_a")
-        .write_series(
+        .write(
             _ts_df(2),
             data_type="actual",
             name="capacity",

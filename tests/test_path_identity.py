@@ -172,7 +172,7 @@ def test_move_to_preserves_uuid_and_series(client):
         retention="forever",
     )
     df = pl.DataFrame({"valid_time": _hours(2), "value": [3.5, 3.5]})
-    scope.write_series(df, data_type="actual", name="capacity")
+    scope.write(df, data_type="actual", name="capacity")
 
     scope.move_to(client.node("P", "NewSite"))
 

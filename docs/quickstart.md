@@ -183,7 +183,7 @@ e = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line")
 scope = client.edge(uuid=line.id)
 scope.register_series(name="power_flow", canonical_unit="MW",
                       data_type="actual", timeseries_type="FLAT")
-scope.write_series(df, name="power_flow", data_type="actual")
+scope.write(df, name="power_flow", data_type="actual")
 scope.read(name="power_flow", data_type="actual")
 ```
 

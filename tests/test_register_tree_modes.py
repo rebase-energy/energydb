@@ -213,6 +213,36 @@ def test_dry_run_with_replace_subtree(client):
     assert client.node("P", "S", "T").get().capacity == 3.5
 
 
+def test_replace_subtree_noop_roundtrip_with_geometries_has_no_changes(client):
+    """Read-modify-write with no mutation must produce an empty diff, even when
+    nodes carry shapely geometries. Regression for spurious data-edit entries
+    caused by tuple coords in serialize output vs list coords from JSONB."""
+    from shapely.geometry import Point, Polygon
+
+    tree = edb.Portfolio(
+        name="P",
+        members=[
+            edb.Site(
+                name="Offshore",
+                geometry=Point(3.0, 55.0),
+                members=[
+                    edb.WindTurbine(name="T01", capacity=3.5, geometry=Point(3.02, 55.01)),
+                ],
+            ),
+            edb.BiddingZone(name="SE4", geometry=Polygon([(12.5, 55.0), (16.5, 55.0), (16.5, 58.0), (12.5, 58.0)])),
+        ],
+    )
+    client.register_tree(tree)
+
+    # Read back, then immediately register with no mutation. Diff must be empty.
+    fetched = client.get_tree("P")
+    diff = client.register_tree(fetched, mode="replace_subtree", allow_delete=True, dry_run=True)
+    assert isinstance(diff, TreeDiff)
+    assert not diff.has_changes, (
+        f"No-op round-trip should produce no changes, got: nodes={diff.node_changes}, edges={diff.edge_changes}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cross-tree edge rejection
 # ---------------------------------------------------------------------------

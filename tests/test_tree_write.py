@@ -339,7 +339,7 @@ def test_live_create_edge_with_series(live_edb):
             "value": [200.0, 250.0],
         }
     )
-    scope.write_series(flow, data_type="actual", name="power_flow")
+    scope.write(flow, data_type="actual", name="power_flow")
     out = scope.read(data_type="actual", name="power_flow")
     assert out["value"].to_list() == [200.0, 250.0]
 

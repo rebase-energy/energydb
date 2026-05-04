@@ -171,7 +171,7 @@ The whole walk runs in one Postgres transaction so partial application can't lea
 
 `.node()` and `.where()` calls are **lazy** — they accumulate path / filter without
 hitting the DB. Resolution happens in one query when a terminal operation runs
-(`.read()`, `.write_series()`, `.get()`, `.children()`, `.rename()`, `.delete()`, …):
+(`.read()`, `.write()`, `.get()`, `.children()`, `.rename()`, `.delete()`, …):
 
 ```
 client.node("Europe").node("Sweden").node("Lillgrund").read(data_type="forecast")

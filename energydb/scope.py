@@ -11,7 +11,7 @@ one indexed recursive CTE on ``(parent_uuid, name)``. An edge is identified
 by its ``uuid`` (or by the ``(from_path, to_path, edge_type)`` triple).
 ``.node()`` / ``.where()`` are lazy: they accumulate path and filters
 without hitting the DB. Terminal operations (``.read()``,
-``.write_series()``, ``.children()``, ...) trigger one indexed resolution
+``.write()``, ``.children()``, ...) trigger one indexed resolution
 query and execute.
 """
 
@@ -400,7 +400,7 @@ class NodeScope:
     # Single-series timeseries I/O — manifest builders that delegate to client
     # ------------------------------------------------------------------
 
-    def write_series(
+    def write(
         self,
         df: pl.DataFrame,
         *,
@@ -678,7 +678,7 @@ class EdgeScope:
             conn.commit()
         return sid
 
-    def write_series(
+    def write(
         self,
         df: pl.DataFrame,
         *,
@@ -752,7 +752,7 @@ class EdgeScope:
 
 
 # ---------------------------------------------------------------------------
-# Manifest builder shared between NodeScope.write_series and EdgeScope.write_series
+# Manifest builder shared between NodeScope.write and EdgeScope.write
 # ---------------------------------------------------------------------------
 
 

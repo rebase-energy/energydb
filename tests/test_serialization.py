@@ -99,7 +99,9 @@ class TestSerializeNode:
         assert data["hub_height"] == 80
         assert data["geometry"]["__geometry__"] is True
         assert data["geometry"]["type"] == "Point"
-        assert data["geometry"]["coordinates"] == (3.0, 55.0)
+        # Coords are lists, not tuples, so the in-memory serialize output
+        # compares equal to the JSONB read-back.
+        assert data["geometry"]["coordinates"] == [3.0, 55.0]
         # Structural columns and ``id`` live as columns; not duplicated in data.
         assert "name" not in data
         assert "id" not in data
@@ -126,7 +128,7 @@ class TestSerializeNode:
     def test_site_with_geometry(self):
         s = edm.Site(name="Offshore-1", geometry=Point(3.0, 55.0))
         data = serialize_node(s)["data"].obj
-        assert data["geometry"]["coordinates"] == (3.0, 55.0)
+        assert data["geometry"]["coordinates"] == [3.0, 55.0]
 
     def test_battery(self):
         b = edm.battery.Battery(name="B01", storage_capacity=100, min_soc=0.1)
