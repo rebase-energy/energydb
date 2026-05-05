@@ -19,7 +19,7 @@ hold UUIDs directly — no separate bigint identifier, no translation step at an
 | FKs (`parent_uuid`, `from_node_uuid`, …) | `UUID REFERENCES …(uuid)` |
 | Series ownership | `series.node_uuid` / `series.edge_uuid` |
 
-Path-based addressing (`client.node("Europe", "Sweden", "Lillgrund")`) is preserved as a
+Path-based addressing (`client.get_node("Europe", "Sweden", "Lillgrund")`) is preserved as a
 user-friendly fluent CLI; resolution walks `(parent_uuid, name)` via one indexed
 recursive CTE. Names stay convenient for navigation and remain unique under a parent
 (`UNIQUE (parent_uuid, name)`), but identity is the UUID.
@@ -35,7 +35,7 @@ recursive CTE. Names stay convenient for navigation and remain unique under a pa
 | `energydb.paths` | Path → uuid resolution (recursive CTE on `(parent_uuid, name)`) for the fluent CLI |
 | `energydb._io`, `energydb._join` | Manifest read/write pipeline + post-read hierarchy hydration |
 | `energydb.scope` | `NodeScope` / `EdgeScope` — fluent navigation, CRUD, timeseries I/O |
-| `energydb.client` | `EnergyDBClient` — schema, register_tree, queries, bulk I/O |
+| `energydb.client` | `Client` — schema, register_tree, queries, bulk I/O |
 | `energydb.__init__` | Public exports |
 
 ## Schema
@@ -169,17 +169,17 @@ The whole walk runs in one Postgres transaction so partial application can't lea
 
 ## `NodeScope` resolution
 
-`.node()` and `.where()` calls are **lazy** — they accumulate path / filter without
-hitting the DB. Resolution happens in one query when a terminal operation runs
+`.get_node()` and `.where()` calls are **lazy** — they accumulate path / filter
+without hitting the DB. Resolution happens in one query when a terminal operation runs
 (`.read()`, `.write()`, `.get()`, `.children()`, `.rename()`, `.delete()`, …):
 
 ```
-client.node("Europe").node("Sweden").node("Lillgrund").read(data_type="forecast")
-       │              │               │                      │
-       └── lazy ──────┴── lazy ───────┴── lazy               └── terminal: 1 CTE on (parent_uuid, name)
+client.get_node("Europe").get_node("Sweden").get_node("Lillgrund").read(data_type="forecast")
+       │                  │                   │                          │
+       └── lazy ──────────┴── lazy ───────────┴── lazy                   └── terminal: 1 CTE on (parent_uuid, name)
 ```
 
-Identity-form lookup is `client.node(uuid=...)`. Path-form is the user-friendly
+Identity-form lookup is `client.get_node(uuid=...)`. Path-form is the user-friendly
 default; both produce the same `NodeScope`.
 
 ## `EdgeScope`
@@ -188,12 +188,12 @@ default; both produce the same `NodeScope`.
 Identity is `edge_uuid` or the `(from_path, to_path, edge_type)` triple.
 
 ```python
-client.edge(uuid=...).read(data_type="actual", name="power_flow")
-client.edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get()
-client.edge(uuid=...).update(data={"capacity": 600})
-client.edge(uuid=...).delete()
-client.edge(uuid=...).from_node().read(data_type="actual")
-client.edge(uuid=...).to_node().read(data_type="actual")
+client.get_edge(uuid=...).read(data_type="actual", name="power_flow")
+client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get()
+client.get_edge(uuid=...).update(data={"capacity": 600})
+client.get_edge(uuid=...).delete()
+client.get_edge(uuid=...).from_node().read(data_type="actual")
+client.get_edge(uuid=...).to_node().read(data_type="actual")
 ```
 
 ## Manifest I/O

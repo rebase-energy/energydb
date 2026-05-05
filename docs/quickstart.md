@@ -18,9 +18,9 @@ or any hosted provider) and a running ClickHouse instance for TimeDB's series st
 ## Connecting
 
 ```python
-from energydb import EnergyDBClient
+from energydb import Client
 
-client = EnergyDBClient()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
+client = Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
 client.create()            # CREATE SCHEMA + Base.metadata.create_all + CH series_values
 ```
 
@@ -39,7 +39,7 @@ portfolio = edb.Portfolio(
             name="Offshore-1",
             lat=55.0, lon=3.0,
             members=[
-                edb.WindTurbine(
+                edb.wind.WindTurbine(
                     name="T01", capacity=3.5, hub_height=80,
                     timeseries=[
                         edb.TimeSeriesDescriptor(name="power", unit="MW",
@@ -49,7 +49,7 @@ portfolio = edb.Portfolio(
                                                  timeseries_type=edb.TimeSeriesType.OVERLAPPING),
                     ],
                 ),
-                edb.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
+                edb.wind.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
                     edb.TimeSeriesDescriptor(name="power", unit="MW",
                                              data_type=edb.DataType.ACTUAL),
                 ]),
@@ -124,16 +124,16 @@ client.write(manifest)
 
 ```python
 # Single-series read (path-based fluent CLI)
-df = client.node("My Portfolio", "Offshore-1", "T01").read(
+df = client.get_node("My Portfolio", "Offshore-1", "T01").read(
     data_type="actual", name="power",
     start_valid=base,
 )
 
 # Subtree read — every actual `power` across the whole portfolio
-df = client.node("My Portfolio").read(data_type="actual", name="power")
+df = client.get_node("My Portfolio").read(data_type="actual", name="power")
 
 # Filter descendants by EDM type
-df = client.node("My Portfolio").where(type="WindTurbine").read(
+df = client.get_node("My Portfolio").where(type="WindTurbine").read(
     data_type="actual", name="power",
 )
 ```
@@ -145,9 +145,8 @@ Read results include `path` (List(Utf8)), `node` (name), `node_type`, `node_uuid
 
 ```python
 # Single node reconstructed as an EDM object — uuid populated from the DB
-turbine = client.get_node("T01")           # by name (within scope)
-turbine = client.node("My Portfolio", "Offshore-1", "T01").get()
-turbine = client.node(uuid=...).get()      # by uuid
+turbine = client.get_node("My Portfolio", "Offshore-1", "T01").get()
+turbine = client.get_node(uuid=...).get()      # by uuid
 
 # Full subtree as an EDM tree
 tree = client.get_tree("My Portfolio", include_series=True)
@@ -161,26 +160,24 @@ turbines = client.query_nodes(type="WindTurbine", within="My Portfolio")
 Edges model typed cross-tree links — lines, transformers, pipes, interconnections.
 
 ```python
-from energydatamodel.reference import Reference
-
-bus_a = edb.JunctionPoint(name="BusA")
-bus_b = edb.JunctionPoint(name="BusB")
-line = edb.Line(
+bus_a = edb.grid.JunctionPoint(name="BusA")
+bus_b = edb.grid.JunctionPoint(name="BusB")
+line = edb.grid.Line(
     name="Cable-1",
     capacity=500,
-    from_element=Reference(bus_a),
-    to_element=Reference(bus_b),
+    from_element=bus_a,
+    to_element=bus_b,
 )
 
 # Persist the topology in one call — register_tree handles nodes then edges.
 client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b, line]))
 
 # Lookup by uuid or by triple
-e = client.get_edge(uuid=line.id)
-e = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line")
+e = client.get_edge(uuid=line.id).get()
+e = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get()
 
 # Series on an edge
-scope = client.edge(uuid=line.id)
+scope = client.get_edge(uuid=line.id)
 scope.register_series(name="power_flow", canonical_unit="MW",
                       data_type="actual", timeseries_type="FLAT")
 scope.write(df, name="power_flow", data_type="actual")
@@ -218,10 +215,10 @@ Routing modes are mutually exclusive — autodetected by column name.
 For surgical edits, fluent scope ops:
 
 ```python
-client.node("My Portfolio", "Offshore-1", "T01").rename("T01-A")
-client.node("My Portfolio", "Offshore-1", "T01-A").update(data={"capacity": 4.5})
-client.node("My Portfolio", "Offshore-1", "T01-A").move_to(client.node("My Portfolio", "Onshore-1"))
-client.node("My Portfolio", "Offshore-1", "T01-A").delete()
+client.get_node("My Portfolio", "Offshore-1", "T01").rename("T01-A")
+client.get_node("My Portfolio", "Offshore-1", "T01-A").update(data={"capacity": 4.5})
+client.get_node("My Portfolio", "Offshore-1", "T01-A").move_to(client.get_node("My Portfolio", "Onshore-1"))
+client.get_node("My Portfolio", "Offshore-1", "T01-A").delete()
 ```
 
 See [`examples/quickstart.ipynb`](https://github.com/rebase-energy/energydb/blob/main/examples/quickstart.ipynb)
