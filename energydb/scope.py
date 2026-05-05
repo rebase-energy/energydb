@@ -6,13 +6,13 @@ read/write** (one timeseries on this node, property updates, deletes).
 Tree / structure mutation goes through ``client.register_tree`` directly.
 
 A node is identified by its ``uuid`` (UUID7); the path form
-``client.node("Europe", "Sweden")`` is sugar that resolves to a uuid via
-one indexed recursive CTE on ``(parent_uuid, name)``. An edge is identified
-by its ``uuid`` (or by the ``(from_path, to_path, edge_type)`` triple).
-``.node()`` / ``.where()`` are lazy: they accumulate path and filters
-without hitting the DB. Terminal operations (``.read()``,
-``.write()``, ``.children()``, ...) trigger one indexed resolution
-query and execute.
+``client.get_node("Europe", "Sweden")`` is sugar that resolves to a uuid
+via one indexed recursive CTE on ``(parent_uuid, name)``. An edge is
+identified by its ``uuid`` (or by the ``(from_path, to_path, edge_type)``
+triple). ``.get_node()`` / ``.where()`` are lazy: they accumulate path
+and filters without hitting the DB. Terminal operations (``.read()``,
+``.write()``, ``.children()``, ``.get()``, ...) trigger one indexed
+resolution query and execute.
 """
 
 from __future__ import annotations
@@ -21,11 +21,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+import pandas as pd
 import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeriesDescriptor, TimeSeriesType
 
 from energydb import series as series_mod
+from energydb._frames import OutputType, to_output, to_polars
 from energydb.paths import (
     Path,
     resolve_edge_uuid,
@@ -36,7 +38,7 @@ from energydb.paths import (
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
 if TYPE_CHECKING:
-    from energydb.client import EnergyDBClient
+    from energydb.client import Client
 
 
 def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Path:
@@ -72,13 +74,13 @@ class NodeScope:
     """Accumulated scope for navigating and operating on a single node.
 
     Identity is the ``uuid``. ``_path`` and ``_node_uuid`` accumulate as
-    the user calls ``.node(...)``; resolution happens on the next terminal
-    call.
+    the user calls ``.get_node(...)``; resolution happens on the next
+    terminal call.
     """
 
     def __init__(
         self,
-        client: EnergyDBClient,
+        client: Client,
         *,
         node_uuid: UUID | None = None,
         path: Path = (),
@@ -101,12 +103,12 @@ class NodeScope:
     # Navigation (lazy)
     # ------------------------------------------------------------------
 
-    def node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
+    def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Lazy navigation. Accepts variadic names, a tuple/list, or ``uuid=``.
 
-        ``scope.node("A", "B")``    — append two segments
-        ``scope.node(("A", "B"))``  — same, tuple form
-        ``scope.node(uuid=...)``    — replace scope with absolute uuid
+        ``scope.get_node("A", "B")``    — append two segments
+        ``scope.get_node(("A", "B"))``  — same, tuple form
+        ``scope.get_node(uuid=...)``    — replace scope with absolute uuid
         """
         if uuid is not None:
             if names_or_path:
@@ -402,7 +404,7 @@ class NodeScope:
 
     def write(
         self,
-        df: pl.DataFrame,
+        df: pl.DataFrame | pd.DataFrame,
         *,
         data_type: str,
         name: str,
@@ -418,13 +420,14 @@ class NodeScope:
         """Write time-series data for a single series on this node.
 
         Builds a 1-route manifest (``node_uuid``, ``data_type``, ``name``,
-        plus optional ``unit``) over the supplied ``df`` and delegates to
-        :meth:`EnergyDBClient.write`. Returns the ``run_id`` used.
+        plus optional ``unit``) over the supplied ``df`` (pandas or polars)
+        and delegates to :meth:`Client.write`. Returns the ``run_id``
+        used.
         """
         with self._pool.connection() as conn:
             node_uuid = self._resolve_node_uuid(conn)
         manifest = _attach_routing(
-            df,
+            to_polars(df),
             owner_col="node_uuid",
             owner_val=node_uuid,
             data_type=data_type,
@@ -454,16 +457,18 @@ class NodeScope:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-    ) -> pl.DataFrame:
+        output: OutputType = "pandas",
+    ) -> pl.DataFrame | pd.DataFrame:
         """Read time-series data for this scope (node + descendants).
 
         Builds a manifest of (``node_uuid``, ``data_type``, ``name``) rows
         spanning the resolved subtree, then delegates to
-        :meth:`EnergyDBClient.read`.
+        :meth:`Client.read`. Returns pandas by default; pass
+        ``output="polars"`` for a polars DataFrame.
         """
         manifest = self._build_read_manifest(data_type=data_type, name=name)
         if manifest is None:
-            return pl.DataFrame()
+            return to_output(pl.DataFrame(), output)
         return self._client.read(
             manifest,
             unit=unit,
@@ -473,6 +478,7 @@ class NodeScope:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            output=output,
         )
 
     def read_relative(
@@ -481,12 +487,13 @@ class NodeScope:
         data_type: str,
         name: str,
         unit: str | None = None,
+        output: OutputType = "pandas",
         **td_read_kwargs,
-    ) -> pl.DataFrame:
+    ) -> pl.DataFrame | pd.DataFrame:
         manifest = self._build_read_manifest(data_type=data_type, name=name)
         if manifest is None:
-            return pl.DataFrame()
-        return self._client.read_relative(manifest, unit=unit, **td_read_kwargs)
+            return to_output(pl.DataFrame(), output)
+        return self._client.read_relative(manifest, unit=unit, output=output, **td_read_kwargs)
 
     def _build_read_manifest(
         self,
@@ -528,7 +535,7 @@ class EdgeScope:
 
     def __init__(
         self,
-        client: EnergyDBClient,
+        client: Client,
         *,
         edge_uuid: UUID | None = None,
         from_path: Path | None = None,
@@ -680,7 +687,7 @@ class EdgeScope:
 
     def write(
         self,
-        df: pl.DataFrame,
+        df: pl.DataFrame | pd.DataFrame,
         *,
         data_type: str,
         name: str,
@@ -696,7 +703,7 @@ class EdgeScope:
         with self._pool.connection() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
         manifest = _attach_routing(
-            df,
+            to_polars(df),
             owner_col="edge_uuid",
             owner_val=edge_uuid,
             data_type=data_type,
@@ -726,7 +733,8 @@ class EdgeScope:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-    ) -> pl.DataFrame:
+        output: OutputType = "pandas",
+    ) -> pl.DataFrame | pd.DataFrame:
         with self._pool.connection() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None
@@ -737,7 +745,7 @@ class EdgeScope:
                 name=name,
             )
         if meta.is_empty():
-            return pl.DataFrame()
+            return to_output(pl.DataFrame(), output)
         manifest = meta.select(["edge_uuid", "data_type", "name"]).unique()
         return self._client.read(
             manifest,
@@ -748,6 +756,7 @@ class EdgeScope:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            output=output,
         )
 
 

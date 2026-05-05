@@ -7,9 +7,10 @@ fresh schema and clean up after themselves.
 import os
 from datetime import UTC, datetime, timedelta
 
+import pandas as pd
 import polars as pl
 import pytest
-from energydb import EnergyDBClient
+from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
@@ -42,13 +43,13 @@ def _ts_df(n: int = 4) -> pl.DataFrame:
 
 @pytest.fixture
 def edb():
-    client = EnergyDBClient()
+    client = Client()
     client.delete()
     client.create()
     # Seed a simple hierarchy root via register_tree (uuid-aware).
     import energydb as edb_mod
 
-    asset = edb_mod.WindTurbine(name="asset_a", capacity=1.0)
+    asset = edb_mod.wind.WindTurbine(name="asset_a", capacity=1.0)
     root = edb_mod.Portfolio(name="root", members=[asset])
     client.register_tree(root)
     yield client
@@ -58,8 +59,8 @@ def edb():
 
 def test_register_flat_series_and_write_read(edb):
     sid = (
-        edb.node("root")
-        .node("asset_a")
+        edb.get_node("root")
+        .get_node("asset_a")
         .register_series(
             name="capacity",
             canonical_unit="MW",
@@ -70,18 +71,19 @@ def test_register_flat_series_and_write_read(edb):
     )
     assert isinstance(sid, int) and sid > 0
 
-    edb.node("root").node("asset_a").write(
+    edb.get_node("root").get_node("asset_a").write(
         _ts_df(3),
         data_type="actual",
         name="capacity",
     )
 
     result = (
-        edb.node("root")
-        .node("asset_a")
+        edb.get_node("root")
+        .get_node("asset_a")
         .read(
             data_type="actual",
             name="capacity",
+            output="polars",
         )
     )
     assert "series_id" in result.columns
@@ -89,7 +91,7 @@ def test_register_flat_series_and_write_read(edb):
 
 
 def test_register_overlapping_series_requires_knowledge_time(edb):
-    edb.node("root").node("asset_a").register_series(
+    edb.get_node("root").get_node("asset_a").register_series(
         name="power",
         canonical_unit="MW",
         data_type="forecast",
@@ -98,7 +100,7 @@ def test_register_overlapping_series_requires_knowledge_time(edb):
     )
 
     with pytest.raises(ValueError, match="knowledge_time is required for OVERLAPPING"):
-        edb.node("root").node("asset_a").write(
+        edb.get_node("root").get_node("asset_a").write(
             _ts_df(2),
             data_type="forecast",
             name="power",
@@ -106,7 +108,7 @@ def test_register_overlapping_series_requires_knowledge_time(edb):
 
 
 def test_overlapping_write_read_with_kt(edb):
-    edb.node("root").node("asset_a").register_series(
+    edb.get_node("root").get_node("asset_a").register_series(
         name="power",
         canonical_unit="MW",
         data_type="forecast",
@@ -114,13 +116,13 @@ def test_overlapping_write_read_with_kt(edb):
         retention="medium",
     )
 
-    edb.node("root").node("asset_a").write(
+    edb.get_node("root").get_node("asset_a").write(
         _ts_df(2),
         data_type="forecast",
         name="power",
         knowledge_time=KT_1,
     )
-    edb.node("root").node("asset_a").write(
+    edb.get_node("root").get_node("asset_a").write(
         _ts_df(2).with_columns(pl.col("value") + 100),
         data_type="forecast",
         name="power",
@@ -129,23 +131,25 @@ def test_overlapping_write_read_with_kt(edb):
 
     # Latest: KT_2 wins
     latest = (
-        edb.node("root")
-        .node("asset_a")
+        edb.get_node("root")
+        .get_node("asset_a")
         .read(
             data_type="forecast",
             name="power",
+            output="polars",
         )
     )
     assert latest["value"].to_list() == [100.0, 101.0]
 
     # History: both kts present
     history = (
-        edb.node("root")
-        .node("asset_a")
+        edb.get_node("root")
+        .get_node("asset_a")
         .read(
             data_type="forecast",
             name="power",
             include_knowledge_time=True,
+            output="polars",
         )
     )
     assert len(history) == 4
@@ -155,7 +159,7 @@ def test_cross_retention_read_is_single_query(edb):
     """Registering FLAT and OVERLAPPING series under one asset and reading all
     of them should return a combined result via one td.read (no partition_by).
     """
-    asset = edb.node("root").node("asset_a")
+    asset = edb.get_node("root").get_node("asset_a")
     asset.register_series(
         name="capacity",
         canonical_unit="MW",
@@ -173,7 +177,7 @@ def test_cross_retention_read_is_single_query(edb):
     asset.write(_ts_df(2), data_type="actual", name="capacity")
     asset.write(_ts_df(2), data_type="forecast", name="power", knowledge_time=KT_1)
 
-    result = asset.read()
+    result = asset.read(output="polars")
     # Two series × 2 rows = 4 rows
     assert len(result) == 4
     assert set(result["series_id"].unique().to_list()) == {1, 2} or len(result["series_id"].unique()) == 2
@@ -181,8 +185,8 @@ def test_cross_retention_read_is_single_query(edb):
 
 def test_read_runs_for_series_hydrates_pg_metadata(edb):
     sid = (
-        edb.node("root")
-        .node("asset_a")
+        edb.get_node("root")
+        .get_node("asset_a")
         .register_series(
             name="capacity",
             canonical_unit="MW",
@@ -192,8 +196,8 @@ def test_read_runs_for_series_hydrates_pg_metadata(edb):
         )
     )
     run_id = (
-        edb.node("root")
-        .node("asset_a")
+        edb.get_node("root")
+        .get_node("asset_a")
         .write(
             _ts_df(2),
             data_type="actual",
@@ -212,7 +216,7 @@ def test_read_runs_for_series_hydrates_pg_metadata(edb):
 
 
 def test_retention_immutable_trigger(edb):
-    edb.node("root").node("asset_a").register_series(
+    edb.get_node("root").get_node("asset_a").register_series(
         name="capacity",
         canonical_unit="MW",
         data_type="actual",
@@ -223,3 +227,39 @@ def test_retention_immutable_trigger(edb):
 
     with edb._pool.connection() as conn, pytest.raises(psycopg.errors.RaiseException, match="immutable"):
         conn.execute("UPDATE energydb.series SET retention = 'long' WHERE name = 'capacity'")
+
+
+def test_pandas_in_pandas_out(edb):
+    """A pandas DataFrame goes in, a pandas DataFrame comes out by default."""
+    edb.get_node("root").get_node("asset_a").register_series(
+        name="capacity",
+        canonical_unit="MW",
+        data_type="actual",
+        timeseries_type="FLAT",
+        retention="medium",
+    )
+
+    pdf = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(
+                [BASE_VT + timedelta(hours=i) for i in range(3)],
+                utc=True,
+            ),
+            "value": [10.0, 11.0, 12.0],
+        }
+    )
+    edb.get_node("root").get_node("asset_a").write(pdf, data_type="actual", name="capacity")
+
+    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity")
+    assert isinstance(result, pd.DataFrame)
+    assert "valid_time" in result.columns
+    assert "value" in result.columns
+    assert result["value"].tolist() == [10.0, 11.0, 12.0]
+
+
+def test_pandas_empty_read(edb):
+    """An empty-result read with the default pandas output returns an empty
+    pandas DataFrame, not a polars one."""
+    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="nonexistent")
+    assert isinstance(result, pd.DataFrame)
+    assert len(result) == 0

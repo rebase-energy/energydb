@@ -1,4 +1,4 @@
-"""Tests for ``register_tree`` and edge support on ``EnergyDBClient``.
+"""Tests for ``register_tree`` and edge support on ``Client``.
 
 Mocked-pool unit tests for the tree-walking, plus a small set of live
 integration tests when ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are set.
@@ -15,7 +15,7 @@ import energydb as edb
 import polars as pl
 import pytest
 from energydatamodel.reference import Reference
-from energydb.client import EnergyDBClient
+from energydb.client import Client
 
 # ---------------------------------------------------------------------------
 # Unit tests — mocked pool / td
@@ -32,10 +32,10 @@ def _simple_df(n: int = 3) -> pl.DataFrame:
     )
 
 
-def _mock_client(monkeypatch) -> EnergyDBClient:
-    """Build an EnergyDBClient with both pool and td fully mocked."""
-    monkeypatch.setattr(EnergyDBClient, "__init__", lambda self: None)
-    client = EnergyDBClient()  # type: ignore[call-arg]
+def _mock_client(monkeypatch) -> Client:
+    """Build a Client with both pool and td fully mocked."""
+    monkeypatch.setattr(Client, "__init__", lambda self: None)
+    client = Client()  # type: ignore[call-arg]
     client._pool = MagicMock()
     client.td = MagicMock()
     return client
@@ -128,11 +128,11 @@ class TestRegisterTree:
 
         portfolio = edb.Portfolio(name="P")
         s1 = edb.Site(name="S1")
-        t1 = edb.WindTurbine(name="T1", capacity=3.5)
-        t2 = edb.WindTurbine(name="T2", capacity=3.5)
+        t1 = edb.wind.WindTurbine(name="T1", capacity=3.5)
+        t2 = edb.wind.WindTurbine(name="T2", capacity=3.5)
         s1.members = [t1, t2]
         s2 = edb.Site(name="S2")
-        b1 = edb.Battery(name="B1", storage_capacity=10)
+        b1 = edb.battery.Battery(name="B1", storage_capacity=10)
         s2.members = [b1]
         portfolio.members = [s1, s2]
 
@@ -157,7 +157,7 @@ class TestRegisterTree:
             lambda _pool, obj, *, parent_uuid=None: obj.id,
         )
 
-        tree = edb.WindTurbine(
+        tree = edb.wind.WindTurbine(
             name="T",
             capacity=3.5,
             timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
@@ -173,7 +173,7 @@ class TestRegisterTree:
             lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not be called")),
         )
 
-        tree = edb.WindTurbine(
+        tree = edb.wind.WindTurbine(
             name="T",
             capacity=3.5,
             timeseries=[edb.TimeSeries(_simple_df(2), name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
@@ -216,7 +216,7 @@ class TestRegisterTree:
 
         monkeypatch.setattr("energydb._persist.create_node", fake_create_node)
 
-        client.register_tree(edb.WindTurbine(name="T", capacity=3.5), under=("Region", "Site"))
+        client.register_tree(edb.wind.WindTurbine(name="T", capacity=3.5), under=("Region", "Site"))
         assert captured_parent == [parent_uuid]
 
 
@@ -238,9 +238,9 @@ class TestTwoPassWalk:
         monkeypatch.setattr("energydb._persist.create_node", fake_create_node)
         monkeypatch.setattr("energydb._persist.create_edge", fake_create_edge)
 
-        bus_a = edb.JunctionPoint(name="BusA")
-        bus_b = edb.JunctionPoint(name="BusB")
-        line = edb.Line(name="L1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+        bus_a = edb.grid.JunctionPoint(name="BusA")
+        bus_b = edb.grid.JunctionPoint(name="BusB")
+        line = edb.grid.Line(name="L1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
         tree = edb.Portfolio(name="Grid", members=[bus_a, bus_b, line])
         client.register_tree(tree)
 
@@ -264,7 +264,7 @@ pytestmark_live = pytest.mark.skipif(
 
 @pytest.fixture
 def live_edb():
-    client = EnergyDBClient()
+    client = Client()
     client.delete()
     client.create()
     yield client
@@ -282,7 +282,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
             edb.Site(
                 name="S",
                 members=[
-                    edb.WindTurbine(
+                    edb.wind.WindTurbine(
                         name="T1",
                         capacity=3.5,
                         timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
@@ -305,7 +305,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
     )
     live_edb.write(write_df)
 
-    out = live_edb.node("P").node("S").node("T1").read(data_type="actual", name="power")
+    out = live_edb.get_node("P").get_node("S").get_node("T1").read(data_type="actual", name="power", output="polars")
     assert out["value"].to_list() == [1.0, 2.0, 3.0]
 
 
@@ -313,18 +313,18 @@ def test_live_register_tree_then_write_and_read(live_edb):
 def test_live_create_edge_with_series(live_edb):
     """Create two grid nodes, an edge between them, register a series on the
     edge, write data, read it back."""
-    bus_a = edb.JunctionPoint(name="BusA")
-    bus_b = edb.JunctionPoint(name="BusB")
+    bus_a = edb.grid.JunctionPoint(name="BusA")
+    bus_b = edb.grid.JunctionPoint(name="BusB")
     live_edb.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b]))
 
-    line = edb.Line(name="Cable-1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    line = edb.grid.Line(name="Cable-1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
     edge_uuid = live_edb.create_edge(line)
     assert isinstance(edge_uuid, UUID)
 
-    edge = live_edb.get_edge(uuid=edge_uuid)
+    edge = live_edb.get_edge(uuid=edge_uuid).get()
     assert type(edge).__name__ == "Line"
 
-    scope = live_edb.edge(uuid=edge_uuid)
+    scope = live_edb.get_edge(uuid=edge_uuid)
     scope.register_series(
         name="power_flow",
         canonical_unit="MW",
@@ -340,7 +340,7 @@ def test_live_create_edge_with_series(live_edb):
         }
     )
     scope.write(flow, data_type="actual", name="power_flow")
-    out = scope.read(data_type="actual", name="power_flow")
+    out = scope.read(data_type="actual", name="power_flow", output="polars")
     assert out["value"].to_list() == [200.0, 250.0]
 
 
@@ -350,12 +350,12 @@ def test_live_manifest_read(live_edb):
     tree = edb.Portfolio(
         name="P",
         members=[
-            edb.WindTurbine(
+            edb.wind.WindTurbine(
                 name="T1",
                 capacity=3.5,
                 timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             ),
-            edb.WindTurbine(
+            edb.wind.WindTurbine(
                 name="T2",
                 capacity=3.5,
                 timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
@@ -382,7 +382,7 @@ def test_live_manifest_read(live_edb):
             "name": ["power", "power"],
         }
     )
-    out = live_edb.read(manifest)
+    out = live_edb.read(manifest, output="polars")
     assert set(out["node"].unique().to_list()) == {"T1", "T2"}
     assert "path" in out.columns
 
@@ -392,7 +392,7 @@ def test_live_get_tree_with_series(live_edb):
     tree = edb.Portfolio(
         name="Pg",
         members=[
-            edb.WindTurbine(
+            edb.wind.WindTurbine(
                 name="Tg",
                 capacity=3.5,
                 timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
@@ -412,12 +412,12 @@ def test_live_get_tree_with_series(live_edb):
 @pytestmark_live
 def test_live_query_within_accepts_str_tuple_list_uuid(live_edb):
     """``within=`` should accept a bare str, tuple, list, or UUID."""
-    bus_a = edb.JunctionPoint(name="BusA")
-    bus_b = edb.JunctionPoint(name="BusB")
+    bus_a = edb.grid.JunctionPoint(name="BusA")
+    bus_b = edb.grid.JunctionPoint(name="BusB")
     portfolio = edb.Portfolio(name="My Portfolio", members=[bus_a, bus_b])
     portfolio_uuid = live_edb.register_tree(portfolio)
 
-    line = edb.Line(name="Cable-1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    line = edb.grid.Line(name="Cable-1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
     live_edb.create_edge(line)
 
     by_str = live_edb.query_nodes(within="My Portfolio")
@@ -448,7 +448,7 @@ def test_live_idempotent_register_tree_does_not_bump_updated_at(live_edb):
     """
     tree = edb.Portfolio(
         name="Idem",
-        members=[edb.WindTurbine(name="T", capacity=3.5)],
+        members=[edb.wind.WindTurbine(name="T", capacity=3.5)],
     )
     live_edb.register_tree(tree)
 

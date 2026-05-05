@@ -3,7 +3,7 @@
 After the UUID identity rewrite, ``node.uuid`` is the row PK and the value
 held by every :class:`energydatamodel.Reference`. Paths are still a
 user-friendly addressing form though — the fluent CLI lets you write
-``client.node("Europe", "Sweden", "Lillgrund")`` and resolve the path
+``client.get_node("Europe", "Sweden", "Lillgrund")`` and resolve the path
 chain to a UUID with one indexed recursive CTE on ``(parent_uuid, name)``.
 
 A node is identified at the storage layer by its ``uuid``; an edge by its
@@ -36,7 +36,7 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
 
     When ``start_uuid`` is given the walk begins as a child of that node
     rather than at the root; this supports
-    ``client.node(uuid=...).node("Child")``-style relative navigation.
+    ``client.get_node(uuid=...).get_node("Child")``-style relative navigation.
     """
     if not path:
         if start_uuid is not None:

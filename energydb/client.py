@@ -1,13 +1,13 @@
-"""EnergyDBClient — owns the psycopg pool and constructs TimeDBClient.
+"""Client — owns the psycopg pool and constructs TimeDBClient.
 
 UUID identity model:
 
 * A node is uniquely identified by its ``uuid`` (UUID7, set on the EDM
   Element at construction).
 * An edge is uniquely identified by its ``uuid`` (also UUID7).
-* Path-based addressing (``client.node("Europe", "Sweden")``) is preserved
-  as a user-friendly fluent CLI; resolution walks ``(parent_uuid, name)``
-  via one indexed recursive CTE.
+* Path-based addressing (``client.get_node("Europe", "Sweden")``) is
+  preserved as a user-friendly fluent CLI; resolution walks
+  ``(parent_uuid, name)`` via one indexed recursive CTE.
 * Edge endpoints in storage are ``from_node_uuid`` / ``to_node_uuid`` —
   no path resolution at write or read time.
 
@@ -16,6 +16,9 @@ API split:
 * ``register_tree`` — structure (nodes, edges, descriptors). Idempotent
   upsert; raises on inline timeseries data.
 * ``write`` / ``read`` — bulk timeseries data via manifest DataFrames.
+* ``get_node`` / ``get_edge`` — fluent scope entry points. Reads like
+  English: ``client.get_node("p").where(type="WindTurbine").read()``.
+  Terminate with ``.get()`` to fetch the EDM object eagerly.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+import pandas as pd
 import polars as pl
 from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine
@@ -32,13 +36,13 @@ from timedatamodel import DataType, TimeSeriesDescriptor, TimeSeriesType
 from timedb import TimeDBClient
 
 from energydb import runs as runs_mod
+from energydb._frames import OutputType, to_output, to_polars
 from energydb._io import read_manifest, read_relative_manifest, write_manifest
 from energydb._persist import create_edge, register_tree_under
 from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
     Path,
-    resolve_edge_uuid,
     resolve_node_uuid,
     resolve_path,
     resolve_paths_bulk,
@@ -50,7 +54,7 @@ from energydb.serialization import reconstruct_edge, reconstruct_node
 _SEARCH_PATH = "SET search_path TO energydb, public"
 
 
-class EnergyDBClient:
+class Client:
     """Client for energy assets, hierarchy, and time series.
 
     Owns the psycopg connection pool (used for all PG ops) and constructs
@@ -113,23 +117,26 @@ class EnergyDBClient:
     # Fluent entry — scopes for navigation & single-element ops
     # ------------------------------------------------------------------
 
-    def node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
-        """Return a :class:`NodeScope`.
+    def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
+        """Return a :class:`NodeScope` for a node or subtree.
 
-        ``client.node()``                        — empty scope (root context)
-        ``client.node("A", "B", "C")``           — variadic path
-        ``client.node(("A", "B", "C"))``         — tuple/list path
-        ``client.node(uuid=...)``                — absolute by uuid
+        ``client.get_node("A", "B", "C")``           — variadic path
+        ``client.get_node(("A", "B", "C"))``         — tuple/list path
+        ``client.get_node(uuid=...)``                — absolute by uuid
+
+        Terminate the chain with ``.get()`` to fetch the EDM object,
+        ``.read()`` for time-series data, ``.where(...)`` to filter a
+        subtree, etc.
         """
         if uuid is not None:
             if names_or_path:
                 raise ValueError("Pass either uuid= or names, not both.")
             return NodeScope(self, node_uuid=uuid)
         if not names_or_path:
-            return NodeScope(self)
+            raise ValueError("Provide a path or uuid=.")
         return NodeScope(self, path=_coerce_path(names_or_path))
 
-    def edge(
+    def get_edge(
         self,
         from_path: Path | list[str] | None = None,
         to_path: Path | list[str] | None = None,
@@ -137,7 +144,10 @@ class EnergyDBClient:
         type: str | None = None,
         uuid: UUID | None = None,
     ) -> EdgeScope:
-        """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type)``."""
+        """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type)``.
+
+        Terminate with ``.get()`` to fetch the EDM edge eagerly.
+        """
         if uuid is not None:
             if from_path is not None or to_path is not None or type is not None:
                 raise ValueError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
@@ -209,26 +219,6 @@ class EnergyDBClient:
             return diff
         return root_uuid
 
-    def get_node(self, *names_or_path, uuid: UUID | None = None):
-        """Return one node as an EDM object (no children).
-
-        Accepts a path tuple or variadic names; or ``uuid=`` for direct lookup.
-        """
-        with self._pool.connection() as conn:
-            if uuid is not None:
-                node_uuid = uuid
-            elif names_or_path:
-                node_uuid = resolve_node_uuid(conn, _coerce_path(names_or_path))
-            else:
-                raise ValueError("Provide a path or uuid=.")
-            row = conn.execute(
-                "SELECT uuid, node_type, name, data FROM energydb.node WHERE uuid = %s",
-                (node_uuid,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
-            return reconstruct_node({"uuid": row[0], "node_type": row[1], "name": row[2], "data": row[3]})
-
     def query_nodes(
         self,
         *,
@@ -285,43 +275,6 @@ class EnergyDBClient:
             edge_uuid = create_edge(conn, edm_obj, tree_root=None)
             conn.commit()
         return edge_uuid
-
-    def get_edge(
-        self,
-        from_path: Path | list[str] | None = None,
-        to_path: Path | list[str] | None = None,
-        *,
-        type: str | None = None,
-        uuid: UUID | None = None,
-    ):
-        """Return one edge as an EDM object.
-
-        Address by ``uuid=`` or by the ``(from_path, to_path, type=)`` triple.
-        """
-        with self._pool.connection() as conn:
-            if uuid is not None:
-                edge_uuid = uuid
-            else:
-                if from_path is None or to_path is None or type is None:
-                    raise ValueError("Provide uuid= or (from_path, to_path, type=).")
-                edge_uuid = resolve_edge_uuid(conn, tuple(from_path), tuple(to_path), type)
-            row = conn.execute(
-                "SELECT uuid, edge_type, label, data, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
-                (edge_uuid,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
-
-        return reconstruct_edge(
-            {
-                "uuid": row[0],
-                "edge_type": row[1],
-                "label": row[2],
-                "data": row[3],
-                "from_node_uuid": row[4],
-                "to_node_uuid": row[5],
-            }
-        )
 
     def query_edges(
         self,
@@ -460,7 +413,7 @@ class EnergyDBClient:
 
     def write(
         self,
-        df: pl.DataFrame,
+        df: pl.DataFrame | pd.DataFrame,
         *,
         knowledge_time: datetime | None = None,
         run_id: int | None = None,
@@ -472,11 +425,11 @@ class EnergyDBClient:
     ) -> int:
         """Bulk-write timeseries data via a routing manifest.
 
-        ``df`` carries one routing column (``node_uuid``, ``edge_uuid``, or
-        ``path`` as ``List(Utf8)``), plus ``data_type``, ``name``, and the
-        timedb data columns (``valid_time``, ``value``, optional
-        ``knowledge_time``). Optional ``unit`` column triggers per-row unit
-        conversion to each series's canonical unit.
+        ``df`` is a pandas or polars DataFrame carrying one routing column
+        (``node_uuid``, ``edge_uuid``, or ``path`` as ``List(Utf8)``), plus
+        ``data_type``, ``name``, and the timedb data columns (``valid_time``,
+        ``value``, optional ``knowledge_time``). Optional ``unit`` column
+        triggers per-row unit conversion to each series's canonical unit.
 
         Series must already be registered (typically via
         :meth:`register_tree`). Returns the ``run_id`` used.
@@ -484,7 +437,7 @@ class EnergyDBClient:
         return write_manifest(
             self._pool,
             self.td,
-            df,
+            to_polars(df),
             knowledge_time=knowledge_time,
             run_id=run_id,
             workflow_id=workflow_id,
@@ -496,7 +449,7 @@ class EnergyDBClient:
 
     def read(
         self,
-        df: pl.DataFrame,
+        df: pl.DataFrame | pd.DataFrame,
         *,
         unit: str | None = None,
         start_valid: datetime | None = None,
@@ -505,12 +458,17 @@ class EnergyDBClient:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-    ) -> pl.DataFrame:
-        """Bulk read via manifest. Detects edge vs node routing automatically."""
-        return read_manifest(
+        output: OutputType = "pandas",
+    ) -> pl.DataFrame | pd.DataFrame:
+        """Bulk read via manifest. Detects edge vs node routing automatically.
+
+        Accepts pandas or polars on input. Returns pandas by default; pass
+        ``output="polars"`` for a polars DataFrame.
+        """
+        result = read_manifest(
             self._pool,
             self.td,
-            df,
+            to_polars(df),
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -519,16 +477,23 @@ class EnergyDBClient:
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
         )
+        return to_output(result, output)
 
     def read_relative(
         self,
-        df: pl.DataFrame,
+        df: pl.DataFrame | pd.DataFrame,
         *,
         unit: str | None = None,
+        output: OutputType = "pandas",
         **td_kwargs,
-    ) -> pl.DataFrame:
-        """Bulk relative read via manifest."""
-        return read_relative_manifest(self._pool, self.td, df, unit=unit, **td_kwargs)
+    ) -> pl.DataFrame | pd.DataFrame:
+        """Bulk relative read via manifest.
+
+        Accepts pandas or polars on input. Returns pandas by default; pass
+        ``output="polars"`` for a polars DataFrame.
+        """
+        result = read_relative_manifest(self._pool, self.td, to_polars(df), unit=unit, **td_kwargs)
+        return to_output(result, output)
 
     # ------------------------------------------------------------------
     # Runs

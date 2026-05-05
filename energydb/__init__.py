@@ -12,7 +12,6 @@ from energydatamodel import (
     Edge,
     # Core hierarchy
     Element,
-    # Containers
     EnergyCommunity,
     GridNode,
     # Quantities
@@ -26,11 +25,15 @@ from energydatamodel import (
     Region,
     Scope,
     Sensor,
+    # Containers
     Site,
     SynchronousArea,
     VirtualPowerPlant,
     WeatherCell,
+    # Sub-namespaces — tech-specific equipment lives here
+    battery,
     build_metric,
+    building,
     # Vocabulary constructors
     cross_border_flow,
     electricity_demand,
@@ -39,38 +42,17 @@ from energydatamodel import (
     electricity_supply_area,
     gas_demand,
     gas_supply,
+    grid,
     grid_frequency,
     heating_demand,
+    heatpump,
+    hydro,
+    solar,
     spot_price,
     temperature,
+    weather,
+    wind,
 )
-from energydatamodel.battery import Battery
-from energydatamodel.building import Building, House
-from energydatamodel.grid import (
-    Carrier,
-    DeliveryPoint,
-    EdgeAsset,
-    Interconnection,
-    JunctionPoint,
-    Line,
-    Link,
-    Meter,
-    Network,
-    Pipe,
-    SubNetwork,
-    Transformer,
-)
-from energydatamodel.heatpump import HeatPump
-from energydatamodel.hydro import HydroPowerPlant, HydroTurbine, Reservoir
-from energydatamodel.solar import PVArray, PVSystem, SolarPowerArea
-from energydatamodel.weather import (
-    HumiditySensor,
-    RadiationSensor,
-    RainSensor,
-    TemperatureSensor,
-    WindSpeedSensor,
-)
-from energydatamodel.wind import WindFarm, WindPowerArea, WindTurbine
 from timedatamodel import (
     DataShape,
     DataType,
@@ -80,14 +62,14 @@ from timedatamodel import (
     TimeSeriesType,
 )
 
-from energydb.client import EnergyDBClient
+from energydb.client import Client
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.scope import EdgeScope, NodeScope
 from energydb.units import IncompatibleUnitError
 
 __all__ = [
     # Client
-    "EnergyDBClient",
+    "Client",
     "IncompatibleUnitError",
     "NodeScope",
     "EdgeScope",
@@ -105,35 +87,10 @@ __all__ = [
     # Semantic bases
     "Asset",
     "NodeAsset",
-    "EdgeAsset",
     "GridNode",
     "Sensor",
     "Collection",
     "Area",
-    # Assets
-    "Battery",
-    "Building",
-    "House",
-    "HeatPump",
-    "HydroPowerPlant",
-    "HydroTurbine",
-    "Reservoir",
-    "PVSystem",
-    "PVArray",
-    "SolarPowerArea",
-    "WindFarm",
-    "WindTurbine",
-    "WindPowerArea",
-    # Grid nodes
-    "JunctionPoint",
-    "Meter",
-    "DeliveryPoint",
-    # Edges
-    "Line",
-    "Link",
-    "Transformer",
-    "Pipe",
-    "Interconnection",
     # Areas
     "BiddingZone",
     "ControlArea",
@@ -147,14 +104,6 @@ __all__ = [
     "Region",
     "EnergyCommunity",
     "VirtualPowerPlant",
-    "SubNetwork",
-    "Network",
-    # Sensors
-    "TemperatureSensor",
-    "RadiationSensor",
-    "WindSpeedSensor",
-    "HumiditySensor",
-    "RainSensor",
     # Time series types
     "TimeSeries",
     "TimeSeriesDescriptor",
@@ -162,8 +111,6 @@ __all__ = [
     "DataShape",
     "Frequency",
     "TimeSeriesType",
-    # Powergrid value types
-    "Carrier",
     # Vocabulary constructors
     "cross_border_flow",
     "electricity_demand",
@@ -181,4 +128,13 @@ __all__ = [
     "Quantity",
     "Scope",
     "build_metric",
+    # Sub-namespaces (tech-specific equipment)
+    "battery",
+    "building",
+    "grid",
+    "heatpump",
+    "hydro",
+    "solar",
+    "weather",
+    "wind",
 ]

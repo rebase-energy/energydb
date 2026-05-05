@@ -25,7 +25,7 @@ import energydb as edb
 import polars as pl
 import pytest
 from energydatamodel.reference import Reference
-from energydb import EnergyDBClient
+from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
@@ -36,7 +36,7 @@ if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
 
 @pytest.fixture
 def client():
-    c = EnergyDBClient()
+    c = Client()
     c.delete()
     c.create()
     yield c
@@ -61,18 +61,18 @@ def test_duplicate_names_under_different_parents_resolve_independently(client):
         members=[
             edb.Site(
                 name="SiteA",
-                members=[edb.WindTurbine(name="T01", capacity=3.5)],
+                members=[edb.wind.WindTurbine(name="T01", capacity=3.5)],
             ),
             edb.Site(
                 name="SiteB",
-                members=[edb.WindTurbine(name="T01", capacity=4.0)],
+                members=[edb.wind.WindTurbine(name="T01", capacity=4.0)],
             ),
         ],
     )
     client.register_tree(tree)
 
-    a = client.node("MyP", "SiteA", "T01").get()
-    b = client.node("MyP", "SiteB", "T01").get()
+    a = client.get_node("MyP", "SiteA", "T01").get()
+    b = client.get_node("MyP", "SiteB", "T01").get()
     assert a.capacity == 3.5
     assert b.capacity == 4.0
     assert a.id != b.id
@@ -90,7 +90,7 @@ def test_names_with_slashes_round_trip(client):
         members=[edb.Site(name="Distribution/12kV")],
     )
     client.register_tree(tree)
-    site = client.node("P", "Distribution/12kV").get()
+    site = client.get_node("P", "Distribution/12kV").get()
     assert site.name == "Distribution/12kV"
 
 
@@ -105,7 +105,7 @@ def test_names_with_dots_and_unicode(client):
     )
     client.register_tree(tree)
     for nm in ("N.O.R.D", "Lillgrund Vindkraftspark", "北京"):
-        assert client.node("P", nm).get().name == nm
+        assert client.get_node("P", nm).get().name == nm
 
 
 # ---------------------------------------------------------------------------
@@ -114,37 +114,37 @@ def test_names_with_dots_and_unicode(client):
 
 
 def test_edge_addressed_by_uuid_or_triple(client):
-    bus_a = edb.JunctionPoint(name="BusA")
-    bus_b = edb.JunctionPoint(name="BusB")
+    bus_a = edb.grid.JunctionPoint(name="BusA")
+    bus_b = edb.grid.JunctionPoint(name="BusB")
     client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b]))
 
-    line = edb.Line(name="Cable-1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    line = edb.grid.Line(name="Cable-1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
     edge_uuid = client.create_edge(line)
     assert isinstance(edge_uuid, UUID)
 
-    by_triple = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line")
-    assert isinstance(by_triple, edb.Line)
+    by_triple = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get()
+    assert isinstance(by_triple, edb.grid.Line)
     assert by_triple.capacity == 500
     assert by_triple.id == edge_uuid
 
-    by_uuid = client.get_edge(uuid=edge_uuid)
+    by_uuid = client.get_edge(uuid=edge_uuid).get()
     assert by_uuid.capacity == 500
 
 
 def test_two_edges_of_different_types_between_same_endpoints(client):
-    bus_a = edb.JunctionPoint(name="BusA")
-    bus_b = edb.JunctionPoint(name="BusB")
+    bus_a = edb.grid.JunctionPoint(name="BusA")
+    bus_b = edb.grid.JunctionPoint(name="BusB")
     client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b]))
 
-    line = edb.Line(name="Cable", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
-    pipe = edb.Pipe(
+    line = edb.grid.Line(name="Cable", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    pipe = edb.grid.Pipe(
         name="GasPipe", capacity=200, medium="gas", from_element=Reference(bus_a), to_element=Reference(bus_b)
     )
     line_uuid = client.create_edge(line)
     pipe_uuid = client.create_edge(pipe)
     assert line_uuid != pipe_uuid
-    assert isinstance(client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line"), edb.Line)
-    assert isinstance(client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Pipe"), edb.Pipe)
+    assert isinstance(client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get(), edb.grid.Line)
+    assert isinstance(client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Pipe").get(), edb.grid.Pipe)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ def test_two_edges_of_different_types_between_same_endpoints(client):
 
 
 def test_move_to_preserves_uuid_and_series(client):
-    turbine = edb.WindTurbine(name="T01", capacity=3.5)
+    turbine = edb.wind.WindTurbine(name="T01", capacity=3.5)
     tree = edb.Portfolio(
         name="P",
         members=[
@@ -163,7 +163,7 @@ def test_move_to_preserves_uuid_and_series(client):
     )
     client.register_tree(tree)
 
-    scope = client.node("P", "OldSite", "T01")
+    scope = client.get_node("P", "OldSite", "T01")
     sid = scope.register_series(
         name="capacity",
         canonical_unit="MW",
@@ -174,16 +174,16 @@ def test_move_to_preserves_uuid_and_series(client):
     df = pl.DataFrame({"valid_time": _hours(2), "value": [3.5, 3.5]})
     scope.write(df, data_type="actual", name="capacity")
 
-    scope.move_to(client.node("P", "NewSite"))
+    scope.move_to(client.get_node("P", "NewSite"))
 
     with pytest.raises(ValueError):
-        client.node("P", "OldSite", "T01").get()
-    moved = client.node("P", "NewSite", "T01").get()
+        client.get_node("P", "OldSite", "T01").get()
+    moved = client.get_node("P", "NewSite", "T01").get()
     assert moved.capacity == 3.5
     # UUID survives the move.
     assert moved.id == turbine.id
 
-    out = client.node("P", "NewSite", "T01").read(data_type="actual", name="capacity")
+    out = client.get_node("P", "NewSite", "T01").read(data_type="actual", name="capacity", output="polars")
     assert out["value"].to_list() == [3.5, 3.5]
     assert out["series_id"].unique().to_list() == [sid]
 
@@ -192,8 +192,8 @@ def test_move_to_collision_raises(client):
     tree = edb.Portfolio(
         name="P",
         members=[
-            edb.Site(name="A", members=[edb.WindTurbine(name="T01", capacity=3.5)]),
-            edb.Site(name="B", members=[edb.WindTurbine(name="T01", capacity=4.0)]),
+            edb.Site(name="A", members=[edb.wind.WindTurbine(name="T01", capacity=3.5)]),
+            edb.Site(name="B", members=[edb.wind.WindTurbine(name="T01", capacity=4.0)]),
         ],
     )
     client.register_tree(tree)
@@ -201,14 +201,14 @@ def test_move_to_collision_raises(client):
     import psycopg
 
     with pytest.raises(psycopg.errors.UniqueViolation):
-        client.node("P", "A", "T01").move_to(client.node("P", "B"))
+        client.get_node("P", "A", "T01").move_to(client.get_node("P", "B"))
 
 
 def test_move_to_self_rejected(client):
     """Moving a node into itself must raise — that would orphan it from the tree."""
     client.register_tree(edb.Portfolio(name="P", members=[edb.Site(name="S")]))
     with pytest.raises(ValueError, match="into itself"):
-        client.node("P", "S").move_to(client.node("P", "S"))
+        client.get_node("P", "S").move_to(client.get_node("P", "S"))
 
 
 def test_move_to_descendant_rejected(client):
@@ -217,11 +217,11 @@ def test_move_to_descendant_rejected(client):
     client.register_tree(
         edb.Portfolio(
             name="P",
-            members=[edb.Site(name="S", members=[edb.WindTurbine(name="T", capacity=3.5)])],
+            members=[edb.Site(name="S", members=[edb.wind.WindTurbine(name="T", capacity=3.5)])],
         )
     )
     with pytest.raises(ValueError, match="own subtree"):
-        client.node("P", "S").move_to(client.node("P", "S", "T"))
+        client.get_node("P", "S").move_to(client.get_node("P", "S", "T"))
 
 
 # ---------------------------------------------------------------------------
@@ -233,13 +233,13 @@ def test_same_name_different_type_rejected_under_one_parent(client):
     import psycopg
 
     client.register_tree(edb.Portfolio(name="P"))
-    client.register_tree(edb.WindTurbine(name="X", capacity=3.5), under=("P",))
+    client.register_tree(edb.wind.WindTurbine(name="X", capacity=3.5), under=("P",))
 
     # Same name + different type under the same parent → rejected by the
     # ``UNIQUE (parent_uuid, name)`` constraint (different uuid for Battery,
     # so ON CONFLICT (uuid) doesn't fire; the unique key collision surfaces).
     with pytest.raises(psycopg.errors.UniqueViolation):
-        client.register_tree(edb.Battery(name="X", storage_capacity=10), under=("P",))
+        client.register_tree(edb.battery.Battery(name="X", storage_capacity=10), under=("P",))
 
 
 # ---------------------------------------------------------------------------
@@ -251,12 +251,12 @@ def test_manifest_with_list_utf8_paths(client):
     tree = edb.Portfolio(
         name="P",
         members=[
-            edb.WindTurbine(
+            edb.wind.WindTurbine(
                 name="T01",
                 capacity=3.5,
                 timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             ),
-            edb.WindTurbine(
+            edb.wind.WindTurbine(
                 name="Distribution/12kV",  # name with slash
                 capacity=2.0,
                 timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
@@ -283,7 +283,7 @@ def test_manifest_with_list_utf8_paths(client):
             "name": ["power", "power"],
         }
     )
-    out = client.read(manifest)
+    out = client.read(manifest, output="polars")
     assert set(out["node"].unique().to_list()) == {"T01", "Distribution/12kV"}
     paths = sorted([tuple(p) for p in out["path"].to_list()])
     assert ("P", "Distribution/12kV") in paths
