@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energydb"
-version = "0.3.3"
+version = "0.4.0"
 description = "Energy database: hierarchy + series metadata on Postgres, bitemporal I/O via timedb"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "timedatamodel>=0.3.0",
     "timedb>=0.2.0",
-    "energydatamodel>=0.0.5",
+    "energydatamodel>=0.1.0",
     "psycopg[binary]>=3.1",
     "psycopg_pool>=3.1",
     "sqlalchemy>=2.0",
