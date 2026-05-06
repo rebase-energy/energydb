@@ -54,14 +54,3 @@ intersphinx_mapping = {
     "polars": ("https://docs.pola.rs/api/python/stable/", None),
     "sqlalchemy": ("https://docs.sqlalchemy.org/en/20/", None),
 }
-
-# Imports that may fail in the RTD build environment — mocked so autodoc can
-# still introspect the package without a live Postgres / ClickHouse.
-autodoc_mock_imports = [
-    "psycopg",
-    "sqlalchemy",
-    "timedb",
-    "timedatamodel",
-    "energydatamodel",
-    "polars",
-]
