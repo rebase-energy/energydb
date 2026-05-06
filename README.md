@@ -1,6 +1,6 @@
 <div align="center">
   <h1>⚡ EnergyDB</h1>
-  <p><b>Persistent storage for energy asset hierarchies and time series, built on PostgreSQL.</b></p>
+  <p><b>Persistent storage for energy portfolios — assets, grid topology, and bitemporal time series, in one connected database.</b></p>
 
   <a href="https://pypi.org/project/energydb/"><img alt="PyPI" src="https://img.shields.io/pypi/v/energydb?color=blue&style=flat-square"></a>
   <a href="https://pypi.org/project/energydb/"><img alt="Python Versions" src="https://img.shields.io/pypi/pyversions/energydb?style=flat-square"></a>
@@ -10,30 +10,33 @@
 
 <br/>
 
-**EnergyDB** extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies — portfolios, sites, and assets — links them to time series with full auditability, and models grid topology via typed edges.
+**EnergyDB** extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies — portfolios, sites, and assets — links them to bitemporal time series with full auditability, and models grid topology via typed edges. Round-trip a portfolio between Python and Postgres without losing identity: every `Element` keeps its UUID end-to-end.
+
+Most time-series systems are agnostic about what their series represent. EnergyDB knows it is a portfolio: assets, sites, and grid topology, with the bitemporal series that describe them living alongside.
 
 ---
 
-## 🏗️ How It Works
+## 🏗️ The Connected Portfolio Model
 
-EnergyDB bridges two libraries:
+EnergyDB stores three kinds of objects in one connected database:
 
-- **EnergyDataModel** defines energy assets in Python (wind turbines, solar PV, batteries, etc.) organized into hierarchies (Portfolio → Site → Asset → TimeSeries), plus grid topology (JunctionPoint → Line → JunctionPoint).
-- **TimeDB** stores time series in PostgreSQL with three-dimensional temporal tracking (valid time, knowledge time, change time).
+| Layer | Description | Real-World Example |
+| :---- | :--- | :--- |
+| 🌳&nbsp;**Hierarchy** | Arbitrary-depth tree of portfolios, sites, and assets | *"Offshore-1 → WindTurbine T01 → power"* |
+| 🔗&nbsp;**Topology** | Typed edges (Line, Link, Pipe) connect any two nodes | *"Cable-1: BusA → BusB"* |
+| ⏱️&nbsp;**Bitemporal series** | Forecast revisions and audit trails — owned by a node *or* edge | *"power_flow on Cable-1, valid Wed 12:00, known Mon 18:00"* |
 
-EnergyDB adds node and edge tables to the same PostgreSQL database and links them to TimeDB's time series, enabling SQL joins across both.
+> **Identity & Round-Trip:** Every `Element` carries a UUID7. Read → modify → write back works in place — renames, moves, and property edits become silent `UPDATE`s.
 
-```
-Portfolio
-  └── Site "Offshore-1"
-        ├── WindTurbine "T01"  ←  static: capacity, hub_height, ...
-        │     ├── TimeSeries "active_power"  ←  stored in TimeDB
-        │     └── TimeSeries "wind_speed"    ←  stored in TimeDB
-        ├── WindTurbine "T02"
-        ├── JunctionPoint "BusA"
-        └── JunctionPoint "BusB"
-              └── Line "Cable-1" (BusA → BusB)  ←  edge with own TimeSeries
-```
+---
+
+## ✨ Why Choose EnergyDB?
+
+- 🌳 **Asset hierarchies:** Declare your portfolio in Python (EnergyDataModel) and persist arbitrary depth in one call.
+- 🔗 **Grid topology:** Typed edges for lines, links, pipes — with their own time series and endpoint navigation.
+- 🔁 **Round-trip persistence:** UUID identity from in-memory `Element` to Postgres row PK; no delete-then-insert dance.
+- ⏱️ **Bitemporal series:** Forecast revisions, corrections, and time-of-knowledge queries powered by [TimeDB](https://github.com/rebase-energy/timedb).
+- 🧭 **Fluent, lazy navigation:** `client.get_node("Portfolio", "Site", "T01").read(...)` resolves to one indexed CTE.
 
 ---
 
@@ -45,14 +48,9 @@ Portfolio
 pip install energydb
 ```
 
-Requires Python 3.9+ and a PostgreSQL database (e.g., [Neon](https://neon.tech), local Postgres, or any hosted provider).
+Requires Python 3.12+, PostgreSQL (asset hierarchy + series catalog), and ClickHouse (time-series values).
 
 ### 2. Usage Example
-
-Structure and data live in two separate calls so each can be re-run on its own
-cadence. Identity is a UUID7 generated on every `Element` at construction; that same
-UUID is the row PK in Postgres, so renames / moves / property edits round-trip in
-place.
 
 ```python
 from datetime import UTC, datetime
@@ -61,96 +59,47 @@ import energydb as edb
 import pandas as pd
 
 client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
-client.create()                # PG schema + CH series_values table
+client.create()        # PG schema + CH series_values table
 
-# 1. Declare each WindTurbine with its TimeSeriesDescriptors.
-#    Descriptors are structure-only (schema); data lands later via write().
+# 1. Declare a turbine and the series it will hold (descriptors only).
 t01 = edb.wind.WindTurbine(
     name="T01", lat=55.01, lon=3.02, capacity=3.5, hub_height=80,
     timeseries=[
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
-        edb.TimeSeriesDescriptor(
-            name="power", unit="MW",
-            data_type=edb.DataType.FORECAST,
-            timeseries_type=edb.TimeSeriesType.OVERLAPPING,
-        ),
-    ],
-)
-t02 = edb.wind.WindTurbine(
-    name="T02", lat=55.01, lon=3.04, capacity=3.5, hub_height=80,
-    timeseries=[
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+        edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                 data_type=edb.DataType.ACTUAL),
     ],
 )
 
-# 2. Group turbines under a Site.
-offshore_1 = edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01, t02])
+# 2. Wrap it in a site and a portfolio.
+site = edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01])
+portfolio = edb.Portfolio(name="my-portfolio", members=[site])
 
-# 3. Same pattern for the second site: PV system + battery.
-pv01 = edb.solar.PVSystem(
-    name="PV01", capacity=10, surface_tilt=25, surface_azimuth=180,
-    timeseries=[
-        edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
-    ],
-)
-b01 = edb.battery.Battery(name="B01", storage_capacity=1000, max_charge=500)
-rooftop_1 = edb.Site(name="Rooftop-1", lat=52.0, lon=4.5, members=[pv01, b01])
-
-# 4. Assemble the portfolio.
-portfolio = edb.Portfolio(name="my-portfolio", members=[offshore_1, rooftop_1])
-
-# 5. Persist the structure + series schemas. Idempotent.
+# 3. Persist structure (nodes, edges, descriptors). Idempotent.
 client.register_tree(portfolio)
 
-# 6. Write a day of hourly values for one series.
+# 4. Write a day of hourly values for the turbine's power series.
 start = datetime(2026, 1, 1, tzinfo=UTC)
-hours = pd.date_range(start, periods=24, freq="1h", tz="UTC")
-df = pd.DataFrame({"valid_time": hours, "value": [2.5 + 0.05 * i for i in range(24)]})
+df = pd.DataFrame({
+    "valid_time": pd.date_range(start, periods=24, freq="1h", tz="UTC"),
+    "value": [2.5 + 0.05 * i for i in range(24)],
+})
 client.get_node("my-portfolio", "Offshore-1", "T01").write(
     df, name="power", data_type="actual",
 )
 
-# 7. Read with the fluent API — single asset, single series.
-client.get_node("my-portfolio", "Offshore-1", "T01").read(
-    data_type="actual", name="power",
-)
+# 5. Read back — single asset, or across the whole portfolio.
+client.get_node("my-portfolio", "Offshore-1", "T01").read(name="power", data_type="actual")
+client.get_node("my-portfolio").read(name="power", data_type="actual")
 
-# Subtree read — all actuals for 'power' across the portfolio.
-client.get_node("my-portfolio").read(data_type="actual", name="power")
-
-# Filter descendants by EDM type.
-client.get_node("my-portfolio").where(type="WindTurbine").read(data_type="actual", name="power")
-
-# 8. Reconstruct the full EDM tree from the database.
+# 6. Reconstruct the full EDM tree from the database.
 tree = client.get_tree("my-portfolio", include_series=True)
-```
-
-### 3. Read → modify → write back
-
-Because identity is the UUID, the round-trip preserves it. Renames, moves, and
-property edits become silent UPDATEs; explicit confirmation gates destructive ops.
-
-```python
-tree = client.get_tree("my-portfolio")     # uuids populated from PG
-tree.members[0].name = "Renamed-Site"      # silent rename
-tree.members[0].members[0].capacity = 4.0  # silent property edit
-del tree.members[0].members[1]             # remove a turbine
-
-# Preview before applying
-diff = client.register_tree(
-    tree, mode="replace_subtree", allow_delete=True, dry_run=True,
-)
-diff.print()
-
-# Apply
-client.register_tree(tree, mode="replace_subtree", allow_delete=True)
 ```
 
 ---
 
-## 🧪 Try It in Google Colab
+## 🧪 Try it in Google Colab
 
-Want to try EnergyDB without a local setup? Open our Quickstart in Colab.
+Want to try EnergyDB without a local setup? Open our Quickstart in Colab — the first cell automatically installs PostgreSQL + ClickHouse inside the VM.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rebase-energy/energydb/blob/main/examples/quickstart.ipynb)
 
@@ -158,11 +107,21 @@ Want to try EnergyDB without a local setup? Open our Quickstart in Colab.
 
 ---
 
+## 📚 Documentation & Resources
+
+- [📖 Official Documentation](https://energydb.readthedocs.io)
+- [⚙️ Installation Guide](https://energydb.readthedocs.io/en/latest/installation.html)
+- [🐍 Python SDK Documentation](https://energydb.readthedocs.io/en/latest/sdk.html)
+- [🌐 Reference](https://energydb.readthedocs.io/en/latest/reference.html)
+- [💡 Examples & Notebooks](examples/)
+
+---
+
 ## 📦 Related Projects
 
 | Project | Description |
 | :------ | :---------- |
-| [TimeDB](https://github.com/rebase-energy/timedb) | Time series database with auditability and overlapping forecast support |
+| [TimeDB](https://github.com/rebase-energy/timedb) | Bitemporal time-series database with auditability and overlapping-forecast support |
 | [TimeDataModel](https://github.com/rebase-energy/TimeDataModel) | Pythonic data model for time series |
 | [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) | Data model for energy assets (solar, wind, battery, grid, ...) |
 
@@ -170,7 +129,7 @@ Want to try EnergyDB without a local setup? Open our Quickstart in Colab.
 
 ## 🤝 Contributing
 
-Contributions are welcome! If you're interested in improving EnergyDB, please open an issue or pull request.
+Contributions are welcome! If you're interested in improving EnergyDB, please see our [Development Guide](DEVELOPMENT.md) for local setup instructions.
 
 ---
 

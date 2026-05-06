@@ -1,58 +1,84 @@
-"""Sphinx configuration for EnergyDB."""
+# Configuration file for the Sphinx documentation builder.
+#
+# For the full list of built-in configuration values, see the documentation:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-from __future__ import annotations
+# -- Path setup --------------------------------------------------------------
 
-import importlib.metadata
+import glob
+import os
+import shutil
+import sys
 
-project = "EnergyDB"
-author = "Rebase Energy"
+sys.path.insert(0, os.path.abspath(".."))
+
+# Copy notebook files from examples directory to docs/notebooks for nbsphinx
+_docs_dir = os.path.dirname(os.path.abspath(__file__))
+_examples_src = os.path.join(_docs_dir, "..", "examples")
+_notebooks_dir = os.path.join(_docs_dir, "notebooks")
+
+os.makedirs(_notebooks_dir, exist_ok=True)
+
+for nb_file in glob.glob(os.path.join(_examples_src, "*.ipynb")):
+    basename = os.path.basename(nb_file)
+    dest = os.path.join(_notebooks_dir, basename)
+    if not os.path.exists(dest) or os.path.getmtime(nb_file) > os.path.getmtime(dest):
+        shutil.copy2(nb_file, dest)
+
+# -- Project information -----------------------------------------------------
+
+project = "energydb"
 copyright = "Rebase Energy"
+author = "Rebase Energy"
+release = "0.3.2"
+version = "0.3.2"
 
-try:
-    release = importlib.metadata.version("energydb")
-except importlib.metadata.PackageNotFoundError:
-    release = "0.0.0"
-version = release
+# -- General configuration ---------------------------------------------------
 
 extensions = [
     "sphinx.ext.autodoc",
-    "sphinx.ext.autosummary",
+    "sphinx.ext.viewcode",
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
-    "sphinx.ext.viewcode",
-    "sphinx_autodoc_typehints",
-    "sphinx_copybutton",
-    "myst_parser",
+    "sphinx.ext.autosummary",
+    "nbsphinx",
 ]
 
-autosummary_generate = True
-autodoc_default_options = {
-    "members": True,
-    "undoc-members": False,
-    "show-inheritance": True,
-}
-autodoc_typehints = "description"
-napoleon_google_docstring = True
-napoleon_numpy_docstring = False
-
-myst_enable_extensions = ["colon_fence", "deflist"]
-
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
+# nbsphinx configuration
+nbsphinx_execute = "never"
+nbsphinx_allow_errors = True
 
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
+# -- Options for HTML output -------------------------------------------------
+
 html_theme = "sphinx_rtd_theme"
-html_static_path: list[str] = []
+html_static_path = ["_static"]
+
 html_theme_options = {
     "navigation_depth": 2,
 }
 
+# -- Extension configuration -------------------------------------------------
+
+# Napoleon settings for NumPy/Google style docstrings
+napoleon_google_docstring = True
+napoleon_numpy_docstring = True
+napoleon_include_init_with_doc = False
+napoleon_include_private_with_doc = False
+napoleon_include_special_with_doc = True
+napoleon_use_admonition_for_examples = False
+napoleon_use_admonition_for_notes = False
+napoleon_use_admonition_for_references = False
+napoleon_use_ivar = False
+napoleon_use_param = True
+napoleon_use_rtype = True
+
+# Intersphinx mapping
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
+    "pandas": ("https://pandas.pydata.org/docs/", None),
     "polars": ("https://docs.pola.rs/api/python/stable/", None),
-    "sqlalchemy": ("https://docs.sqlalchemy.org/en/20/", None),
+    "pint": ("https://pint.readthedocs.io/en/stable/", None),
 }

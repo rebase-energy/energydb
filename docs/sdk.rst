@@ -1,0 +1,767 @@
+SDK Usage
+=========
+
+The energydb SDK is a single class — :class:`~energydb.Client` — that owns a
+PostgreSQL connection pool and constructs a :class:`timedb.TimeDBClient` for
+ClickHouse I/O. Around it sit two fluent scopes (:class:`~energydb.NodeScope`
+and :class:`~energydb.EdgeScope`) that let you navigate the hierarchy and
+operate on a single node or edge in idiomatic Python.
+
+Overview
+--------
+
+energydb stores three kinds of objects, all in the same PostgreSQL ``energydb``
+schema:
+
+- **Nodes** — Portfolio, Site, WindTurbine, Battery, JunctionPoint, …
+  Identified by a UUID7 generated when the ``Element`` is constructed in
+  Python; that same UUID is the row primary key in Postgres.
+- **Edges** — typed cross-tree links (Line, Link, Pipe, Interconnection)
+  between two nodes, also UUID-keyed.
+- **Series** — bitemporal series owned by exactly one node *or* edge. The
+  catalog row lives in PostgreSQL; the values themselves live in TimeDB's
+  ClickHouse ``series_values`` table.
+
+Time series in energydb fall into two categories — a property of each
+descriptor:
+
+- ``FLAT`` — actuals / measurements, one value per ``valid_time``
+- ``OVERLAPPING`` — versioned forecasts, multiple ``knowledge_time`` per ``valid_time``
+
+The same ``client.write`` / ``client.read`` pipeline handles both. OVERLAPPING
+series additionally require a ``knowledge_time`` (kwarg or column) on every
+write.
+
+
+Getting Started
+---------------
+
+Import the package and instantiate the client:
+
+.. code-block:: python
+
+   import energydb as edb
+
+   client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
+
+The constructor accepts explicit ``pg_conninfo=`` and ``ch_url=`` kwargs for
+custom connections; environment variables are the default.
+
+energydb re-exports the EnergyDataModel public API under ``edb.*`` (see
+``edb.wind``, ``edb.solar``, ``edb.battery``, ``edb.grid``, ``edb.Site``,
+``edb.Portfolio``, …) and the TimeDB descriptor types
+(:class:`~timedatamodel.TimeSeriesDescriptor`, :class:`~timedatamodel.DataType`,
+:class:`~timedatamodel.TimeSeriesType`).
+
+
+Database Connection
+-------------------
+
+The client reads its connection settings from environment variables by default:
+
+- ``TIMEDB_PG_DSN`` (or ``DATABASE_URL``) — PostgreSQL DSN
+- ``TIMEDB_CH_URL`` — ClickHouse HTTP URL
+
+You can also use a ``.env`` file in your project root (see
+:doc:`installation`).
+
+For programmatic use, instantiate the client with explicit settings:
+
+.. code-block:: python
+
+   client = edb.Client(
+       pg_conninfo="postgresql://user:pw@localhost:5432/energydb",
+       ch_url="http://default:@localhost:8123/default",
+   )
+
+
+Schema Management
+-----------------
+
+Creating the Schema
+~~~~~~~~~~~~~~~~~~~
+
+Before using the client, create the database schema:
+
+.. code-block:: python
+
+   client.create()
+
+This runs ``CREATE SCHEMA energydb`` and ``Base.metadata.create_all`` against
+PostgreSQL, then delegates to TimeDB to create the ClickHouse
+``series_values`` table. Safe to run repeatedly.
+
+Deleting the Schema
+~~~~~~~~~~~~~~~~~~~
+
+To drop both databases (use with caution):
+
+.. code-block:: python
+
+   client.delete()
+
+**WARNING**: ``DROP SCHEMA energydb CASCADE`` removes every node, edge, series
+descriptor, and run; ``td.delete()`` removes every value in ClickHouse.
+
+
+Building Hierarchies with ``register_tree``
+-------------------------------------------
+
+The single entry point for structure persistence — every node, edge, and
+series descriptor — is :meth:`~energydb.Client.register_tree`. It is
+declarative, idempotent, and atomic: build the entire portfolio top-down as
+one nested expression in Python, then persist it in one call.
+
+.. code-block:: python
+
+   import energydb as edb
+
+   t01 = edb.wind.WindTurbine(
+       name="T01", lat=55.01, lon=3.02, capacity=3.5, hub_height=80,
+       timeseries=[
+           edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                    data_type=edb.DataType.ACTUAL),
+           edb.TimeSeriesDescriptor(
+               name="power", unit="MW",
+               data_type=edb.DataType.FORECAST,
+               timeseries_type=edb.TimeSeriesType.OVERLAPPING,
+           ),
+       ],
+   )
+   t02 = edb.wind.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
+       edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                data_type=edb.DataType.ACTUAL),
+   ])
+
+   portfolio = edb.Portfolio(
+       name="my-portfolio",
+       members=[edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01, t02])],
+   )
+
+   root_uuid = client.register_tree(portfolio)
+
+Every ``Element`` got its ``id`` (UUID7) at construction; ``register_tree``
+writes those UUIDs straight into the row primary keys in PostgreSQL.
+Re-running with the same tree is a no-op — the underlying upsert
+(``ON CONFLICT (uuid)``) skips updates whose payload is unchanged.
+
+.. note::
+
+   ``register_tree`` is **structure-only**. If any node/edge in the tree
+   carries non-empty inline ``TimeSeries.df`` data, the call raises
+   ``ValueError`` — write data separately via :meth:`~energydb.Client.write`
+   or the scope helpers (see below).
+
+Modes
+~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Mode
+     - Behavior for rows under the subtree root not in the target tree
+   * - ``"additive"`` (default)
+     - Left untouched. Re-running with a smaller tree never deletes anything.
+   * - ``"replace_subtree"``
+     - Candidates for deletion. Pass ``allow_delete=True`` to apply the
+       deletes; otherwise raises with the orphan list.
+
+.. code-block:: python
+
+   client.register_tree(portfolio)                                      # additive
+   client.register_tree(portfolio, mode="additive")                     # explicit
+   client.register_tree(portfolio, mode="replace_subtree", allow_delete=True)
+
+Renames, moves, and property edits
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With UUID identity, mutations resolve in one statement at the database layer:
+
+- **Rename** (same uuid, different ``name``) → silent ``UPDATE``
+- **Move** (same uuid, different ``parent_uuid``) → silent ``UPDATE``
+- **Property edit** (same uuid, different ``data``) → silent ``UPDATE``
+- **Type change** (same uuid, different ``node_type``) → rejected; element
+  type is immutable for a given id
+
+The recommended round-trip is read → modify → write back:
+
+.. code-block:: python
+
+   tree = client.get_tree("my-portfolio")          # uuids populated from PG
+   tree.members[0].name = "Renamed-Site"           # silent rename
+   tree.members[0].members[0].capacity = 4.0       # silent property edit
+   del tree.members[0].members[1]                  # remove a turbine
+
+   # Preview before applying.
+   diff = client.register_tree(
+       tree, mode="replace_subtree", allow_delete=True, dry_run=True,
+   )
+   diff.print()
+
+   # Apply.
+   client.register_tree(tree, mode="replace_subtree", allow_delete=True)
+
+Dry run
+~~~~~~~
+
+``dry_run=True`` returns a :class:`~energydb.TreeDiff` and rolls back —
+no DB state changes. The diff carries flat ``node_changes`` /
+``edge_changes`` lists and binned views (``node_inserts``, ``node_renames``,
+``node_moves``, ``node_data_edits``, ``node_deletes``, ``edge_inserts`` /
+``edge_updates`` / ``edge_deletes``).
+
+``TreeDiff.print()`` renders a tree-shaped textual preview::
+
+   Portfolio 'P'
+   ├── ~ Site 'NewName'                            [rename 'OldName' → 'NewName']
+   │   ├── + WindTurbine 'T03'                     [insert]
+   │   ├──   WindTurbine 'T01'
+   │   ├── ~ WindTurbine 'T02'                     [capacity: 3.5 → 4.0]
+   │   └── - Battery 'B1'                          [delete] (allow_delete required)
+   └── → Site 'Other'                              [moved (parent <a> → <b>)]
+   edges:
+     + Line 'Cable-1' <a-uuid> → <b-uuid>          [insert]
+
+
+Edges and Grid Topology
+-----------------------
+
+Edges model typed cross-tree links — lines, transformers, pipes,
+interconnections. They have full CRUD, can carry their own time series, and
+support endpoint navigation.
+
+.. code-block:: python
+
+   bus_a = edb.grid.JunctionPoint(name="BusA")
+   bus_b = edb.grid.JunctionPoint(name="BusB")
+   line = edb.grid.Line(
+       name="Cable-1", capacity=500,
+       from_element=bus_a, to_element=bus_b,
+   )
+
+   # Persist topology in one call — register_tree handles nodes then edges.
+   client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b, line]))
+
+For standalone edges between nodes that already exist in the database, use
+:meth:`~energydb.Client.create_edge` directly:
+
+.. code-block:: python
+
+   client.create_edge(line)
+
+Look an edge up by uuid or by the ``(from_path, to_path, type)`` triple:
+
+.. code-block:: python
+
+   e = client.get_edge(uuid=line.id).get()
+   e = client.get_edge(("Grid", "BusA"), ("Grid", "BusB"), type="Line").get()
+
+Series on an edge:
+
+.. code-block:: python
+
+   scope = client.get_edge(uuid=line.id)
+   scope.register_series(
+       name="power_flow", canonical_unit="MW",
+       data_type="actual", timeseries_type="FLAT",
+   )
+   scope.write(df, name="power_flow", data_type="actual")
+   scope.read(name="power_flow", data_type="actual")
+
+
+Targeted Time-Series I/O
+------------------------
+
+Use :meth:`NodeScope.write <energydb.NodeScope.write>` /
+:meth:`EdgeScope.write <energydb.EdgeScope.write>` when you have a single
+known series — patching a bad segment, backfilling a gap, exploring data
+interactively, or driving a small ETL. The series is resolved exactly once
+via the scope's path or uuid before any data reaches the database.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 36 36
+
+   * -
+     - Targeted I/O (scope ``write`` / ``read``)
+     - Bulk I/O (``client.write`` / ``client.read``)
+   * - **Targets**
+     - One series at a time
+     - Many series across many nodes / edges
+   * - **Typical use**
+     - Patching, backfilling, exploration
+     - ETL pipelines, scheduled loads, cross-portfolio reads
+   * - **Routing**
+     - Implicit (the scope's resolved uuid)
+     - Manifest column: ``node_uuid``, ``edge_uuid``, or ``path``
+
+Writing
+~~~~~~~
+
+Build a small DataFrame with ``valid_time`` and ``value`` (and optionally
+``knowledge_time`` for OVERLAPPING series), then write it through the
+scope:
+
+.. code-block:: python
+
+   from datetime import UTC, datetime
+   import pandas as pd
+
+   start = datetime(2026, 1, 1, tzinfo=UTC)
+   df = pd.DataFrame({
+       "valid_time": pd.date_range(start, periods=24, freq="1h", tz="UTC"),
+       "value": [2.5 + 0.1 * h for h in range(24)],
+   })
+
+   client.get_node("my-portfolio", "Offshore-1", "T01").write(
+       df, data_type="actual", name="power",
+   )
+
+A pandas or polars DataFrame is accepted; everything is converted to polars
+internally. ``write()`` returns the ``run_id`` used for this batch — all
+writes are recorded in the ``energydb.runs`` table, keyed by a client-side
+UUID7-derived integer.
+
+Optional kwargs:
+
+- ``unit`` — declare the incoming unit; if it differs from the series'
+  registered ``canonical_unit``, pint computes the scalar factor and
+  rescales every value before writing
+- ``knowledge_time`` — broadcast a single ``knowledge_time`` (required for
+  OVERLAPPING series unless a ``knowledge_time`` column is on the DataFrame)
+- ``run_id``, ``workflow_id``, ``model_name``, ``run_start_time``,
+  ``run_finish_time``, ``run_params`` — provenance metadata stored in
+  ``energydb.runs``
+
+Reading
+~~~~~~~
+
+A scope's ``.read()`` reads every series that matches under the resolved
+subtree. Pass ``data_type=`` and ``name=`` to narrow:
+
+.. code-block:: python
+
+   # Single-series read
+   df = client.get_node("my-portfolio", "Offshore-1", "T01").read(
+       data_type="actual", name="power", start_valid=start,
+   )
+
+   # Subtree read — every actual 'power' across the whole portfolio
+   df = client.get_node("my-portfolio").read(data_type="actual", name="power")
+
+   # Filter descendants by EDM type
+   df = client.get_node("my-portfolio").where(type="WindTurbine").read(
+       data_type="actual", name="power",
+   )
+
+The read returns a pandas DataFrame by default; pass ``output="polars"`` for
+polars. Columns include the standard timedb output (``series_id``,
+``valid_time``, ``value``, plus optional ``knowledge_time`` /
+``change_time`` flags) joined with the energydb-side hierarchy info:
+``path`` (List[str]), ``node`` (display name), ``node_type``, ``node_uuid``,
+``data_type``, ``name``.
+
+For edge reads, the hierarchy columns are: ``edge_uuid``, ``edge`` (label),
+``edge_type``, ``from_node`` (path), ``to_node`` (path).
+
+Time-range filters mirror TimeDB:
+
+.. code-block:: python
+
+   df = scope.read(
+       data_type="actual", name="power",
+       start_valid=datetime(2026, 1, 1, tzinfo=UTC),
+       end_valid=datetime(2026, 2, 1, tzinfo=UTC),
+       start_known=datetime(2026, 1, 1, tzinfo=UTC),  # OVERLAPPING only
+       end_known=datetime(2026, 1, 15, tzinfo=UTC),
+       include_updates=False,                          # correction chain off
+       include_knowledge_time=False,                   # collapse to latest
+   )
+
+Per-window cutoffs (for backtesting / day-ahead simulation) are exposed via
+:meth:`NodeScope.read_relative <energydb.NodeScope.read_relative>` — same
+window-length / issue-offset / daily-shorthand semantics as
+:meth:`timedb.TimeDBClient.read_relative`.
+
+
+Bulk Manifest I/O
+-----------------
+
+For production pipelines that touch many series across many nodes or edges
+in one call, use :meth:`Client.write <energydb.Client.write>` and
+:meth:`Client.read <energydb.Client.read>` with a *manifest DataFrame*. The
+same engine drives the scope helpers, so guarantees are identical.
+
+The manifest carries one routing column plus ``data_type``, ``name``, and
+the data columns. The routing column is autodetected from the column names
+— exactly one of:
+
+- ``node_uuid`` — programmatic routing by UUID
+- ``edge_uuid`` — programmatic routing for edge-attached series
+- ``path`` — human-readable, ``List(Utf8)`` (preserves names with ``/``,
+  ``.``, spaces)
+
+write() — long-format multi-series ingestion
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   import polars as pl
+   from datetime import UTC, datetime, timedelta
+
+   base = datetime(2026, 1, 1, tzinfo=UTC)
+   hours = [base + timedelta(hours=h) for h in range(24)]
+
+   manifest = pl.DataFrame({
+       "path":       [["my-portfolio", "Offshore-1", "T01"]] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power"] * 24,
+       "valid_time": hours,
+       "value":      [2.5 + 0.1 * h for h in range(24)],
+   })
+   client.write(manifest)
+
+The other two routing forms are equivalent:
+
+.. code-block:: python
+
+   # By node uuid (programmatic)
+   pl.DataFrame({
+       "node_uuid":  [str(t01.id)] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power"] * 24,
+       "valid_time": hours,
+       "value":      [2.5 + 0.1 * h for h in range(24)],
+   })
+
+   # By edge uuid (for edge-attached series)
+   pl.DataFrame({
+       "edge_uuid":  [str(line.id)] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power_flow"] * 24,
+       "valid_time": hours,
+       "value":      [200.0 + h for h in range(24)],
+   })
+
+Routing modes are mutually exclusive — passing more than one routing column
+raises ``ValueError``.
+
+Series must already be registered (typically via
+:meth:`~energydb.Client.register_tree`) — unresolved
+``(owner, data_type, name)`` triples raise before any data reaches
+ClickHouse.
+
+Optional columns and kwargs:
+
+- ``unit`` (column or kwarg) — incoming unit, auto-converted to each series'
+  canonical unit; mutually exclusive when both forms are supplied
+- ``knowledge_time`` (column or kwarg) — required for OVERLAPPING series
+- ``run_id``, ``workflow_id``, ``model_name``, ``run_start_time``,
+  ``run_finish_time``, ``run_params`` — provenance metadata; default
+  ``run_id`` is one client-generated UUID7-derived integer per call
+
+Returns the ``run_id`` used.
+
+read() — manifest-based multi-series read
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The read manifest is the same shape, minus the data columns:
+
+.. code-block:: python
+
+   manifest = pl.DataFrame([
+       {"path": ("my-portfolio", "Offshore-1", "T01"), "data_type": "actual", "name": "power"},
+       {"path": ("my-portfolio", "Offshore-1", "T02"), "data_type": "actual", "name": "power"},
+   ])
+   df = client.read(
+       manifest,
+       start_valid=datetime(2026, 1, 1, tzinfo=UTC),
+       end_valid=datetime(2026, 2, 1, tzinfo=UTC),
+   )
+
+Returns a pandas DataFrame by default; pass ``output="polars"`` for polars.
+
+Optional kwargs:
+
+- ``unit`` — request a specific unit; per-series scalar factor applied
+- ``start_valid`` / ``end_valid`` — valid_time range (UTC)
+- ``start_known`` / ``end_known`` — knowledge_time range (OVERLAPPING only)
+- ``include_updates`` — expose correction chain
+- ``include_knowledge_time`` — return one row per (knowledge_time, valid_time)
+
+The result columns mirror the scope read: timedb output joined with the
+hierarchy columns (``path`` / ``node`` / ``node_type`` / ``node_uuid`` for
+node manifests, ``edge_uuid`` / ``edge`` / ``edge_type`` / ``from_node`` /
+``to_node`` for edge manifests).
+
+Per-window relative reads use :meth:`Client.read_relative
+<energydb.Client.read_relative>`, with the same parameters as TimeDB's
+:meth:`~timedb.TimeDBClient.read_relative`.
+
+
+Tree Reconstruction
+-------------------
+
+Pull a node or a whole subtree back as a regular EnergyDataModel object —
+same UUIDs, ready for inspection or in-memory edits.
+
+.. code-block:: python
+
+   # Single node, eager
+   turbine = client.get_node("my-portfolio", "Offshore-1", "T01").get()
+   turbine = client.get_node(uuid=t01.id).get()
+
+   # Full subtree as an EDM tree
+   tree = client.get_tree("my-portfolio")
+   tree_with_series = client.get_tree("my-portfolio", include_series=True)
+
+With ``include_series=True``, every reconstructed node carries its registered
+:class:`~timedatamodel.TimeSeriesDescriptor` entries on ``timeseries`` (no
+data — descriptors only).
+
+Flat queries by type / subtree / properties:
+
+.. code-block:: python
+
+   turbines = client.query_nodes(type="WindTurbine", within="my-portfolio")
+   lines = client.query_edges(type="Line", within="my-portfolio")
+
+
+Imperative Single-Element Ops
+-----------------------------
+
+For surgical edits without a tree round-trip, fluent scope ops:
+
+.. code-block:: python
+
+   t01 = client.get_node("my-portfolio", "Offshore-1", "T01")
+   t01.rename("T01-A")
+   t01.update(data={"capacity": 4.5})
+   t01.move_to(client.get_node("my-portfolio", "Onshore-1"))
+   t01.delete()
+
+``move_to`` rejects re-parenting into self or any descendant (cycle
+detection). ``rename`` and ``update`` are idempotent and round-trip safe.
+
+The same surface exists on edges:
+
+.. code-block:: python
+
+   e = client.get_edge(uuid=line.id)
+   e.update(data={"capacity": 600})
+   e.delete()
+
+
+Series Registration
+-------------------
+
+The recommended way to register series is to declare them as
+:class:`~timedatamodel.TimeSeriesDescriptor` entries on each ``Element`` and
+let ``register_tree`` persist them with the rest of the structure.
+
+For surgical additions on an existing node or edge, scopes expose
+``register_series``:
+
+.. code-block:: python
+
+   client.get_node("my-portfolio", "Offshore-1", "T01").register_series(
+       name="wind_speed",
+       canonical_unit="m/s",
+       data_type="actual",
+       timeseries_type="FLAT",
+   )
+
+Or pass a descriptor directly:
+
+.. code-block:: python
+
+   desc = edb.TimeSeriesDescriptor(
+       name="wind_speed", unit="m/s", data_type=edb.DataType.ACTUAL,
+   )
+   client.get_node(uuid=t01.id).register_series(desc)
+
+``retention``, ``canonical_unit``, and the owner columns are immutable after
+insert (enforced by a Postgres trigger). Reclassifying a series means
+registering a new one — this preserves CH-side data integrity. When
+``retention`` is omitted it is derived from ``timeseries_type``: ``FLAT``
+(actuals) → ``forever``, ``OVERLAPPING`` (forecasts) → ``medium``.
+
+
+Run History
+-----------
+
+Every write creates one run row in ``energydb.runs``. To list runs that wrote
+data for a given series:
+
+.. code-block:: python
+
+   runs = client.read_runs_for_series(series_id=42)
+   # [
+   #   {"run_id": 123..., "workflow_id": "nightly-forecast",
+   #    "model_name": "ECMWF",
+   #    "run_start_time": ..., "run_finish_time": ...,
+   #    "run_params": {"horizon": 48}, "inserted_at": ...},
+   #   ...
+   # ]
+
+Run ids are client-side BIGINTs (top 63 bits of a UUID7), time-sortable, and
+fit cleanly in ``Int64``.
+
+
+Error Handling
+--------------
+
+Common errors and how to handle them:
+
+.. code-block:: python
+
+   from energydb import IncompatibleUnitError
+
+   try:
+       client.register_tree(portfolio, mode="replace_subtree")
+   except ValueError as e:
+       if "would delete" in str(e):
+           # Orphans detected — pass allow_delete=True to confirm.
+           ...
+       else:
+           raise
+
+   try:
+       client.write(manifest)
+   except ValueError as e:
+       if "Series not registered" in str(e):
+           # Register descriptors via register_tree first.
+           ...
+       elif "knowledge_time is required for OVERLAPPING" in str(e):
+           ...
+       else:
+           raise
+   except IncompatibleUnitError as e:
+       print(f"Unit mismatch: {e}")
+
+Key exceptions:
+
+- ``ValueError`` — orphan detection in ``replace_subtree``, missing routing
+  columns, unresolved series, missing ``knowledge_time`` for OVERLAPPING,
+  illegal type changes, cycle-creating ``move_to``
+- :class:`~energydb.IncompatibleUnitError` — unit conversion failed due to
+  dimensionality mismatch
+
+
+Best Practices
+--------------
+
+1. **Always use timezone-aware UTC datetimes.** Naive timestamps raise.
+
+   .. code-block:: python
+
+      from datetime import UTC, datetime
+      good = datetime(2026, 1, 1, 12, tzinfo=UTC)
+
+2. **Declare descriptors with the tree, not later.** Inline
+   :class:`~timedatamodel.TimeSeriesDescriptor` entries on every
+   ``Element``; ``register_tree`` registers them in the same transaction.
+   Use ``scope.register_series`` only for surgical additions.
+
+3. **Round-trip through ``get_tree`` → modify → ``register_tree``.** UUIDs
+   make renames, moves, and property edits silent ``UPDATE``\ s — no
+   delete-then-insert dance.
+
+4. **Use ``dry_run=True`` before destructive ``replace_subtree``.** Inspect
+   the :class:`~energydb.TreeDiff` (or call ``.print()``) and confirm before
+   passing ``allow_delete=True``.
+
+5. **Pick a routing column per pipeline.** Mixing ``path`` and ``node_uuid``
+   in the same manifest raises. Use ``path`` for human-readable ETL,
+   ``node_uuid`` / ``edge_uuid`` once you have the ids.
+
+6. **Tag writes with ``workflow_id`` / ``model_name``.** Provenance lives in
+   ``energydb.runs`` and is recoverable via
+   :meth:`~energydb.Client.read_runs_for_series`.
+
+7. **Use ``where(type=...)`` for type-filtered subtree reads.** A single
+   fluent call replaces N targeted reads — the manifest pipeline batches
+   resolution and the join in one round-trip.
+
+
+Complete Example
+----------------
+
+A complete workflow from setup to analysis:
+
+.. code-block:: python
+
+   from datetime import UTC, datetime, timedelta
+   import energydb as edb
+   import pandas as pd
+   import polars as pl
+
+   client = edb.Client()
+   client.delete()
+   client.create()
+
+   # 1. Declare the portfolio (asset hierarchy + descriptors).
+   t01 = edb.wind.WindTurbine(
+       name="T01", lat=55.01, lon=3.02, capacity=3.5, hub_height=80,
+       timeseries=[
+           edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                    data_type=edb.DataType.ACTUAL),
+           edb.TimeSeriesDescriptor(
+               name="power", unit="MW",
+               data_type=edb.DataType.FORECAST,
+               timeseries_type=edb.TimeSeriesType.OVERLAPPING,
+           ),
+       ],
+   )
+   t02 = edb.wind.WindTurbine(name="T02", capacity=3.5, timeseries=[
+       edb.TimeSeriesDescriptor(name="power", unit="MW",
+                                data_type=edb.DataType.ACTUAL),
+   ])
+   site = edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01, t02])
+   portfolio = edb.Portfolio(name="my-portfolio", members=[site])
+
+   # 2. Persist structure (idempotent).
+   client.register_tree(portfolio)
+
+   # 3. Targeted write — actual power for T01.
+   start = datetime(2026, 1, 1, tzinfo=UTC)
+   hours = pd.date_range(start, periods=24, freq="1h", tz="UTC")
+   df = pd.DataFrame({"valid_time": hours, "value": [2.5 + 0.05 * i for i in range(24)]})
+   client.get_node("my-portfolio", "Offshore-1", "T01").write(
+       df, data_type="actual", name="power",
+   )
+
+   # 4. Bulk write — actual power for both turbines via a manifest.
+   long_df = pl.DataFrame({
+       "path":       [["my-portfolio", "Offshore-1", "T01"]] * 24
+                   + [["my-portfolio", "Offshore-1", "T02"]] * 24,
+       "data_type":  ["actual"] * 48,
+       "name":       ["power"] * 48,
+       "valid_time": list(hours) * 2,
+       "value":      [2.5 + 0.05 * i for i in range(24)]
+                   + [2.7 + 0.05 * i for i in range(24)],
+   })
+   run_id = client.write(long_df)
+   print(f"wrote run_id={run_id}")
+
+   # 5. Subtree read — every actual 'power' across the portfolio.
+   result = client.get_node("my-portfolio").read(
+       data_type="actual", name="power", start_valid=start,
+   )
+   print(result.head())
+
+   # 6. Round-trip — modify and write back.
+   tree = client.get_tree("my-portfolio")
+   tree.members[0].name = "Offshore-Renamed"          # rename
+   tree.members[0].members[0].capacity = 4.0          # property edit
+   del tree.members[0].members[1]                     # remove T02
+
+   diff = client.register_tree(
+       tree, mode="replace_subtree", allow_delete=True, dry_run=True,
+   )
+   diff.print()
+   client.register_tree(tree, mode="replace_subtree", allow_delete=True)
+
+   # 7. Cleanup.
+   client.delete()
