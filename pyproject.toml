@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "energydb"
 version = "0.3.0"
@@ -13,6 +17,9 @@ dependencies = [
     "polars>=1.0",
     "pint>=0.23",
 ]
+
+[tool.setuptools]
+packages = ["energydb"]
 
 [tool.setuptools.package-data]
 energydb = ["sql/*.sql"]
