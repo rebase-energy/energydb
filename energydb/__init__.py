@@ -58,7 +58,6 @@ from timedatamodel import (
     DataType,
     Frequency,
     TimeSeries,
-    TimeSeriesDescriptor,
     TimeSeriesType,
 )
 
@@ -106,7 +105,6 @@ __all__ = [
     "VirtualPowerPlant",
     # Time series types
     "TimeSeries",
-    "TimeSeriesDescriptor",
     "DataType",
     "DataShape",
     "Frequency",

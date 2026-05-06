@@ -37,12 +37,12 @@ Quick Start
    client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
    client.create()        # PG schema + CH series_values table
 
-   # 1. Declare a turbine with the series it will hold (descriptors only).
+   # 1. Declare a turbine with the series it will hold (metadata only).
    t01 = edb.wind.WindTurbine(
        name="T01", lat=55.01, lon=3.02, capacity=3.5, hub_height=80,
        timeseries=[
-           edb.TimeSeriesDescriptor(name="power", unit="MW",
-                                    data_type=edb.DataType.ACTUAL),
+           edb.TimeSeries(name="power", unit="MW",
+                          data_type=edb.DataType.ACTUAL),
        ],
    )
 
@@ -50,7 +50,7 @@ Quick Start
    site = edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01])
    portfolio = edb.Portfolio(name="my-portfolio", members=[site])
 
-   # 3. Persist structure (nodes, edges, descriptors). Idempotent.
+   # 3. Persist structure (nodes, edges, series declarations). Idempotent.
    client.register_tree(portfolio)
 
    # 4. Write a day of hourly values for the turbine's power series.

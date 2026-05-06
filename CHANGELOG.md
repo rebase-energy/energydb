@@ -14,7 +14,7 @@ EnergyDB stores three kinds of objects in one connected database:
 
 ## ✨ Key Features
 
-- **Declarative structure**: `client.register_tree(portfolio)` persists every node, edge, and series descriptor in one idempotent call
+- **Declarative structure**: `client.register_tree(portfolio)` persists every node, edge, and series declaration in one idempotent call
 - **UUID identity end-to-end**: `Element.id` is the row primary key — renames, moves, and property edits become silent `UPDATE`s
 - **Modes for in-place rewrites**: `mode="replace_subtree"` with `allow_delete=True` (and `dry_run=True` for previews via `TreeDiff.print()`)
 - **Fluent, lazy navigation**: `client.get_node("Portfolio", "Site", "T01").read(...)` accumulates path/filters and resolves in one indexed CTE

@@ -254,12 +254,12 @@ def test_manifest_with_list_utf8_paths(client):
             edb.wind.WindTurbine(
                 name="T01",
                 capacity=3.5,
-                timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+                timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             ),
             edb.wind.WindTurbine(
                 name="Distribution/12kV",  # name with slash
                 capacity=2.0,
-                timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+                timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             ),
         ],
     )

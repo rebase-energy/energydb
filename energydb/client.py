@@ -13,7 +13,7 @@ UUID identity model:
 
 API split:
 
-* ``register_tree`` — structure (nodes, edges, descriptors). Idempotent
+* ``register_tree`` — structure (nodes, edges, series declarations). Idempotent
   upsert; raises on inline timeseries data.
 * ``write`` / ``read`` — bulk timeseries data via manifest DataFrames.
 * ``get_node`` / ``get_edge`` — fluent scope entry points. Reads like
@@ -32,7 +32,7 @@ import pandas as pd
 import polars as pl
 from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine
-from timedatamodel import DataType, TimeSeriesDescriptor, TimeSeriesType
+from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient
 
 from energydb import runs as runs_mod
@@ -174,7 +174,7 @@ class Client:
         allow_delete: bool = False,
         dry_run: bool = False,
     ) -> UUID | TreeDiff:
-        """Persist an EDM tree's structure: nodes, edges, series descriptors.
+        """Persist an EDM tree's structure: nodes, edges, series declarations.
 
         Idempotent. With UUID identity, renames/moves/property edits on the
         same EDM ``id`` upsert in place — no need to delete-then-insert.
@@ -346,8 +346,8 @@ class Client:
         """Reconstruct the full EDM subtree rooted at the given node.
 
         With ``include_series=True``, every reconstructed node has its
-        registered series attached as :class:`TimeSeriesDescriptor` entries
-        on ``timeseries`` (no data — descriptors only).
+        registered series attached as metadata-only :class:`TimeSeries`
+        entries (``df=None``) on ``timeseries``.
         """
         with self._pool.connection() as conn:
             if uuid is not None:
@@ -389,7 +389,8 @@ class Client:
                     node_obj = nodes.get(nid)
                     if node_obj is None:
                         continue
-                    descriptor = TimeSeriesDescriptor(
+                    series = TimeSeries(
+                        df=None,
                         name=sname,
                         unit=unit or "dimensionless",
                         data_type=DataType(dt.upper()) if dt else None,
@@ -398,7 +399,7 @@ class Client:
                     )
                     if node_obj.timeseries is None:
                         node_obj.timeseries = []
-                    node_obj.timeseries.append(descriptor)
+                    node_obj.timeseries.append(series)
 
         # Attach children to their parents (flat pass — uuid-based, order-agnostic).
         for node_uuid, parent_uuid in parent_map.items():

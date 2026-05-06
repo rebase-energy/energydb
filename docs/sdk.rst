@@ -23,7 +23,7 @@ schema:
   ClickHouse ``series_values`` table.
 
 Time series in energydb fall into two categories — a property of each
-descriptor:
+series:
 
 - ``FLAT`` — actuals / measurements, one value per ``valid_time``
 - ``OVERLAPPING`` — versioned forecasts, multiple ``knowledge_time`` per ``valid_time``
@@ -49,8 +49,8 @@ custom connections; environment variables are the default.
 
 energydb re-exports the EnergyDataModel public API under ``edb.*`` (see
 ``edb.wind``, ``edb.solar``, ``edb.battery``, ``edb.grid``, ``edb.Site``,
-``edb.Portfolio``, …) and the TimeDB descriptor types
-(:class:`~timedatamodel.TimeSeriesDescriptor`, :class:`~timedatamodel.DataType`,
+``edb.Portfolio``, …) and the TimeDB types
+(:class:`~timedatamodel.TimeSeries`, :class:`~timedatamodel.DataType`,
 :class:`~timedatamodel.TimeSeriesType`).
 
 
@@ -101,14 +101,14 @@ To drop both databases (use with caution):
    client.delete()
 
 **WARNING**: ``DROP SCHEMA energydb CASCADE`` removes every node, edge, series
-descriptor, and run; ``td.delete()`` removes every value in ClickHouse.
+declaration, and run; ``td.delete()`` removes every value in ClickHouse.
 
 
 Building Hierarchies with ``register_tree``
 -------------------------------------------
 
 The single entry point for structure persistence — every node, edge, and
-series descriptor — is :meth:`~energydb.Client.register_tree`. It is
+series declaration — is :meth:`~energydb.Client.register_tree`. It is
 declarative, idempotent, and atomic: build the entire portfolio top-down as
 one nested expression in Python, then persist it in one call.
 
@@ -119,9 +119,9 @@ one nested expression in Python, then persist it in one call.
    t01 = edb.wind.WindTurbine(
        name="T01", lat=55.01, lon=3.02, capacity=3.5, hub_height=80,
        timeseries=[
-           edb.TimeSeriesDescriptor(name="power", unit="MW",
-                                    data_type=edb.DataType.ACTUAL),
-           edb.TimeSeriesDescriptor(
+           edb.TimeSeries(name="power", unit="MW",
+                          data_type=edb.DataType.ACTUAL),
+           edb.TimeSeries(
                name="power", unit="MW",
                data_type=edb.DataType.FORECAST,
                timeseries_type=edb.TimeSeriesType.OVERLAPPING,
@@ -129,8 +129,8 @@ one nested expression in Python, then persist it in one call.
        ],
    )
    t02 = edb.wind.WindTurbine(name="T02", capacity=3.5, hub_height=80, timeseries=[
-       edb.TimeSeriesDescriptor(name="power", unit="MW",
-                                data_type=edb.DataType.ACTUAL),
+       edb.TimeSeries(name="power", unit="MW",
+                      data_type=edb.DataType.ACTUAL),
    ])
 
    portfolio = edb.Portfolio(
@@ -517,8 +517,8 @@ same UUIDs, ready for inspection or in-memory edits.
    tree_with_series = client.get_tree("my-portfolio", include_series=True)
 
 With ``include_series=True``, every reconstructed node carries its registered
-:class:`~timedatamodel.TimeSeriesDescriptor` entries on ``timeseries`` (no
-data — descriptors only).
+series as metadata-only :class:`~timedatamodel.TimeSeries` entries (``df=None``)
+on ``timeseries``.
 
 Flat queries by type / subtree / properties:
 
@@ -556,9 +556,9 @@ The same surface exists on edges:
 Series Registration
 -------------------
 
-The recommended way to register series is to declare them as
-:class:`~timedatamodel.TimeSeriesDescriptor` entries on each ``Element`` and
-let ``register_tree`` persist them with the rest of the structure.
+The recommended way to register series is to declare them as metadata-only
+:class:`~timedatamodel.TimeSeries` entries on each ``Element`` and let
+``register_tree`` persist them with the rest of the structure.
 
 For surgical additions on an existing node or edge, scopes expose
 ``register_series``:
@@ -572,14 +572,14 @@ For surgical additions on an existing node or edge, scopes expose
        timeseries_type="FLAT",
    )
 
-Or pass a descriptor directly:
+Or pass a metadata-only TimeSeries directly:
 
 .. code-block:: python
 
-   desc = edb.TimeSeriesDescriptor(
+   ts = edb.TimeSeries(
        name="wind_speed", unit="m/s", data_type=edb.DataType.ACTUAL,
    )
-   client.get_node(uuid=t01.id).register_series(desc)
+   client.get_node(uuid=t01.id).register_series(ts)
 
 ``retention``, ``canonical_unit``, and the owner columns are immutable after
 insert (enforced by a Postgres trigger). Reclassifying a series means
@@ -631,7 +631,7 @@ Common errors and how to handle them:
        client.write(manifest)
    except ValueError as e:
        if "Series not registered" in str(e):
-           # Register descriptors via register_tree first.
+           # Register series via register_tree first.
            ...
        elif "knowledge_time is required for OVERLAPPING" in str(e):
            ...
@@ -659,10 +659,10 @@ Best Practices
       from datetime import UTC, datetime
       good = datetime(2026, 1, 1, 12, tzinfo=UTC)
 
-2. **Declare descriptors with the tree, not later.** Inline
-   :class:`~timedatamodel.TimeSeriesDescriptor` entries on every
-   ``Element``; ``register_tree`` registers them in the same transaction.
-   Use ``scope.register_series`` only for surgical additions.
+2. **Declare series with the tree, not later.** Inline metadata-only
+   :class:`~timedatamodel.TimeSeries` entries on every ``Element``;
+   ``register_tree`` registers them in the same transaction. Use
+   ``scope.register_series`` only for surgical additions.
 
 3. **Round-trip through ``get_tree`` → modify → ``register_tree``.** UUIDs
    make renames, moves, and property edits silent ``UPDATE``\ s — no
@@ -701,13 +701,13 @@ A complete workflow from setup to analysis:
    client.delete()
    client.create()
 
-   # 1. Declare the portfolio (asset hierarchy + descriptors).
+   # 1. Declare the portfolio (asset hierarchy + series declarations).
    t01 = edb.wind.WindTurbine(
        name="T01", lat=55.01, lon=3.02, capacity=3.5, hub_height=80,
        timeseries=[
-           edb.TimeSeriesDescriptor(name="power", unit="MW",
-                                    data_type=edb.DataType.ACTUAL),
-           edb.TimeSeriesDescriptor(
+           edb.TimeSeries(name="power", unit="MW",
+                          data_type=edb.DataType.ACTUAL),
+           edb.TimeSeries(
                name="power", unit="MW",
                data_type=edb.DataType.FORECAST,
                timeseries_type=edb.TimeSeriesType.OVERLAPPING,
@@ -715,8 +715,8 @@ A complete workflow from setup to analysis:
        ],
    )
    t02 = edb.wind.WindTurbine(name="T02", capacity=3.5, timeseries=[
-       edb.TimeSeriesDescriptor(name="power", unit="MW",
-                                data_type=edb.DataType.ACTUAL),
+       edb.TimeSeries(name="power", unit="MW",
+                      data_type=edb.DataType.ACTUAL),
    ])
    site = edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01, t02])
    portfolio = edb.Portfolio(name="my-portfolio", members=[site])

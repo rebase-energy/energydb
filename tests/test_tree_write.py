@@ -149,8 +149,8 @@ class TestRegisterTree:
         ]
         client.td.write.assert_not_called()
 
-    def test_descriptor_only_tree_registers_no_data(self, monkeypatch):
-        """Descriptors are fine for register_tree; td.write is never called."""
+    def test_metadata_only_tree_registers_no_data(self, monkeypatch):
+        """Metadata-only TimeSeries are fine for register_tree; td.write is never called."""
         client = _mock_client(monkeypatch)
         monkeypatch.setattr(
             "energydb._persist.create_node",
@@ -160,7 +160,7 @@ class TestRegisterTree:
         tree = edb.wind.WindTurbine(
             name="T",
             capacity=3.5,
-            timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+            timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
         )
         client.register_tree(tree)
         client.td.write.assert_not_called()
@@ -285,7 +285,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
                     edb.wind.WindTurbine(
                         name="T1",
                         capacity=3.5,
-                        timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+                        timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
                     )
                 ],
             )
@@ -353,12 +353,12 @@ def test_live_manifest_read(live_edb):
             edb.wind.WindTurbine(
                 name="T1",
                 capacity=3.5,
-                timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+                timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             ),
             edb.wind.WindTurbine(
                 name="T2",
                 capacity=3.5,
-                timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+                timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             ),
         ],
     )
@@ -395,7 +395,7 @@ def test_live_get_tree_with_series(live_edb):
             edb.wind.WindTurbine(
                 name="Tg",
                 capacity=3.5,
-                timeseries=[edb.TimeSeriesDescriptor(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+                timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
             )
         ],
     )

@@ -72,21 +72,21 @@ Exceptions
    :members:
 
 
-Time-Series Descriptors
------------------------
+Time-Series Declarations
+------------------------
 
-:class:`~timedatamodel.TimeSeriesDescriptor` lives in ``timedatamodel`` and
-is re-exported from ``energydb`` for convenience:
+:class:`~timedatamodel.TimeSeries` lives in ``timedatamodel`` and is
+re-exported from ``energydb`` for convenience:
 
 .. code-block:: python
 
-   from energydb import DataType, TimeSeriesDescriptor, TimeSeriesType
+   from energydb import DataType, TimeSeries, TimeSeriesType
 
-The descriptor declares a series's identity (``name``, ``unit``,
-``data_type``) and its bitemporal shape (``timeseries_type``: ``FLAT`` or
-``OVERLAPPING``). Attach descriptors to any ``Element`` via the
-``timeseries=[...]`` constructor kwarg; ``register_tree`` persists them
-alongside the structure.
+A metadata-only ``TimeSeries`` (constructed with ``df=None``) declares a
+series's identity (``name``, ``unit``, ``data_type``) and its bitemporal
+shape (``timeseries_type``: ``FLAT`` or ``OVERLAPPING``). Attach such
+declarations to any ``Element`` via the ``timeseries=[...]`` constructor
+kwarg; ``register_tree`` persists them alongside the structure.
 
 
 Schema (SQLAlchemy Models)

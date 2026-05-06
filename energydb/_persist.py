@@ -1,4 +1,4 @@
-"""Write helpers — node/edge upserts, descriptor registration, tree walks.
+"""Write helpers — node/edge upserts, series registration, tree walks.
 
 These helpers all take an open ``conn`` and do **not** commit. The caller
 controls the transaction boundary, which is how ``client.register_tree``
@@ -21,7 +21,7 @@ from uuid import UUID
 import energydatamodel as edm
 import polars as pl
 from energydatamodel.reference import Reference
-from timedatamodel import TimeSeries, TimeSeriesDescriptor, TimeSeriesType
+from timedatamodel import TimeSeries, TimeSeriesType
 
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
@@ -187,11 +187,11 @@ def register_tree_under(
     allow_delete: bool = False,
     dry_run: bool = False,
 ) -> tuple[UUID, TreeDiff]:
-    """Walk the EDM tree DFS, upsert nodes/edges, register descriptors.
+    """Walk the EDM tree DFS, upsert nodes/edges, register series.
 
-    Structure-only. Caller manages the transaction. Raises if any inline
-    ``TimeSeries.df`` carries data — write data separately via
-    ``client.write(df, ...)``.
+    Structure-only. Caller manages the transaction. Raises if any
+    ``TimeSeries`` on the tree has a non-empty df attached — write data
+    separately via ``client.write(df, ...)``.
 
     Modes:
 
@@ -506,7 +506,7 @@ def _apply_diff(
     4. Delete orphaned nodes (CASCADE handles their descendants and any
        remaining edges attached to them).
 
-    Series descriptors are registered alongside their owners during the
+    Series declarations are registered alongside their owners during the
     insert/update walk via :func:`create_node` / :func:`create_edge`, which
     we re-use for per-row UPSERTs.
     """
@@ -557,12 +557,17 @@ def _index_edm_objects(edm_obj) -> dict[UUID, Any]:
 
 
 def _validate_no_inline_data(edm_obj) -> None:
-    """Raise if any node/edge in the tree carries non-empty TimeSeries data."""
+    """Raise if any node/edge in the tree carries non-empty TimeSeries data.
+
+    ``register_tree()`` is structure-only — every ``TimeSeries`` on
+    ``element.timeseries`` must be metadata-only (``df=None``). Data is
+    written separately via :meth:`client.write`.
+    """
 
     def _check(obj):
         ts_list = getattr(obj, "timeseries", None) or []
         for ts in ts_list:
-            if isinstance(ts, TimeSeries) and ts.df is not None and ts.df.height > 0:
+            if ts.df is not None and ts.df.height > 0:
                 obj_name = getattr(obj, "name", "<unnamed>")
                 raise ValueError(
                     f"register_tree() received {obj_name!r} with inline timeseries data "
@@ -576,7 +581,7 @@ def _validate_no_inline_data(edm_obj) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Series descriptor registration
+# Series registration
 # ---------------------------------------------------------------------------
 
 
@@ -586,10 +591,7 @@ def register_node_descriptors(conn, node_uuid: UUID, edm_obj) -> None:
     if not ts_list:
         return
     for ts in ts_list:
-        if isinstance(ts, TimeSeries):
-            _register_one(conn, node_uuid=node_uuid, edge_uuid=None, descriptor=ts.to_descriptor())
-        elif isinstance(ts, TimeSeriesDescriptor):
-            _register_one(conn, node_uuid=node_uuid, edge_uuid=None, descriptor=ts)
+        _register_one(conn, node_uuid=node_uuid, edge_uuid=None, ts=ts)
 
 
 def register_edge_descriptors(conn, edge_uuid: UUID, edm_obj) -> None:
@@ -597,10 +599,7 @@ def register_edge_descriptors(conn, edge_uuid: UUID, edm_obj) -> None:
     if not ts_list:
         return
     for ts in ts_list:
-        if isinstance(ts, TimeSeries):
-            _register_one(conn, node_uuid=None, edge_uuid=edge_uuid, descriptor=ts.to_descriptor())
-        elif isinstance(ts, TimeSeriesDescriptor):
-            _register_one(conn, node_uuid=None, edge_uuid=edge_uuid, descriptor=ts)
+        _register_one(conn, node_uuid=None, edge_uuid=edge_uuid, ts=ts)
 
 
 def _register_one(
@@ -608,21 +607,21 @@ def _register_one(
     *,
     node_uuid: UUID | None,
     edge_uuid: UUID | None,
-    descriptor: TimeSeriesDescriptor,
+    ts: TimeSeries,
 ) -> int:
-    """Register one descriptor row using ``series_mod.register_series``."""
-    name = descriptor.name
-    canonical_unit = descriptor.unit
-    data_type = str(descriptor.data_type).lower() if descriptor.data_type is not None else None
-    ts_type = descriptor.timeseries_type
+    """Register one series row using ``series_mod.register_series``."""
+    name = ts.name
+    canonical_unit = ts.unit
+    data_type = str(ts.data_type).lower() if ts.data_type is not None else None
+    ts_type = ts.timeseries_type
     timeseries_type = ts_type.value if isinstance(ts_type, TimeSeriesType) else (str(ts_type) if ts_type else None)
 
     if name is None:
-        raise ValueError("descriptor.name is required")
+        raise ValueError("ts.name is required")
     if data_type is None:
-        raise ValueError(f"descriptor.data_type is required for {name!r}")
+        raise ValueError(f"ts.data_type is required for {name!r}")
     if timeseries_type is None:
-        raise ValueError(f"descriptor.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
+        raise ValueError(f"ts.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
 
     return series_mod.register_series(
         conn,
@@ -632,7 +631,7 @@ def _register_one(
         name=name,
         canonical_unit=canonical_unit,
         timeseries_type=timeseries_type,
-        description=descriptor.description,
+        description=ts.description,
     )
 
 

@@ -24,7 +24,7 @@ from uuid import UUID
 import pandas as pd
 import polars as pl
 from psycopg.types.json import Jsonb
-from timedatamodel import TimeSeriesDescriptor, TimeSeriesType
+from timedatamodel import TimeSeries, TimeSeriesType
 
 from energydb import series as series_mod
 from energydb._frames import OutputType, to_output, to_polars
@@ -57,9 +57,9 @@ def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Pa
     return tuple(args)
 
 
-def _timeseries_type_from_descriptor(desc: TimeSeriesDescriptor) -> str | None:
-    """Extract timeseries_type from a descriptor as 'FLAT' or 'OVERLAPPING'."""
-    ts_type = desc.timeseries_type
+def _timeseries_type_from_ts(ts: TimeSeries) -> str | None:
+    """Extract timeseries_type from a TimeSeries as 'FLAT' or 'OVERLAPPING'."""
+    ts_type = ts.timeseries_type
     if ts_type is None:
         return None
     return ts_type.value if isinstance(ts_type, TimeSeriesType) else str(ts_type)
@@ -343,7 +343,7 @@ class NodeScope:
 
     def register_series(
         self,
-        descriptor_or_name: TimeSeriesDescriptor | str | None = None,
+        ts_or_name: TimeSeries | str | None = None,
         *,
         name: str | None = None,
         canonical_unit: str | None = None,
@@ -354,22 +354,22 @@ class NodeScope:
     ) -> int:
         """Register a time series on this node.
 
-        Accepts a ``TimeSeriesDescriptor`` (unit + data_type + timeseries_type
-        extracted) or explicit kwargs. When ``retention`` is omitted it is
-        derived from ``timeseries_type``: ``FLAT`` (actuals) → ``'forever'``,
-        ``OVERLAPPING`` (forecasts) → ``'medium'``.
+        Accepts a ``TimeSeries`` (metadata extracted) or explicit kwargs. When
+        ``retention`` is omitted it is derived from ``timeseries_type``:
+        ``FLAT`` (actuals) → ``'forever'``, ``OVERLAPPING`` (forecasts) →
+        ``'medium'``.
         """
-        if isinstance(descriptor_or_name, TimeSeriesDescriptor):
-            desc = descriptor_or_name
-            name = name or desc.name
-            canonical_unit = canonical_unit or desc.unit
-            if data_type is None and desc.data_type is not None:
-                data_type = str(desc.data_type).lower()
+        if isinstance(ts_or_name, TimeSeries):
+            ts = ts_or_name
+            name = name or ts.name
+            canonical_unit = canonical_unit or ts.unit
+            if data_type is None and ts.data_type is not None:
+                data_type = str(ts.data_type).lower()
             if timeseries_type is None:
-                timeseries_type = _timeseries_type_from_descriptor(desc)
-            description = description or desc.description
-        elif isinstance(descriptor_or_name, str):
-            name = descriptor_or_name
+                timeseries_type = _timeseries_type_from_ts(ts)
+            description = description or ts.description
+        elif isinstance(ts_or_name, str):
+            name = ts_or_name
 
         if name is None:
             raise ValueError("name is required")
@@ -637,7 +637,7 @@ class EdgeScope:
 
     def register_series(
         self,
-        descriptor_or_name: TimeSeriesDescriptor | str | None = None,
+        ts_or_name: TimeSeries | str | None = None,
         *,
         name: str | None = None,
         canonical_unit: str | None = None,
@@ -646,17 +646,17 @@ class EdgeScope:
         retention: str | None = None,
         description: str | None = None,
     ) -> int:
-        if isinstance(descriptor_or_name, TimeSeriesDescriptor):
-            desc = descriptor_or_name
-            name = name or desc.name
-            canonical_unit = canonical_unit or desc.unit
-            if data_type is None and desc.data_type is not None:
-                data_type = str(desc.data_type).lower()
+        if isinstance(ts_or_name, TimeSeries):
+            ts = ts_or_name
+            name = name or ts.name
+            canonical_unit = canonical_unit or ts.unit
+            if data_type is None and ts.data_type is not None:
+                data_type = str(ts.data_type).lower()
             if timeseries_type is None:
-                timeseries_type = _timeseries_type_from_descriptor(desc)
-            description = description or desc.description
-        elif isinstance(descriptor_or_name, str):
-            name = descriptor_or_name
+                timeseries_type = _timeseries_type_from_ts(ts)
+            description = description or ts.description
+        elif isinstance(ts_or_name, str):
+            name = ts_or_name
 
         if name is None:
             raise ValueError("name is required")
