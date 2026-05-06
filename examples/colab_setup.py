@@ -31,7 +31,7 @@ print("3/4  Installing and starting ClickHouse …")
 _run("apt-get -qq install -y apt-transport-https ca-certificates")
 _run(
     "curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key"
-    " | gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg"
+    " | gpg --dearmor --yes --batch -o /usr/share/keyrings/clickhouse-keyring.gpg"
 )
 _run(
     'echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg]'
