@@ -45,9 +45,11 @@ source_suffix = {
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
-html_theme = "furo"
-html_title = f"EnergyDB {version}"
+html_theme = "sphinx_rtd_theme"
 html_static_path: list[str] = []
+html_theme_options = {
+    "navigation_depth": 2,
+}
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
