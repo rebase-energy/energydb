@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "timedb>=0.2.0",
-    "energydatamodel>=0.0.3",
+    "energydatamodel>=0.0.5",
     "psycopg[binary]>=3.1",
     "psycopg_pool>=3.1",
     "sqlalchemy>=2.0",
