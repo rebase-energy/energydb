@@ -59,18 +59,15 @@ uv run file.py
 
 EnergyDB uses two databases:
 
-- **PostgreSQL** — stores the asset hierarchy (`energydb.node`, `energydb.edge`), the series catalog (`energydb.series`), and run metadata (`energydb.runs`)
-- **ClickHouse** — stores all time-series values (via [TimeDB](https://github.com/rebase-energy/timedb))
+- **PostgreSQL** (port `5433`) — stores the asset hierarchy (`energydb.node`, `energydb.edge`), the series catalog (`energydb.series`), and run metadata (`energydb.runs`)
+- **ClickHouse** (port `8123`) — stores all time-series values (via [TimeDB](https://github.com/rebase-energy/timedb))
 
-The simplest local setup is the same Docker stack distributed with TimeDB:
+Spin both up locally using Docker:
 
 ```bash
-git clone https://github.com/rebase-energy/timedb.git
-cd timedb/local-db
+cd local-db/
 docker compose up -d
 ```
-
-This boots `local_postgres` (port 5433) and `local_clickhouse` (port 8123).
 
 Verify the containers are running:
 
@@ -78,11 +75,28 @@ Verify the containers are running:
 docker ps
 ```
 
+You should see `energydb_postgres` (port 5433) and `energydb_clickhouse` (port 8123).
+
+> **Note:** the ClickHouse container shares ports 8123/9000 with the standalone TimeDB stack. If you previously started TimeDB's `local-db/` containers, stop them first (`cd <timedb>/local-db && docker compose down`) before bringing up EnergyDB's stack.
+
 ## 4) Configuration
 
 EnergyDB reads `TIMEDB_PG_DSN` and `TIMEDB_CH_URL` from the environment.
 
-Set them directly in your shell:
+Fastest option (recommended): from the repository root, copy the example environment file.
+
+```bash
+cp .env.example .env
+```
+
+Both variables are already set correctly for the local Docker setup:
+
+```text
+TIMEDB_PG_DSN=postgresql://postgres:devpassword@127.0.0.1:5433/devdb
+TIMEDB_CH_URL=http://default:@localhost:8123/default
+```
+
+Alternatively, export the variables directly in your shell:
 
 ```bash
 # Bash/Zsh
@@ -96,13 +110,6 @@ set -x TIMEDB_PG_DSN postgresql://postgres:devpassword@127.0.0.1:5433/devdb
 set -x TIMEDB_CH_URL http://default:@localhost:8123/default
 ```
 
-Or use a `.env` file in the repository root:
-
-```text
-TIMEDB_PG_DSN=postgresql://postgres:devpassword@127.0.0.1:5433/devdb
-TIMEDB_CH_URL=http://default:@localhost:8123/default
-```
-
 ## 5) Next Steps
 
 Now you can try the examples in `examples/`, run the tests in `tests/`, or build your own script using the SDK. Create the schema once before running anything:
@@ -114,7 +121,36 @@ client = edb.Client()
 client.create()
 ```
 
-## 6) Running Tests
+## 6) Database Management & Tools
+
+### Helper scripts (Bash and Fish)
+
+If you are using the local Docker setup, use scripts in `local-db/`:
+
+- `./restart-db.sh` or `./restart-db.fish`: Restarts containers while preserving existing data.
+- `./clean-restart-db.sh` or `./clean-restart-db.fish`: Removes containers, volumes, and data, then starts fresh.
+
+### Manual inspection
+
+Connect to PostgreSQL with `psql`:
+
+```bash
+psql postgresql://postgres:devpassword@127.0.0.1:5433/devdb
+```
+
+Connect to ClickHouse with the HTTP interface:
+
+```bash
+curl http://localhost:8123/ping
+```
+
+Or with the native client:
+
+```bash
+docker exec -it energydb_clickhouse clickhouse-client
+```
+
+## 7) Running Tests
 
 The test suite uses `pytest` and assumes the local PostgreSQL + ClickHouse stack is reachable.
 
@@ -122,7 +158,7 @@ The test suite uses `pytest` and assumes the local PostgreSQL + ClickHouse stack
 pytest
 ```
 
-## 7) Building Documentation
+## 8) Building Documentation
 
 Generate HTML documentation with Sphinx:
 

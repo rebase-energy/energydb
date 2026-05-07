@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: energydb_postgres
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: devdb
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.1
+    container_name: energydb_clickhouse
+    restart: always
+    environment:
+      TZ: UTC
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ./chdata:/var/lib/clickhouse

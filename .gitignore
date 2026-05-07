@@ -26,6 +26,7 @@ venv/
 # Docs
 docs/_build/
 docs/notebooks/
+docs/development.md
 
 # Testing
 .pytest_cache/
