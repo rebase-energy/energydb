@@ -104,8 +104,16 @@ To drop both databases (use with caution):
 declaration, and run; ``td.delete()`` removes every value in ClickHouse.
 
 
-Building Hierarchies with ``register_tree``
--------------------------------------------
+Hierarchies and Topology
+------------------------
+
+Everything below covers writing, reading, and editing the portfolio
+structure itself — nodes, edges, and series declarations. Time-series
+I/O for the values that flow through that structure is covered in the
+next section.
+
+Building with ``register_tree``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The single entry point for structure persistence — every node, edge, and
 series declaration — is :meth:`~energydb.Client.register_tree`. It is
@@ -153,7 +161,7 @@ Re-running with the same tree is a no-op — the underlying upsert
    or the scope helpers (see below).
 
 Modes
-~~~~~
+^^^^^
 
 .. list-table::
    :header-rows: 1
@@ -173,28 +181,8 @@ Modes
    client.register_tree(portfolio, mode="additive")                     # explicit
    client.register_tree(portfolio, mode="replace_subtree", allow_delete=True)
 
-Renames, moves, and property edits
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-With UUID identity, mutations resolve in one statement at the database layer:
-
-- **Rename** (same uuid, different ``name``) → silent ``UPDATE``
-- **Move** (same uuid, different ``parent_uuid``) → silent ``UPDATE``
-- **Property edit** (same uuid, different ``data``) → silent ``UPDATE``
-- **Type change** (same uuid, different ``node_type``) → rejected; element
-  type is immutable for a given id
-
-For one-off edits, address the node by path or uuid and use the imperative
-scope ops (see :ref:`imperative-ops` below):
-
-.. code-block:: python
-
-   client.get_node("my-portfolio", "Offshore-1").rename("Renamed-Site")
-   client.get_node("my-portfolio", "Offshore-1", "T01").update(data={"capacity": 4.0})
-   client.get_node("my-portfolio", "Offshore-1", "T02").delete()
-
 Dry run
-~~~~~~~
+^^^^^^^
 
 Pass ``dry_run=True`` to any :meth:`~energydb.Client.register_tree` call to
 preview the diff before applying. The call returns a
@@ -228,8 +216,104 @@ views (``node_inserts``, ``node_renames``, ``node_moves``,
      + Line 'Cable-1' <a-uuid> → <b-uuid>          [insert]
 
 
+Reconstructing trees
+~~~~~~~~~~~~~~~~~~~~
+
+Pull a node or a whole subtree back as a regular EnergyDataModel object —
+same UUIDs, ready for inspection or in-memory edits.
+
+.. code-block:: python
+
+   # Single node, eager
+   turbine = client.get_node("my-portfolio", "Offshore-1", "T01").get()
+   turbine = client.get_node(uuid=t01.id).get()
+
+   # Full subtree as an EDM tree
+   tree = client.get_tree("my-portfolio")
+   tree_with_series = client.get_tree("my-portfolio", include_series=True)
+
+With ``include_series=True``, every reconstructed node carries its registered
+series as metadata-only :class:`~timedatamodel.TimeSeries` entries (``df=None``)
+on ``timeseries``.
+
+Flat queries by type / subtree / properties:
+
+.. code-block:: python
+
+   turbines = client.query_nodes(type="WindTurbine", within="my-portfolio")
+   lines = client.query_edges(type="Line", within="my-portfolio")
+
+
+Editing single elements
+~~~~~~~~~~~~~~~~~~~~~~~
+
+With UUID identity, mutations resolve in one statement at the database layer:
+
+- **Rename** (same uuid, different ``name``) → silent ``UPDATE``
+- **Move** (same uuid, different ``parent_uuid``) → silent ``UPDATE``
+- **Property edit** (same uuid, different ``data``) → silent ``UPDATE``
+- **Type change** (same uuid, different ``node_type``) → rejected; element
+  type is immutable for a given id
+
+Address the node by path or uuid and use the fluent scope ops:
+
+.. code-block:: python
+
+   t01 = client.get_node("my-portfolio", "Offshore-1", "T01")
+   t01.rename("T01-A")
+   t01.update(data={"capacity": 4.5})
+   t01.move_to(client.get_node("my-portfolio", "Onshore-1"))
+   t01.delete()
+
+``move_to`` rejects re-parenting into self or any descendant (cycle
+detection). ``rename`` and ``update`` are idempotent and round-trip safe.
+
+The same surface exists on edges:
+
+.. code-block:: python
+
+   e = client.get_edge(uuid=line.id)
+   e.update(data={"capacity": 600})
+   e.delete()
+
+
+Declaring series
+~~~~~~~~~~~~~~~~
+
+The recommended way to register series is to declare them as metadata-only
+:class:`~timedatamodel.TimeSeries` entries on each ``Element`` and let
+``register_tree`` persist them with the rest of the structure.
+
+For surgical additions on an existing node or edge, scopes expose
+``register_series``:
+
+.. code-block:: python
+
+   client.get_node("my-portfolio", "Offshore-1", "T01").register_series(
+       name="wind_speed",
+       canonical_unit="m/s",
+       data_type="actual",
+       timeseries_type="FLAT",
+   )
+
+Or pass a metadata-only TimeSeries directly:
+
+.. code-block:: python
+
+   ts = edb.TimeSeries(
+       name="wind_speed", unit="m/s", data_type=edb.DataType.ACTUAL,
+   )
+   client.get_node(uuid=t01.id).register_series(ts)
+
+``retention``, ``canonical_unit``, and the owner columns are immutable after
+insert (enforced by a Postgres trigger). Reclassifying a series means
+registering a new one — this preserves ClickHouse-side data integrity. When
+``retention`` is omitted it is derived from ``timeseries_type``: ``FLAT``
+(actuals) → ``forever``, ``OVERLAPPING`` (forecasts) → ``medium``.
+
+
 Edges and Grid Topology
------------------------
+~~~~~~~~~~~~~~~~~~~~~~~
 
 Edges model typed cross-tree links — lines, transformers, pipes,
 interconnections. They have full CRUD, can carry their own time series, and
@@ -502,96 +586,6 @@ node manifests, ``edge_uuid`` / ``edge`` / ``edge_type`` / ``from_node`` /
 Per-window relative reads use :meth:`Client.read_relative
 <energydb.Client.read_relative>`, with the same parameters as TimeDB's
 :meth:`~timedb.TimeDBClient.read_relative`.
-
-
-Tree Reconstruction
--------------------
-
-Pull a node or a whole subtree back as a regular EnergyDataModel object —
-same UUIDs, ready for inspection or in-memory edits.
-
-.. code-block:: python
-
-   # Single node, eager
-   turbine = client.get_node("my-portfolio", "Offshore-1", "T01").get()
-   turbine = client.get_node(uuid=t01.id).get()
-
-   # Full subtree as an EDM tree
-   tree = client.get_tree("my-portfolio")
-   tree_with_series = client.get_tree("my-portfolio", include_series=True)
-
-With ``include_series=True``, every reconstructed node carries its registered
-series as metadata-only :class:`~timedatamodel.TimeSeries` entries (``df=None``)
-on ``timeseries``.
-
-Flat queries by type / subtree / properties:
-
-.. code-block:: python
-
-   turbines = client.query_nodes(type="WindTurbine", within="my-portfolio")
-   lines = client.query_edges(type="Line", within="my-portfolio")
-
-
-.. _imperative-ops:
-
-Imperative Single-Element Ops
------------------------------
-
-For surgical edits without a tree round-trip, fluent scope ops:
-
-.. code-block:: python
-
-   t01 = client.get_node("my-portfolio", "Offshore-1", "T01")
-   t01.rename("T01-A")
-   t01.update(data={"capacity": 4.5})
-   t01.move_to(client.get_node("my-portfolio", "Onshore-1"))
-   t01.delete()
-
-``move_to`` rejects re-parenting into self or any descendant (cycle
-detection). ``rename`` and ``update`` are idempotent and round-trip safe.
-
-The same surface exists on edges:
-
-.. code-block:: python
-
-   e = client.get_edge(uuid=line.id)
-   e.update(data={"capacity": 600})
-   e.delete()
-
-
-Series Registration
--------------------
-
-The recommended way to register series is to declare them as metadata-only
-:class:`~timedatamodel.TimeSeries` entries on each ``Element`` and let
-``register_tree`` persist them with the rest of the structure.
-
-For surgical additions on an existing node or edge, scopes expose
-``register_series``:
-
-.. code-block:: python
-
-   client.get_node("my-portfolio", "Offshore-1", "T01").register_series(
-       name="wind_speed",
-       canonical_unit="m/s",
-       data_type="actual",
-       timeseries_type="FLAT",
-   )
-
-Or pass a metadata-only TimeSeries directly:
-
-.. code-block:: python
-
-   ts = edb.TimeSeries(
-       name="wind_speed", unit="m/s", data_type=edb.DataType.ACTUAL,
-   )
-   client.get_node(uuid=t01.id).register_series(ts)
-
-``retention``, ``canonical_unit``, and the owner columns are immutable after
-insert (enforced by a Postgres trigger). Reclassifying a series means
-registering a new one — this preserves ClickHouse-side data integrity. When
-``retention`` is omitted it is derived from ``timeseries_type``: ``FLAT``
-(actuals) → ``forever``, ``OVERLAPPING`` (forecasts) → ``medium``.
 
 
 Run History
