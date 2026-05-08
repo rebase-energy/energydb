@@ -55,20 +55,20 @@ energydb reads ``TIMEDB_PG_DSN`` and ``TIMEDB_CH_URL`` from the environment.
 
    # Bash/Zsh
    export TIMEDB_PG_DSN='postgresql://postgres:devpassword@127.0.0.1:5433/devdb'
-   export TIMEDB_CH_URL='http://default:@localhost:8123/default'
+   export TIMEDB_CH_URL='http://default:devpassword@localhost:8123/default'
 
 .. code-block:: fish
 
    # Fish
    set -x TIMEDB_PG_DSN postgresql://postgres:devpassword@127.0.0.1:5433/devdb
-   set -x TIMEDB_CH_URL http://default:@localhost:8123/default
+   set -x TIMEDB_CH_URL http://default:devpassword@localhost:8123/default
 
 A ``.env`` file in the project root works as well:
 
 .. code-block:: text
 
    TIMEDB_PG_DSN=postgresql://postgres:devpassword@127.0.0.1:5433/devdb
-   TIMEDB_CH_URL=http://default:@localhost:8123/default
+   TIMEDB_CH_URL=http://default:devpassword@localhost:8123/default
 
 
 Verification

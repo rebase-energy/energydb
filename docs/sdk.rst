@@ -71,7 +71,7 @@ For programmatic use, instantiate the client with explicit settings:
 
    client = edb.Client(
        pg_conninfo="postgresql://user:pw@localhost:5432/energydb",
-       ch_url="http://default:@localhost:8123/default",
+       ch_url="http://default:devpassword@localhost:8123/default",
    )
 
 

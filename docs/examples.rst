@@ -18,13 +18,13 @@ Before running the examples locally, ensure you have:
 
       # Bash/Zsh
       export TIMEDB_PG_DSN='postgresql://user:password@host:port/database'
-      export TIMEDB_CH_URL='http://default:@localhost:8123/default'
+      export TIMEDB_CH_URL='http://default:devpassword@localhost:8123/default'
 
    .. code-block:: fish
 
       # Fish
       set -x TIMEDB_PG_DSN postgresql://user:password@host:port/database
-      set -x TIMEDB_CH_URL http://default:@localhost:8123/default
+      set -x TIMEDB_CH_URL http://default:devpassword@localhost:8123/default
 
 3. **Jupyter**: Install Jupyter to run the notebooks interactively:
 

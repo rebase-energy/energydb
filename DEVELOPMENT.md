@@ -93,7 +93,7 @@ Both variables are already set correctly for the local Docker setup:
 
 ```text
 TIMEDB_PG_DSN=postgresql://postgres:devpassword@127.0.0.1:5433/devdb
-TIMEDB_CH_URL=http://default:@localhost:8123/default
+TIMEDB_CH_URL=http://default:devpassword@localhost:8123/default
 ```
 
 Alternatively, export the variables directly in your shell:
@@ -101,13 +101,13 @@ Alternatively, export the variables directly in your shell:
 ```bash
 # Bash/Zsh
 export TIMEDB_PG_DSN='postgresql://postgres:devpassword@127.0.0.1:5433/devdb'
-export TIMEDB_CH_URL='http://default:@localhost:8123/default'
+export TIMEDB_CH_URL='http://default:devpassword@localhost:8123/default'
 ```
 
 ```fish
 # Fish
 set -x TIMEDB_PG_DSN postgresql://postgres:devpassword@127.0.0.1:5433/devdb
-set -x TIMEDB_CH_URL http://default:@localhost:8123/default
+set -x TIMEDB_CH_URL http://default:devpassword@localhost:8123/default
 ```
 
 ## 5) Next Steps
