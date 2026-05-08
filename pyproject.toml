@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energydb"
-version = "0.4.2"
+version = "0.4.3"
 description = "Energy database: hierarchy + series metadata on Postgres, bitemporal I/O via timedb"
 readme = "README.md"
 license = "Apache-2.0"
