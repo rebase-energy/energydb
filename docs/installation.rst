@@ -81,7 +81,7 @@ After installation, verify that the schema is created correctly:
    import energydb as edb
 
    client = edb.Client()
-   client.create()  # idempotent: creates the energydb schema + CH series_values
+   client.create()  # idempotent: creates the energydb schema + ClickHouse series_values
    print("ok")
 
 If both databases are reachable, ``client.create()`` returns silently and the

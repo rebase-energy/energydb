@@ -5,19 +5,31 @@ Welcome to EnergyDB
 
 **EnergyDB** is an open-source library for persisting full energy portfolios — assets, grid topology, and bitemporal time series — in one connected database backed by PostgreSQL and ClickHouse.
 
-It extends `TimeDB <https://github.com/rebase-energy/timedb>`_ with persistent storage for `EnergyDataModel <https://github.com/rebase-energy/EnergyDataModel>`_ hierarchies, links every node and edge to its time series with stable UUID identity, and lets you round-trip a portfolio between Python and Postgres without losing any structural state.
+
+What is EnergyDB?
+-----------------
+
+EnergyDB is a database for energy portfolios. It stores three things together in one connected system:
+
+- 🌳 **An asset hierarchy** — your fleet modeled as a tree (Portfolio → Site → WindTurbine, Battery, …) of arbitrary depth.
+- 🔗 **Grid topology** — typed edges (lines, transformers, pipes, interconnections) connecting any two assets, including across portfolios.
+- ⏱️ **Bitemporal time series** — actuals and versioned forecasts attached to any node or edge, queryable as-of any point in time. (A separate ``change_time`` audit field tracks corrections without polluting the bitemporal model.)
+
+Structure lives in PostgreSQL, values live in ClickHouse, and stable UUID identity lets Python objects round-trip to the database without losing any structural state.
+
+It extends `TimeDB <https://github.com/rebase-energy/timedb>`_ with persistent storage for `EnergyDataModel <https://github.com/rebase-energy/EnergyDataModel>`_ hierarchies.
 
 
 Why EnergyDB?
 -------------
 
-Most time-series systems are agnostic about what their series represent — they treat data as an opaque ``(series_id, timestamp, value)`` triple. EnergyDB knows it is a portfolio: assets, sites, and grid topology, with the bitemporal series that describe them living alongside.
+Most time-series systems are agnostic about what their series represent — they treat data as opaque ``(series_id, timestamp, value)`` triples. EnergyDB knows it is a portfolio, and links every series back to the asset or grid edge it describes.
 
-- 🌳 **Asset hierarchies**: declare your portfolio in Python (Portfolio → Site → asset) and persist arbitrary depth in one call
-- 🔗 **Grid topology**: typed edges (Line, Link, Pipe) connect any two nodes and can carry their own time series
-- 🔁 **Round-trip persistence**: every ``Element`` keeps its UUID7 from in-memory object to row PK — renames, moves, and property edits become silent ``UPDATE``\ s
-- ⏱️ **Bitemporal series**: forecast revisions, corrections, and time-of-knowledge queries powered by TimeDB
-- 🧭 **Fluent, lazy navigation**: ``client.get_node("Portfolio", "Site", "T01").read(...)`` resolves to one indexed CTE
+- 🔁 **Round-trip persistence**: every ``Element`` keeps its UUID7 from in-memory object to row primary key — renames, moves, and property edits become silent ``UPDATE``\ s, never delete-then-insert.
+- 📋 **Diffable structural changes**: ``dry_run=True`` previews every insert, rename, move, and delete before you apply — no surprise data loss on ``replace_subtree``.
+- ⏱️ **Bitemporal queries**: forecast revisions, corrections, and time-of-knowledge backtests, powered by TimeDB.
+- 🧭 **Lazy fluent navigation**: ``client.get_node("Portfolio", "Site", "T01").read(...)`` resolves to one indexed SQL query, regardless of subtree size.
+- ⚖️ **Unit conversion at the boundary**: declare canonical units once; pint rescales every read and write automatically.
 
 
 Quick Start
@@ -35,7 +47,7 @@ Quick Start
    import pandas as pd
 
    client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
-   client.create()        # PG schema + CH series_values table
+   client.create()        # PostgreSQL schema + ClickHouse series_values table
 
    # 1. Declare a turbine with the series it will hold (metadata only).
    t01 = edb.wind.WindTurbine(

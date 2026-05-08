@@ -27,7 +27,7 @@ Fluent Scopes
 ``client.get_node(...)`` and ``client.get_edge(...)`` return lazy scopes.
 Path / filter accumulation does not hit the database; terminal operations
 (``.read()``, ``.write()``, ``.get()``, ``.children()``, ``.rename()``,
-``.delete()``, ``.register_series()``, …) resolve in one indexed CTE.
+``.delete()``, ``.register_series()``, …) resolve in one indexed SQL query.
 
 .. autoclass:: energydb.NodeScope
    :members:

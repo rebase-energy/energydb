@@ -10,33 +10,31 @@
 
 <br/>
 
-**EnergyDB** extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies — portfolios, sites, and assets — links them to bitemporal time series with full auditability, and models grid topology via typed edges. Round-trip a portfolio between Python and Postgres without losing identity: every `Element` keeps its UUID end-to-end.
+## 🏗️ What is EnergyDB?
 
-Most time-series systems are agnostic about what their series represent. EnergyDB knows it is a portfolio: assets, sites, and grid topology, with the bitemporal series that describe them living alongside.
-
----
-
-## 🏗️ The Connected Portfolio Model
-
-EnergyDB stores three kinds of objects in one connected database:
+EnergyDB is a database for energy portfolios. It stores three things together in one connected system:
 
 | Layer | Description | Real-World Example |
 | :---- | :--- | :--- |
-| 🌳&nbsp;**Hierarchy** | Arbitrary-depth tree of portfolios, sites, and assets | *"Offshore-1 → WindTurbine T01 → power"* |
-| 🔗&nbsp;**Topology** | Typed edges (Line, Link, Pipe) connect any two nodes | *"Cable-1: BusA → BusB"* |
-| ⏱️&nbsp;**Bitemporal series** | Forecast revisions and audit trails — owned by a node *or* edge | *"power_flow on Cable-1, valid Wed 12:00, known Mon 18:00"* |
+| 🌳&nbsp;**Asset hierarchy** | Arbitrary-depth tree of portfolios, sites, and assets | *"Offshore-1 → WindTurbine T01 → power"* |
+| 🔗&nbsp;**Grid topology** | Typed edges (lines, transformers, pipes, interconnections) connecting any two assets | *"Cable-1: BusA → BusB"* |
+| ⏱️&nbsp;**Bitemporal time series** | Actuals and versioned forecasts attached to any node or edge, queryable as-of any point in time | *"power_flow on Cable-1, valid Wed 12:00, known Mon 18:00"* |
 
-> **Identity & Round-Trip:** Every `Element` carries a UUID7. Read → modify → write back works in place — renames, moves, and property edits become silent `UPDATE`s.
+Structure lives in PostgreSQL, values live in ClickHouse, and stable UUID identity lets Python objects round-trip to the database without losing any structural state. (A separate `change_time` audit field tracks corrections without polluting the bitemporal model.)
+
+EnergyDB extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies.
 
 ---
 
-## ✨ Why Choose EnergyDB?
+## ✨ Why EnergyDB?
 
-- 🌳 **Asset hierarchies:** Declare your portfolio in Python (EnergyDataModel) and persist arbitrary depth in one call.
-- 🔗 **Grid topology:** Typed edges for lines, links, pipes — with their own time series and endpoint navigation.
-- 🔁 **Round-trip persistence:** UUID identity from in-memory `Element` to Postgres row PK; no delete-then-insert dance.
-- ⏱️ **Bitemporal series:** Forecast revisions, corrections, and time-of-knowledge queries powered by [TimeDB](https://github.com/rebase-energy/timedb).
-- 🧭 **Fluent, lazy navigation:** `client.get_node("Portfolio", "Site", "T01").read(...)` resolves to one indexed CTE.
+Most time-series systems are agnostic about what their series represent — they treat data as opaque `(series_id, timestamp, value)` triples. EnergyDB knows it is a portfolio, and links every series back to the asset or grid edge it describes.
+
+- 🔁 **Round-trip persistence:** Every `Element` keeps its UUID7 from in-memory object to row primary key — renames, moves, and property edits become silent `UPDATE`s, never delete-then-insert.
+- 📋 **Diffable structural changes:** `dry_run=True` previews every insert, rename, move, and delete before you apply — no surprise data loss on `replace_subtree`.
+- ⏱️ **Bitemporal queries:** Forecast revisions, corrections, and time-of-knowledge backtests, powered by [TimeDB](https://github.com/rebase-energy/timedb).
+- 🧭 **Lazy fluent navigation:** `client.get_node("Portfolio", "Site", "T01").read(...)` resolves to one indexed SQL query, regardless of subtree size.
+- ⚖️ **Unit conversion at the boundary:** Declare canonical units once; pint rescales every read and write automatically.
 
 ---
 
@@ -59,7 +57,7 @@ import energydb as edb
 import pandas as pd
 
 client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
-client.create()        # PG schema + CH series_values table
+client.create()        # PostgreSQL schema + ClickHouse series_values table
 
 # 1. Declare a turbine and the series it will hold (metadata only).
 t01 = edb.wind.WindTurbine(

@@ -184,32 +184,36 @@ With UUID identity, mutations resolve in one statement at the database layer:
 - **Type change** (same uuid, different ``node_type``) → rejected; element
   type is immutable for a given id
 
-The recommended round-trip is read → modify → write back:
+For one-off edits, address the node by path or uuid and use the imperative
+scope ops (see :ref:`imperative-ops` below):
 
 .. code-block:: python
 
-   tree = client.get_tree("my-portfolio")          # uuids populated from PG
-   tree.members[0].name = "Renamed-Site"           # silent rename
-   tree.members[0].members[0].capacity = 4.0       # silent property edit
-   del tree.members[0].members[1]                  # remove a turbine
-
-   # Preview before applying.
-   diff = client.register_tree(
-       tree, mode="replace_subtree", allow_delete=True, dry_run=True,
-   )
-   diff.print()
-
-   # Apply.
-   client.register_tree(tree, mode="replace_subtree", allow_delete=True)
+   client.get_node("my-portfolio", "Offshore-1").rename("Renamed-Site")
+   client.get_node("my-portfolio", "Offshore-1", "T01").update(data={"capacity": 4.0})
+   client.get_node("my-portfolio", "Offshore-1", "T02").delete()
 
 Dry run
 ~~~~~~~
 
-``dry_run=True`` returns a :class:`~energydb.TreeDiff` and rolls back —
-no DB state changes. The diff carries flat ``node_changes`` /
-``edge_changes`` lists and binned views (``node_inserts``, ``node_renames``,
-``node_moves``, ``node_data_edits``, ``node_deletes``, ``edge_inserts`` /
-``edge_updates`` / ``edge_deletes``).
+Pass ``dry_run=True`` to any :meth:`~energydb.Client.register_tree` call to
+preview the diff before applying. The call returns a
+:class:`~energydb.TreeDiff` and rolls back — no DB state changes.
+
+.. code-block:: python
+
+   diff = client.register_tree(
+       portfolio, mode="replace_subtree", allow_delete=True, dry_run=True,
+   )
+   diff.print()
+
+   # Looks good — apply.
+   client.register_tree(portfolio, mode="replace_subtree", allow_delete=True)
+
+The diff carries flat ``node_changes`` / ``edge_changes`` lists and binned
+views (``node_inserts``, ``node_renames``, ``node_moves``,
+``node_data_edits``, ``node_deletes``, ``edge_inserts`` / ``edge_updates``
+/ ``edge_deletes``).
 
 ``TreeDiff.print()`` renders a tree-shaped textual preview::
 
@@ -528,6 +532,8 @@ Flat queries by type / subtree / properties:
    lines = client.query_edges(type="Line", within="my-portfolio")
 
 
+.. _imperative-ops:
+
 Imperative Single-Element Ops
 -----------------------------
 
@@ -583,7 +589,7 @@ Or pass a metadata-only TimeSeries directly:
 
 ``retention``, ``canonical_unit``, and the owner columns are immutable after
 insert (enforced by a Postgres trigger). Reclassifying a series means
-registering a new one — this preserves CH-side data integrity. When
+registering a new one — this preserves ClickHouse-side data integrity. When
 ``retention`` is omitted it is derived from ``timeseries_type``: ``FLAT``
 (actuals) → ``forever``, ``OVERLAPPING`` (forecasts) → ``medium``.
 
@@ -664,9 +670,9 @@ Best Practices
    ``register_tree`` registers them in the same transaction. Use
    ``scope.register_series`` only for surgical additions.
 
-3. **Round-trip through ``get_tree`` → modify → ``register_tree``.** UUIDs
-   make renames, moves, and property edits silent ``UPDATE``\ s — no
-   delete-then-insert dance.
+3. **Use the imperative scope ops for one-off edits.** UUID identity makes
+   ``rename``, ``update``, ``move_to``, and ``delete`` silent ``UPDATE``\ s —
+   no delete-then-insert dance, no full tree round-trip.
 
 4. **Use ``dry_run=True`` before destructive ``replace_subtree``.** Inspect
    the :class:`~energydb.TreeDiff` (or call ``.print()``) and confirm before
@@ -751,17 +757,12 @@ A complete workflow from setup to analysis:
    )
    print(result.head())
 
-   # 6. Round-trip — modify and write back.
-   tree = client.get_tree("my-portfolio")
-   tree.members[0].name = "Offshore-Renamed"          # rename
-   tree.members[0].members[0].capacity = 4.0          # property edit
-   del tree.members[0].members[1]                     # remove T02
-
-   diff = client.register_tree(
-       tree, mode="replace_subtree", allow_delete=True, dry_run=True,
+   # 6. Surgical edits — rename a site, update a turbine, remove another.
+   client.get_node("my-portfolio", "Offshore-1").rename("Offshore-Renamed")
+   client.get_node("my-portfolio", "Offshore-Renamed", "T01").update(
+       data={"capacity": 4.0},
    )
-   diff.print()
-   client.register_tree(tree, mode="replace_subtree", allow_delete=True)
+   client.get_node("my-portfolio", "Offshore-Renamed", "T02").delete()
 
    # 7. Cleanup.
    client.delete()
