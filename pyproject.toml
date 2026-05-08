@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energydb"
-version = "0.4.0"
+version = "0.4.1"
 description = "Energy database: hierarchy + series metadata on Postgres, bitemporal I/O via timedb"
 readme = "README.md"
 requires-python = ">=3.12"
