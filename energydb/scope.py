@@ -29,7 +29,7 @@ from timedatamodel import TimeSeries, TimeSeriesType
 
 from energydb import series as series_mod
 from energydb._frames import OutputType, to_output, to_polars
-from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids
+from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
     Path,
@@ -431,6 +431,39 @@ class NodeScope:
                 return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
             conn.commit()
         return None
+
+    def add(self, edm_obj, *, dry_run: bool = False) -> NodeScope | TreeDiff:
+        """Add a new child node (or subtree) under this scope.
+
+        Sugar for ``register_tree(edm_obj, under=<this scope>)``. Returns a
+        :class:`NodeScope` pointing at the added root, or a :class:`TreeDiff`
+        when ``dry_run=True``. Inherits create-only semantics from
+        :meth:`Client.register_tree`: raises if any UUID in the payload
+        already exists.
+
+        Inside ``client.transaction()`` the insert participates in the
+        transaction and shows up in ``txn.preview()``; ``dry_run=True`` is
+        not supported inside a transaction.
+        """
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
+            parent_uuid = self._resolve_node_uuid(conn)
+            root_uuid, diff = register_tree_under(
+                conn,
+                edm_obj,
+                parent_uuid=parent_uuid,
+                dry_run=dry_run,
+            )
+            if self._txn is not None:
+                self._txn._node_changes.extend(diff.node_changes)
+                self._txn._edge_changes.extend(diff.edge_changes)
+                return NodeScope(self._client, node_uuid=root_uuid, txn=self._txn)
+            if dry_run:
+                conn.rollback()
+                return diff
+            conn.commit()
+        return NodeScope(self._client, node_uuid=root_uuid)
 
     # ------------------------------------------------------------------
     # Series registration
