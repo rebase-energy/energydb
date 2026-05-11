@@ -102,7 +102,7 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
     where the caller has already verified endpoint existence.
 
     Identity is ``edm_obj.id``. ``ON CONFLICT (uuid)`` updates the row's
-    payload, label, endpoints, and edge_type (the latter only on insert —
+    payload, name, endpoints, and edge_type (the latter only on insert —
     PG wouldn't actually let you change it via the unique key, but we let
     the same-uuid update through cleanly).
     """
@@ -114,10 +114,10 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
 
     row = conn.execute(
         """
-        INSERT INTO energydb.edge (uuid, edge_type, label, from_node_uuid, to_node_uuid, data)
+        INSERT INTO energydb.edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (uuid) DO UPDATE
-          SET label          = EXCLUDED.label,
+          SET name           = EXCLUDED.name,
               from_node_uuid = EXCLUDED.from_node_uuid,
               to_node_uuid   = EXCLUDED.to_node_uuid,
               data           = EXCLUDED.data,
@@ -125,7 +125,7 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
           WHERE energydb.edge.edge_type = EXCLUDED.edge_type
         RETURNING uuid
         """,
-        (uuid_val, row_data["edge_type"], row_data["label"], from_uuid, to_uuid, row_data["data"]),
+        (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
     ).fetchone()
 
     if row is None:
@@ -183,25 +183,18 @@ def register_tree_under(
     edm_obj,
     *,
     parent_uuid: UUID | None,
-    mode: str = "additive",
-    allow_delete: bool = False,
     dry_run: bool = False,
 ) -> tuple[UUID, TreeDiff]:
-    """Walk the EDM tree DFS, upsert nodes/edges, register series.
+    """Walk the EDM tree DFS, insert nodes/edges, register series.
 
     Structure-only. Caller manages the transaction. Raises if any
     ``TimeSeries`` on the tree has a non-empty df attached — write data
     separately via ``client.write(df, ...)``.
 
-    Modes:
-
-    * ``"additive"`` (default): upsert every node/edge in the target tree.
-      Existing rows that are *not* in the target tree are left alone — no
-      deletions, no warnings.
-    * ``"replace_subtree"``: under the subtree rooted at ``edm_obj``,
-      every persisted row not present in the target tree is a candidate
-      for deletion. Pass ``allow_delete=True`` to apply the deletes;
-      otherwise raises if any orphans are detected.
+    Creates only. Raises :class:`ValueError` if any node or edge UUID in
+    the payload already exists in the DB. To modify existing rows, use the
+    scope mutators (:meth:`NodeScope.rename`, ``.update``, ``.delete``,
+    ``.move_to``) or batch them with :meth:`Client.transaction`.
 
     ``dry_run=True`` returns the computed :class:`TreeDiff` without
     writing anything. The transaction is left open; callers should roll
@@ -211,46 +204,35 @@ def register_tree_under(
     (empty in trivial / no-op cases).
     """
     _validate_no_inline_data(edm_obj)
-    _validate_mode(mode)
 
     target_nodes, target_edges, root_uuid = _collect_target_state(edm_obj, parent_uuid)
-    if mode == "replace_subtree":
-        current_nodes, current_edges = _fetch_subtree_state(conn, root_uuid)
-    else:
-        # additive: only fetch the rows whose uuids overlap target — needed
-        # to compute updates accurately. Anything else stays untouched.
-        current_nodes = _fetch_nodes_by_uuids(conn, list(target_nodes.keys()))
-        current_edges = _fetch_edges_by_uuids(conn, list(target_edges.keys()))
+    current_nodes = _fetch_nodes_by_uuids(conn, list(target_nodes.keys()))
+    current_edges = _fetch_edges_by_uuids(conn, list(target_edges.keys()))
 
-    diff = _compute_diff(target_nodes, current_nodes, target_edges, current_edges, mode=mode)
-
-    _validate_no_type_changes(diff)
-    if mode == "replace_subtree" and (diff.node_deletes or diff.edge_deletes) and not allow_delete:
-        names = ", ".join(f"{c.display_type}({c.display_name!r})" for c in diff.node_deletes)
+    if current_nodes or current_edges:
+        existing_nodes = ", ".join(f"{s.node_type}({s.name!r})" for s in current_nodes.values())
+        existing_edges = ", ".join(f"{s.edge_type}({s.name!r})" for s in current_edges.values())
+        parts = []
+        if existing_nodes:
+            parts.append(f"node(s): {existing_nodes}")
+        if existing_edges:
+            parts.append(f"edge(s): {existing_edges}")
         raise ValueError(
-            f"replace_subtree would delete {len(diff.node_deletes)} node(s) and "
-            f"{len(diff.edge_deletes)} edge(s); pass allow_delete=True to confirm. "
-            f"Affected nodes: {names}"
+            f"register_tree is create-only; the payload contains {len(current_nodes)} "
+            f"node(s) and {len(current_edges)} edge(s) whose UUIDs already exist "
+            f"({'; '.join(parts)}). To modify existing rows use scope mutators "
+            f"(client.get_node(...).rename(), .update(), .delete(), .move_to()) "
+            f"or batch them with client.transaction()."
         )
+
+    diff = _compute_diff(target_nodes, current_nodes, target_edges, current_edges)
+    _validate_no_type_changes(diff)
 
     if dry_run:
         return root_uuid, diff
 
     _apply_diff(conn, edm_obj, diff, target_nodes, target_edges)
     return root_uuid, diff
-
-
-# ---------------------------------------------------------------------------
-# Mode validation
-# ---------------------------------------------------------------------------
-
-
-_VALID_MODES = ("additive", "replace_subtree")
-
-
-def _validate_mode(mode: str) -> None:
-    if mode not in _VALID_MODES:
-        raise ValueError(f"Unknown register_tree mode {mode!r}. Valid: {_VALID_MODES}")
 
 
 def _validate_no_type_changes(diff: TreeDiff) -> None:
@@ -325,7 +307,7 @@ def _collect_target_state(
                 edges[child.id] = EdgeSnapshot(
                     uuid=child.id,
                     edge_type=row["edge_type"],
-                    label=row["label"],
+                    name=row["name"],
                     from_node_uuid=from_uuid,
                     to_node_uuid=to_uuid,
                     data=row["data"].obj,
@@ -371,7 +353,7 @@ def _fetch_subtree_state(
         return nodes, {}
 
     edge_rows = conn.execute(
-        "SELECT uuid, edge_type, label, from_node_uuid, to_node_uuid, data "
+        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data "
         "FROM energydb.edge "
         "WHERE from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s)",
         (list(nodes.keys()), list(nodes.keys())),
@@ -380,7 +362,7 @@ def _fetch_subtree_state(
         r[0]: EdgeSnapshot(
             uuid=r[0],
             edge_type=r[1],
-            label=r[2],
+            name=r[2],
             from_node_uuid=r[3],
             to_node_uuid=r[4],
             data=dict(r[5] or {}),
@@ -406,14 +388,14 @@ def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
     if not uuids:
         return {}
     rows = conn.execute(
-        "SELECT uuid, edge_type, label, from_node_uuid, to_node_uuid, data FROM energydb.edge WHERE uuid = ANY(%s)",
+        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM energydb.edge WHERE uuid = ANY(%s)",
         (uuids,),
     ).fetchall()
     return {
         r[0]: EdgeSnapshot(
             uuid=r[0],
             edge_type=r[1],
-            label=r[2],
+            name=r[2],
             from_node_uuid=r[3],
             to_node_uuid=r[4],
             data=dict(r[5] or {}),
@@ -432,8 +414,6 @@ def _compute_diff(
     current_nodes: dict[UUID, NodeSnapshot],
     target_edges: dict[UUID, EdgeSnapshot],
     current_edges: dict[UUID, EdgeSnapshot],
-    *,
-    mode: str,
 ) -> TreeDiff:
     diff = TreeDiff()
 
@@ -452,9 +432,6 @@ def _compute_diff(
             new.node_type,
         ):
             diff.node_changes.append(NodeChange(old=old, new=new))
-    if mode == "replace_subtree":
-        for uuid_val in current_keys - target_keys:
-            diff.node_changes.append(NodeChange(old=current_nodes[uuid_val], new=None))
 
     target_edge_keys = set(target_edges.keys())
     current_edge_keys = set(current_edges.keys())
@@ -465,22 +442,19 @@ def _compute_diff(
         old_e = current_edges[uuid_val]
         new_e = target_edges[uuid_val]
         if (
-            old_e.label,
+            old_e.name,
             old_e.from_node_uuid,
             old_e.to_node_uuid,
             old_e.data,
             old_e.edge_type,
         ) != (
-            new_e.label,
+            new_e.name,
             new_e.from_node_uuid,
             new_e.to_node_uuid,
             new_e.data,
             new_e.edge_type,
         ):
             diff.edge_changes.append(EdgeChange(old=old_e, new=new_e))
-    if mode == "replace_subtree":
-        for uuid_val in current_edge_keys - target_edge_keys:
-            diff.edge_changes.append(EdgeChange(old=current_edges[uuid_val], new=None))
 
     return diff
 
@@ -497,24 +471,14 @@ def _apply_diff(
     target_nodes: dict[UUID, NodeSnapshot],
     target_edges: dict[UUID, EdgeSnapshot],
 ) -> None:
-    """Apply the diff to the database. Order:
+    """Apply the diff to the database (create-only).
 
-    1. Delete edges that are going away (so node deletes don't fail their FKs
-       — though CASCADE would handle it, this is cleaner).
-    2. Insert/update nodes (in DFS order so parent_uuid FKs always resolve).
-    3. Insert/update edges (endpoints now exist).
-    4. Delete orphaned nodes (CASCADE handles their descendants and any
-       remaining edges attached to them).
+    1. Insert nodes (in DFS order so parent_uuid FKs always resolve).
+    2. Insert edges (endpoints now exist).
 
     Series declarations are registered alongside their owners during the
-    insert/update walk via :func:`create_node` / :func:`create_edge`, which
-    we re-use for per-row UPSERTs.
+    insert walk via :func:`create_node` / :func:`create_edge`.
     """
-    # 1. Edge deletes first.
-    for change in diff.edge_deletes:
-        conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (change.uuid,))
-
-    # 2. Nodes — insert + update in DFS order so parent FKs resolve.
     walked: set[UUID] = set()
     edm_objects_by_uuid = _index_edm_objects(edm_obj)
 
@@ -529,18 +493,11 @@ def _apply_diff(
 
     _walk_and_apply_nodes(edm_obj)
 
-    # 3. Edges — insert/update in any order, endpoints exist now.
     for change in diff.edge_changes:
-        if change.kind == "delete":
-            continue
         edge_obj = edm_objects_by_uuid.get(change.uuid)
         if edge_obj is None:
             raise RuntimeError(f"Edge {change.uuid} in diff has no corresponding EDM object.")
         create_edge(conn, edge_obj, tree_root=edm_obj)
-
-    # 4. Node deletes — CASCADE removes descendants and attached series.
-    for change in diff.node_deletes:
-        conn.execute("DELETE FROM energydb.node WHERE uuid = %s", (change.uuid,))
 
 
 def _index_edm_objects(edm_obj) -> dict[UUID, Any]:

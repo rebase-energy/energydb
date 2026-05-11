@@ -43,7 +43,7 @@ class TestEdgeModel:
         assert col_names == {
             "uuid",
             "edge_type",
-            "label",
+            "name",
             "from_node_uuid",
             "to_node_uuid",
             "data",

@@ -2,7 +2,7 @@
 
 After the UUID identity rewrite, every node row carries
 ``{"uuid", "node_type", "name", "data"}`` and every edge row carries
-``{"uuid", "edge_type", "label", "data", "from_node_uuid", "to_node_uuid"}``.
+``{"uuid", "edge_type", "name", "data", "from_node_uuid", "to_node_uuid"}``.
 Reconstruction populates ``Element.id`` from the row's uuid, and edge
 endpoints come back as :class:`Reference` objects holding the endpoint
 uuids directly — no path round-trip.
@@ -39,7 +39,7 @@ def _edge_row(serialized: dict, *, from_uuid, to_uuid) -> dict:
     return {
         "uuid": serialized["uuid"],
         "edge_type": serialized["edge_type"],
-        "label": serialized["label"],
+        "name": serialized["name"],
         "data": serialized["data"].obj,
         "from_node_uuid": from_uuid,
         "to_node_uuid": to_uuid,
@@ -234,7 +234,7 @@ class TestSerializeEdge:
         row = serialize_edge(line)
         assert row["uuid"] == line.id
         assert row["edge_type"] == "Line"
-        assert row["label"] == "L1"
+        assert row["name"] == "L1"
         data = row["data"].obj
         assert data["capacity"] == 500
         assert data["directed"] is True
@@ -302,7 +302,7 @@ class TestReconstructEdge:
         row = {
             "uuid": uuid4(),
             "edge_type": "UnknownEdge",
-            "label": "X",
+            "name": "X",
             "data": {},
             "from_node_uuid": uuid4(),
             "to_node_uuid": uuid4(),
@@ -316,7 +316,7 @@ class TestReconstructEdge:
         row = {
             "uuid": uuid4(),
             "edge_type": "WindTurbine",
-            "label": "T1",
+            "name": "T1",
             "data": {},
             "from_node_uuid": uuid4(),
             "to_node_uuid": uuid4(),

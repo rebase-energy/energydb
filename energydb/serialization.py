@@ -2,7 +2,7 @@
 
 Thin layer over EDM's JSON round-trip system (``energydatamodel.json_io``).
 Each EDM element maps to a single DB row with structural columns
-(``uuid``, ``node_type`` / ``edge_type``, ``name`` / ``label``, FK uuids)
+(``uuid``, ``node_type`` / ``edge_type``, ``name``, FK uuids)
 plus a single ``data`` JSONB column carrying every remaining field —
 geometry (GeoJSON), tz (ZoneInfo), commissioning_date (ISO), sensor
 height, and all domain properties.
@@ -89,19 +89,18 @@ def reconstruct_node(row: dict[str, Any]):
 def serialize_edge(edm_obj) -> dict[str, Any]:
     """Convert an EDM Edge to a dict suitable for database insertion.
 
-    The EDM-side ``name`` field maps to the DB column ``label`` — the edge
-    name is a human label, not an identifier (the triple
+    The edge name is a human label, not an identifier (the triple
     ``(edge_type, from_node_uuid, to_node_uuid)`` is the upsert key).
     ``from_element`` / ``to_element`` are excluded from ``data`` — they're
     stored as ``from_node_uuid`` / ``to_node_uuid`` FK columns.
     """
     storage = edm.element_to_storage_dict(edm_obj, extra_excludes=_EDGE_EXCLUDES)
     edge_type = storage.pop("__type__")
-    label = storage.pop("name", None)
+    name = storage.pop("name", None)
     return {
         "uuid": edm_obj.id,
         "edge_type": edge_type,
-        "label": label,
+        "name": name,
         "data": Jsonb(storage),
     }
 
@@ -109,7 +108,7 @@ def serialize_edge(edm_obj) -> dict[str, Any]:
 def reconstruct_edge(row: dict[str, Any]):
     """Reconstruct an EDM Edge from a database row dict.
 
-    Expects ``row`` to have ``uuid``, ``edge_type``, ``label``, ``data``,
+    Expects ``row`` to have ``uuid``, ``edge_type``, ``name``, ``data``,
     ``from_node_uuid``, ``to_node_uuid``. Endpoints are returned as
     :class:`Reference` objects holding the endpoint uuids — no path round-
     trip needed.
@@ -123,8 +122,8 @@ def reconstruct_edge(row: dict[str, Any]):
 
     data = dict(row.get("data") or {})
     data["__type__"] = edge_type
-    if row.get("label"):
-        data["name"] = row["label"]
+    if row.get("name"):
+        data["name"] = row["name"]
     uuid_val = row["uuid"]
     data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
 

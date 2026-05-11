@@ -450,7 +450,7 @@ polars. Columns include the standard timedb output (``series_id``,
 ``path`` (List[str]), ``node`` (display name), ``node_type``, ``node_uuid``,
 ``data_type``, ``name``.
 
-For edge reads, the hierarchy columns are: ``edge_uuid``, ``edge`` (label),
+For edge reads, the hierarchy columns are: ``edge_uuid``, ``edge`` (name),
 ``edge_type``, ``from_node`` (path), ``to_node`` (path).
 
 Time-range filters mirror TimeDB:

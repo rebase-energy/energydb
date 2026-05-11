@@ -60,7 +60,7 @@ class Edge(Base):
 
     uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
     edge_type = sa.Column(sa.Text, nullable=False)
-    label = sa.Column(sa.Text, nullable=True)
+    name = sa.Column(sa.Text, nullable=True)
     from_node_uuid = sa.Column(
         UUID(as_uuid=True),
         sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),

@@ -59,7 +59,7 @@ def join_hierarchy(conn, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFra
 def join_edge_hierarchy(conn, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
     """Attach edge + endpoint info to a timedb read result.
 
-    Endpoint paths are ``List(Utf8)``; the edge label is exposed as ``edge``.
+    Endpoint paths are ``List(Utf8)``; the edge name is exposed as ``edge``.
     """
     if result.is_empty() or meta.is_empty():
         return result
@@ -70,7 +70,7 @@ def join_edge_hierarchy(conn, result: pl.DataFrame, meta: pl.DataFrame) -> pl.Da
     edge_uuids = [UUID(u) for u in edge_uuid_strs]
 
     rows = conn.execute(
-        "SELECT uuid, label, edge_type, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = ANY(%s)",
+        "SELECT uuid, name, edge_type, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = ANY(%s)",
         (edge_uuids,),
     ).fetchall()
     node_uuids = list({r[3] for r in rows} | {r[4] for r in rows})

@@ -1,20 +1,15 @@
-"""TreeDiff — compute and represent the difference between an EDM tree and
-the persisted subtree it would replace.
+"""TreeDiff — compute and represent the difference produced by a mutation.
 
-Used by :func:`energydb._persist.register_tree_under` in
-``mode="replace_subtree"`` to:
+Categorizes node/edge changes into insert / update / delete buckets, keyed
+by UUID, and renders a tree-shaped preview. Returned by
+:meth:`Client.register_tree` (``dry_run=True``), by each scope mutator
+when called with ``dry_run=True``, and by :meth:`Transaction.preview`.
 
-1. Categorize every node/edge in the *target* (in-memory tree) and the
-   *current* (DB rows under the subtree root) into insert / update /
-   delete buckets, keyed by UUID.
-2. Provide ``allow_delete=True`` confirmation gating on destructive ops.
-3. Render a tree-shaped preview when ``dry_run=True``.
-
-The key insight is that with UUID identity, a rename (name changed) and a
-move (parent_uuid changed) are *not* delete-then-insert — the row keeps
-its uuid and just has its column updated. The diff structure exposes
-"renamed" and "moved" booleans on each update so the user-facing print
-can label changes accurately.
+With UUID identity, a rename (name changed) and a move (parent_uuid
+changed) are *not* delete-then-insert — the row keeps its uuid and just
+has its column updated. The diff structure exposes "renamed" and "moved"
+booleans on each update so the user-facing print can label changes
+accurately.
 """
 
 from __future__ import annotations
@@ -46,7 +41,7 @@ class EdgeSnapshot:
 
     uuid: UUID
     edge_type: str
-    label: str | None
+    name: str | None
     from_node_uuid: UUID
     to_node_uuid: UUID
     data: dict[str, Any]
@@ -135,8 +130,8 @@ class EdgeChange:
     @property
     def display_name(self) -> str:
         if self.new is not None:
-            return self.new.label or self.new.edge_type
-        return self.old.label or self.old.edge_type  # type: ignore[union-attr]
+            return self.new.name or self.new.edge_type
+        return self.old.name or self.old.edge_type  # type: ignore[union-attr]
 
     @property
     def display_type(self) -> str:

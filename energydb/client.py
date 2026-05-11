@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from energydb._transaction import Transaction
 
 import pandas as pd
 import polars as pl
@@ -162,6 +165,28 @@ class Client:
         )
 
     # ------------------------------------------------------------------
+    # Transactions
+    # ------------------------------------------------------------------
+
+    def transaction(self) -> Transaction:
+        """Open an atomic batch of scope mutations.
+
+        Returns a :class:`Transaction` context manager. Mutations executed
+        through ``txn.get_node(...)`` / ``txn.get_edge(...)`` /
+        ``txn.register_tree(...)`` apply immediately to the open
+        transaction's connection but are not committed until
+        :meth:`Transaction.commit` is called explicitly. Exit without
+        commit raises and rolls back.
+
+        Time-series I/O (``scope.write(df, ...)`` / ``scope.read(...)``)
+        inside a transaction does **not** participate in atomicity — it
+        executes immediately against the pool / ClickHouse.
+        """
+        from energydb._transaction import Transaction
+
+        return Transaction(self)
+
+    # ------------------------------------------------------------------
     # Structure — register_tree, edges, queries
     # ------------------------------------------------------------------
 
@@ -170,28 +195,17 @@ class Client:
         edm_obj,
         *,
         under: Path | list[str] | None = None,
-        mode: str = "additive",
-        allow_delete: bool = False,
         dry_run: bool = False,
     ) -> UUID | TreeDiff:
         """Persist an EDM tree's structure: nodes, edges, series declarations.
 
-        Idempotent. With UUID identity, renames/moves/property edits on the
-        same EDM ``id`` upsert in place — no need to delete-then-insert.
-
-        Modes:
-
-        * ``mode="additive"`` (default) — upsert every node/edge in the
-          target tree. Existing rows under the subtree that are *not* in
-          the target tree are left untouched.
-        * ``mode="replace_subtree"`` — under the subtree rooted at
-          ``edm_obj``, every persisted row not present in the target tree
-          is a candidate for deletion. Pass ``allow_delete=True`` to apply
-          the deletes; otherwise raises if any orphans are detected.
+        Create-only. Raises :class:`ValueError` if any UUID in the payload
+        already exists in the DB; modify existing rows via scope mutators
+        (:meth:`NodeScope.rename`, ``.update``, ``.delete``, ``.move_to``)
+        or batch them with :meth:`transaction`.
 
         ``dry_run=True`` returns the computed :class:`TreeDiff` without
-        committing anything. The transaction is rolled back so no DB state
-        changes — useful for previewing what ``replace_subtree`` would do.
+        committing — the transaction is rolled back so no DB state changes.
 
         Inline ``TimeSeries.df`` data is rejected: write data separately
         via :meth:`write` against a manifest. ``under`` selects the parent
@@ -207,8 +221,6 @@ class Client:
                 conn,
                 edm_obj,
                 parent_uuid=parent_uuid,
-                mode=mode,
-                allow_delete=allow_delete,
                 dry_run=dry_run,
             )
             if dry_run:
@@ -312,8 +324,8 @@ class Client:
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
-                f"SELECT uuid, edge_type, label, data, from_node_uuid, to_node_uuid "
-                f"FROM energydb.edge WHERE {where} ORDER BY label NULLS LAST",
+                f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
+                f"FROM energydb.edge WHERE {where} ORDER BY name NULLS LAST",
                 params,
             ).fetchall()
             if not rows:
@@ -324,7 +336,7 @@ class Client:
                 {
                     "uuid": r[0],
                     "edge_type": r[1],
-                    "label": r[2],
+                    "name": r[2],
                     "data": r[3],
                     "from_node_uuid": r[4],
                     "to_node_uuid": r[5],

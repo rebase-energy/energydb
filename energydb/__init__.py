@@ -61,6 +61,7 @@ from timedatamodel import (
     TimeSeriesType,
 )
 
+from energydb._transaction import Transaction
 from energydb.client import Client
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.scope import EdgeScope, NodeScope
@@ -72,6 +73,7 @@ __all__ = [
     "IncompatibleUnitError",
     "NodeScope",
     "EdgeScope",
+    "Transaction",
     # Diff
     "TreeDiff",
     "NodeChange",

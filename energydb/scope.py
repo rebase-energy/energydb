@@ -17,6 +17,7 @@ resolution query and execute.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -28,6 +29,8 @@ from timedatamodel import TimeSeries, TimeSeriesType
 
 from energydb import series as series_mod
 from energydb._frames import OutputType, to_output, to_polars
+from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids
+from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
     Path,
     resolve_edge_uuid,
@@ -38,7 +41,12 @@ from energydb.paths import (
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
 if TYPE_CHECKING:
+    from energydb._transaction import Transaction
     from energydb.client import Client
+
+
+def _dry_run_unsupported_in_txn() -> None:
+    raise ValueError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
 
 
 def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Path:
@@ -55,6 +63,16 @@ def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Pa
     if len(args) == 1 and isinstance(args[0], (tuple, list)):
         return tuple(args[0])
     return tuple(args)
+
+
+def _resolve_endpoint(conn, target: NodeScope | Path | list[str]) -> UUID:
+    """Resolve a node endpoint reference to a UUID against ``conn``."""
+    if isinstance(target, NodeScope):
+        return target._resolve_node_uuid(conn)
+    path = tuple(target)
+    if not path:
+        raise ValueError("Endpoint path cannot be empty.")
+    return resolve_node_uuid(conn, path)
 
 
 def _timeseries_type_from_ts(ts: TimeSeries) -> str | None:
@@ -85,11 +103,13 @@ class NodeScope:
         node_uuid: UUID | None = None,
         path: Path = (),
         where_filters: dict[str, Any] | None = None,
+        txn: Transaction | None = None,
     ):
         self._client = client
         self._node_uuid = node_uuid
         self._path: Path = tuple(path)
         self._where_filters = where_filters
+        self._txn = txn
 
     @property
     def _pool(self):
@@ -98,6 +118,29 @@ class NodeScope:
     @property
     def _td(self):
         return self._client.td
+
+    @contextmanager
+    def _use_conn(self):
+        """Yield a DB connection. Inside a txn, use the txn's connection
+        (caller MUST NOT call ``.commit()`` / ``.rollback()``). Otherwise
+        borrow from the pool; mutators are responsible for explicit
+        ``commit()`` or ``rollback()``.
+        """
+        if self._txn is not None:
+            yield self._txn._conn
+        else:
+            with self._pool.connection() as conn:
+                yield conn
+
+    def _with_txn(self, txn: Transaction) -> NodeScope:
+        """Return a sibling scope bound to ``txn``."""
+        return NodeScope(
+            self._client,
+            node_uuid=self._node_uuid,
+            path=self._path,
+            where_filters=self._where_filters,
+            txn=txn,
+        )
 
     # ------------------------------------------------------------------
     # Navigation (lazy)
@@ -113,7 +156,7 @@ class NodeScope:
         if uuid is not None:
             if names_or_path:
                 raise ValueError("Pass either uuid= or names, not both.")
-            return NodeScope(self._client, node_uuid=uuid)
+            return NodeScope(self._client, node_uuid=uuid, txn=self._txn)
         if not names_or_path:
             raise ValueError("Must provide names or uuid.")
         extra = _coerce_path(names_or_path)
@@ -121,6 +164,7 @@ class NodeScope:
             self._client,
             node_uuid=self._node_uuid,
             path=self._path + extra,
+            txn=self._txn,
         )
 
     def where(
@@ -144,6 +188,7 @@ class NodeScope:
             node_uuid=self._node_uuid,
             path=self._path,
             where_filters=filters,
+            txn=self._txn,
         )
 
     # ------------------------------------------------------------------
@@ -187,7 +232,7 @@ class NodeScope:
     # ------------------------------------------------------------------
 
     def get(self):
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             row = conn.execute(
                 "SELECT uuid, node_type, name, data FROM energydb.node WHERE uuid = %s",
@@ -199,7 +244,7 @@ class NodeScope:
 
     def children(self, *, type: str | None = None) -> list[dict]:
         """Direct children of this node only (one level). Optional type filter."""
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             if type:
                 rows = conn.execute(
@@ -218,7 +263,7 @@ class NodeScope:
     def descendants(self, *, type: str | None = None) -> list[dict]:
         """Every node in the subtree rooted at this node, excluding the node
         itself (recursive). Optional type filter."""
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             rows = conn.execute(
                 """
@@ -242,7 +287,7 @@ class NodeScope:
 
     def path(self) -> Path:
         """Return the resolved path of the scope's node."""
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             return resolve_path(conn, node_uuid)
 
@@ -250,40 +295,77 @@ class NodeScope:
     # Single-element mutations
     # ------------------------------------------------------------------
 
-    def rename(self, new_name: str) -> None:
-        with self._pool.connection() as conn:
+    def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
+            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if before is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
             conn.execute(
                 "UPDATE energydb.node SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, node_uuid),
             )
+            after = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if self._txn is not None:
+                self._txn._record_node(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
             conn.commit()
+        return None
 
-    def update(self, *, data: dict | None = None, name: str | None = None) -> None:
-        sets = ["updated_at = now()"]
-        params: list[Any] = []
-        if data is not None:
-            sets.append("data = data || %s")
-            params.append(Jsonb(data))
-        if name is not None:
-            sets.append("name = %s")
-            params.append(name)
-        with self._pool.connection() as conn:
+    def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
+        """Patch the node's JSONB ``data`` column.
+
+        Default is a shallow merge (Postgres ``data = data || %s``) — top-level
+        keys in ``data`` overwrite existing keys; nested objects are replaced,
+        not deep-merged. Pass ``replace_data=True`` to fully replace the row's
+        ``data`` instead. Renames go through :meth:`rename`.
+        """
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        op = "data = %s" if replace_data else "data = data || %s"
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
-            params.append(node_uuid)
+            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if before is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
             conn.execute(
-                f"UPDATE energydb.node SET {', '.join(sets)} WHERE uuid = %s",
-                params,
+                f"UPDATE energydb.node SET {op}, updated_at = now() WHERE uuid = %s",
+                (Jsonb(data), node_uuid),
             )
+            after = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if self._txn is not None:
+                self._txn._record_node(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
             conn.commit()
+        return None
 
-    def delete(self) -> None:
-        with self._pool.connection() as conn:
+    def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
+            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if before is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
             conn.execute("DELETE FROM energydb.node WHERE uuid = %s", (node_uuid,))
+            if self._txn is not None:
+                self._txn._record_node(before, None)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(node_changes=[NodeChange(old=before, new=None)])
             conn.commit()
+        return None
 
-    def move_to(self, target: NodeScope | Path | list[str]) -> None:
+    def move_to(self, target: NodeScope | Path | list[str], *, dry_run: bool = False) -> TreeDiff | None:
         """Re-parent this node to ``target``.
 
         ``target`` is a :class:`NodeScope` or a path tuple/list. The node's
@@ -301,8 +383,13 @@ class NodeScope:
             target_path = tuple(target)
             target_node_uuid = None
 
-        with self._pool.connection() as conn:
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
+            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if before is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
             if target_path:
                 new_parent_uuid = resolve_node_uuid(conn, target_path, start_uuid=target_node_uuid)
             elif target_node_uuid is not None:
@@ -335,7 +422,15 @@ class NodeScope:
                 "UPDATE energydb.node SET parent_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_parent_uuid, node_uuid),
             )
+            after = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
+            if self._txn is not None:
+                self._txn._record_node(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
             conn.commit()
+        return None
 
     # ------------------------------------------------------------------
     # Series registration
@@ -382,7 +477,7 @@ class NodeScope:
 
         data_type_str = str(data_type).lower()
 
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             sid = series_mod.register_series(
                 conn,
@@ -395,7 +490,8 @@ class NodeScope:
                 retention=retention,
                 description=description,
             )
-            conn.commit()
+            if self._txn is None:
+                conn.commit()
         return sid
 
     # ------------------------------------------------------------------
@@ -424,7 +520,7 @@ class NodeScope:
         and delegates to :meth:`Client.write`. Returns the ``run_id``
         used.
         """
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
         manifest = _attach_routing(
             to_polars(df),
@@ -505,7 +601,7 @@ class NodeScope:
 
         Returns ``None`` when the scope is empty or no series match.
         """
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             target_uuids = self._resolve_target_node_uuids(conn)
             if not target_uuids:
                 return None
@@ -541,9 +637,11 @@ class EdgeScope:
         from_path: Path | None = None,
         to_path: Path | None = None,
         edge_type: str | None = None,
+        txn: Transaction | None = None,
     ):
         self._client = client
         self._edge_uuid = edge_uuid
+        self._txn = txn
         self._from_path = tuple(from_path) if from_path is not None else None
         self._to_path = tuple(to_path) if to_path is not None else None
         self._edge_type = edge_type
@@ -556,6 +654,24 @@ class EdgeScope:
     def _td(self):
         return self._client.td
 
+    @contextmanager
+    def _use_conn(self):
+        if self._txn is not None:
+            yield self._txn._conn
+        else:
+            with self._pool.connection() as conn:
+                yield conn
+
+    def _with_txn(self, txn: Transaction) -> EdgeScope:
+        return EdgeScope(
+            self._client,
+            edge_uuid=self._edge_uuid,
+            from_path=self._from_path,
+            to_path=self._to_path,
+            edge_type=self._edge_type,
+            txn=txn,
+        )
+
     def _resolve_edge_uuid(self, conn) -> UUID:
         if self._edge_uuid is not None:
             return self._edge_uuid
@@ -566,10 +682,10 @@ class EdgeScope:
     # get / navigation -------------------------------------------------
 
     def get(self):
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             row = conn.execute(
-                "SELECT uuid, edge_type, label, data, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
+                "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
                 (edge_uuid,),
             ).fetchone()
             if row is None:
@@ -578,7 +694,7 @@ class EdgeScope:
                 {
                     "uuid": row[0],
                     "edge_type": row[1],
-                    "label": row[2],
+                    "name": row[2],
                     "data": row[3],
                     "from_node_uuid": row[4],
                     "to_node_uuid": row[5],
@@ -586,7 +702,7 @@ class EdgeScope:
             )
 
     def from_node(self) -> NodeScope:
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             row = conn.execute(
                 "SELECT from_node_uuid FROM energydb.edge WHERE uuid = %s",
@@ -594,10 +710,10 @@ class EdgeScope:
             ).fetchone()
             if row is None:
                 raise ValueError(f"Edge not found: uuid={edge_uuid}")
-            return NodeScope(self._client, node_uuid=row[0])
+            return NodeScope(self._client, node_uuid=row[0], txn=self._txn)
 
     def to_node(self) -> NodeScope:
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             row = conn.execute(
                 "SELECT to_node_uuid FROM energydb.edge WHERE uuid = %s",
@@ -605,33 +721,116 @@ class EdgeScope:
             ).fetchone()
             if row is None:
                 raise ValueError(f"Edge not found: uuid={edge_uuid}")
-            return NodeScope(self._client, node_uuid=row[0])
+            return NodeScope(self._client, node_uuid=row[0], txn=self._txn)
 
     # CRUD -------------------------------------------------------------
 
-    def update(self, *, data: dict | None = None, label: str | None = None) -> None:
-        sets = ["updated_at = now()"]
-        params: list[Any] = []
-        if data is not None:
-            sets.append("data = data || %s")
-            params.append(Jsonb(data))
-        if label is not None:
-            sets.append("label = %s")
-            params.append(label)
-        with self._pool.connection() as conn:
+    def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
-            params.append(edge_uuid)
+            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if before is None:
+                raise ValueError(f"Edge not found: uuid={edge_uuid}")
             conn.execute(
-                f"UPDATE energydb.edge SET {', '.join(sets)} WHERE uuid = %s",
-                params,
+                "UPDATE energydb.edge SET name = %s, updated_at = now() WHERE uuid = %s",
+                (new_name, edge_uuid),
             )
+            after = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if self._txn is not None:
+                self._txn._record_edge(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
             conn.commit()
+        return None
 
-    def delete(self) -> None:
-        with self._pool.connection() as conn:
+    def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
+        """Patch the edge's JSONB ``data`` column.
+
+        Default is a shallow merge (Postgres ``data = data || %s``); pass
+        ``replace_data=True`` to fully replace the row's ``data``. Renames
+        go through :meth:`rename`; endpoint changes through :meth:`move_to`.
+        """
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        op = "data = %s" if replace_data else "data = data || %s"
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
-            conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (edge_uuid,))
+            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if before is None:
+                raise ValueError(f"Edge not found: uuid={edge_uuid}")
+            conn.execute(
+                f"UPDATE energydb.edge SET {op}, updated_at = now() WHERE uuid = %s",
+                (Jsonb(data), edge_uuid),
+            )
+            after = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if self._txn is not None:
+                self._txn._record_edge(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
             conn.commit()
+        return None
+
+    def move_to(
+        self,
+        *,
+        from_node: NodeScope | Path | list[str],
+        to_node: NodeScope | Path | list[str],
+        dry_run: bool = False,
+    ) -> TreeDiff | None:
+        """Re-point this edge to a new ``(from_node, to_node)`` pair.
+
+        The edge's ``uuid`` (and its series) stays attached. The
+        ``(edge_type, from_node_uuid, to_node_uuid)`` unique constraint
+        surfaces collisions with an existing edge as a Postgres error.
+        """
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
+            new_from_uuid = _resolve_endpoint(conn, from_node)
+            new_to_uuid = _resolve_endpoint(conn, to_node)
+            if new_from_uuid == new_to_uuid:
+                raise ValueError("Edge endpoints must be distinct nodes.")
+            edge_uuid = self._resolve_edge_uuid(conn)
+            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if before is None:
+                raise ValueError(f"Edge not found: uuid={edge_uuid}")
+            conn.execute(
+                "UPDATE energydb.edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
+                (new_from_uuid, new_to_uuid, edge_uuid),
+            )
+            after = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if self._txn is not None:
+                self._txn._record_edge(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
+            conn.commit()
+        return None
+
+    def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
+            edge_uuid = self._resolve_edge_uuid(conn)
+            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
+            if before is None:
+                raise ValueError(f"Edge not found: uuid={edge_uuid}")
+            conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (edge_uuid,))
+            if self._txn is not None:
+                self._txn._record_edge(before, None)
+                return None
+            if dry_run:
+                conn.rollback()
+                return TreeDiff(edge_changes=[EdgeChange(old=before, new=None)])
+            conn.commit()
+        return None
 
     # series -----------------------------------------------------------
 
@@ -669,7 +868,7 @@ class EdgeScope:
 
         data_type_str = str(data_type).lower()
 
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             sid = series_mod.register_series(
                 conn,
@@ -682,7 +881,8 @@ class EdgeScope:
                 retention=retention,
                 description=description,
             )
-            conn.commit()
+            if self._txn is None:
+                conn.commit()
         return sid
 
     def write(
@@ -700,7 +900,7 @@ class EdgeScope:
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
     ) -> int:
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
         manifest = _attach_routing(
             to_polars(df),
@@ -735,7 +935,7 @@ class EdgeScope:
         include_knowledge_time: bool = False,
         output: OutputType = "pandas",
     ) -> pl.DataFrame | pd.DataFrame:
-        with self._pool.connection() as conn:
+        with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None
             meta = series_mod.resolve_for_read(

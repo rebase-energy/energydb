@@ -438,31 +438,3 @@ def test_live_query_within_accepts_str_tuple_list_uuid(live_edb):
     assert len(e_tuple) == 1
     assert len(e_list) == 1
     assert len(e_uuid) == 1
-
-
-@pytestmark_live
-def test_live_idempotent_register_tree_does_not_bump_updated_at(live_edb):
-    """Registering the same tree twice must be a true no-op: ``updated_at``
-    should not advance when the JSONB ``data`` is byte-identical to what's
-    already in the row.
-    """
-    tree = edb.Portfolio(
-        name="Idem",
-        members=[edb.wind.WindTurbine(name="T", capacity=3.5)],
-    )
-    live_edb.register_tree(tree)
-
-    with live_edb._pool.connection() as conn:
-        first = conn.execute(
-            "SELECT uuid, updated_at FROM energydb.node WHERE parent_uuid IS NULL AND name = 'Idem'"
-        ).fetchone()
-
-    live_edb.register_tree(tree)
-
-    with live_edb._pool.connection() as conn:
-        second = conn.execute(
-            "SELECT uuid, updated_at FROM energydb.node WHERE parent_uuid IS NULL AND name = 'Idem'"
-        ).fetchone()
-
-    assert first[0] == second[0]  # same uuid (no reinsert)
-    assert first[1] == second[1]  # updated_at unchanged (UPDATE skipped via IS DISTINCT FROM)

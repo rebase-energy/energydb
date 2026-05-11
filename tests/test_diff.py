@@ -31,7 +31,7 @@ def _edge(
     uuid: UUID,
     *,
     type: str = "Line",
-    label: str | None = "L",
+    name: str | None = "L",
     a: UUID | None = None,
     b: UUID | None = None,
     data: dict | None = None,
@@ -39,7 +39,7 @@ def _edge(
     return EdgeSnapshot(
         uuid=uuid,
         edge_type=type,
-        label=label,
+        name=name,
         from_node_uuid=a or uuid4(),
         to_node_uuid=b or uuid4(),
         data=data or {},
@@ -130,14 +130,14 @@ class TestNodeChangeKind:
 
 
 class TestEdgeChangeKind:
-    def test_insert_uses_label_as_display_name(self):
-        e = _edge(uuid4(), label="Cable-1")
+    def test_insert_uses_name_as_display_name(self):
+        e = _edge(uuid4(), name="Cable-1")
         c = EdgeChange(old=None, new=e)
         assert c.kind == "insert"
         assert c.display_name == "Cable-1"
 
-    def test_falls_back_to_edge_type_when_label_missing(self):
-        e = _edge(uuid4(), label=None)
+    def test_falls_back_to_edge_type_when_name_missing(self):
+        e = _edge(uuid4(), name=None)
         c = EdgeChange(old=None, new=e)
         assert c.display_name == "Line"
 
@@ -285,7 +285,7 @@ class TestTreeDiffPrint:
         edge_uuid = uuid4()
         d = TreeDiff(
             edge_changes=[
-                EdgeChange(old=None, new=_edge(edge_uuid, type="Line", label="Cable", a=a, b=b)),
+                EdgeChange(old=None, new=_edge(edge_uuid, type="Line", name="Cable", a=a, b=b)),
             ]
         )
         out = self._capture(d)
@@ -351,7 +351,7 @@ class TestTreeDiffPrint:
     def test_edges_only_diff_does_not_say_no_changes(self):
         """A diff with only edge changes must not also print '(no changes)'."""
         edge_uuid = uuid4()
-        d = TreeDiff(edge_changes=[EdgeChange(old=None, new=_edge(edge_uuid, type="Line", label="L"))])
+        d = TreeDiff(edge_changes=[EdgeChange(old=None, new=_edge(edge_uuid, type="Line", name="L"))])
         out = self._capture(d)
         assert "no changes" not in out
         assert "edges:" in out

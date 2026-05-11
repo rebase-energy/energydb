@@ -1,3 +1,9 @@
+# 🚀 v0.4.0 — EnergyDB
+
+**Breaking changes — imperative-first API.** Modifications to existing nodes/edges now go through scope mutators (`rename`, `update`, `move_to`, `delete`); `register_tree` is create-only and raises if any UUID in the payload already exists. New `client.transaction()` context manager batches mutations atomically with `preview()`. Every mutator accepts `dry_run=True` returning a `TreeDiff`.
+
+Other breaks: DB column `energydb.edge.label` renamed to `name` (EDM already used `name`); `NodeScope.update` / `EdgeScope.update` drop the `name`/`label` kwarg (use `.rename()`) and take `data` positionally with new `replace_data` option; `register_tree` drops `mode` and `allow_delete`.
+
 # 🚀 v0.3.2 — EnergyDB
 
 EnergyDB is an open-source library for persisting full energy portfolios — assets, grid topology, and bitemporal time series — in one connected database backed by PostgreSQL and ClickHouse.
@@ -14,9 +20,10 @@ EnergyDB stores three kinds of objects in one connected database:
 
 ## ✨ Key Features
 
-- **Declarative structure**: `client.register_tree(portfolio)` persists every node, edge, and series declaration in one idempotent call
+- **Create-only `register_tree`**: `client.register_tree(portfolio)` persists every node, edge, and series declaration in one call; raises if any UUID is already present
 - **UUID identity end-to-end**: `Element.id` is the row primary key — renames, moves, and property edits become silent `UPDATE`s
-- **Modes for in-place rewrites**: `mode="replace_subtree"` with `allow_delete=True` (and `dry_run=True` for previews via `TreeDiff.print()`)
+- **Imperative mutations with preview**: `scope.rename(...)` / `.update(data, ...)` / `.move_to(...)` / `.delete()` on every node and edge, each with `dry_run=True` returning a `TreeDiff`
+- **Atomic batches**: `with client.transaction() as txn: ... txn.preview(); txn.commit()` — one connection, one transaction, preview-before-commit
 - **Fluent, lazy navigation**: `client.get_node("Portfolio", "Site", "T01").read(...)` accumulates path/filters and resolves in one indexed CTE
 - **Bulk manifest I/O**: write or read across many series in one call via a polars manifest with `node_uuid`, `edge_uuid`, or `path` routing
 - **Unit handling**: per-row or broadcast `unit=` triggers pint-driven conversion to each series' canonical unit before write
