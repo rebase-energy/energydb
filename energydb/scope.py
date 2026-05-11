@@ -34,6 +34,7 @@ from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, regi
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
     Path,
+    build_node_filter_conditions,
     resolve_edge_uuid,
     resolve_node_uuid,
     resolve_path,
@@ -538,27 +539,26 @@ class NodeScope(_BaseScope):
 
     def _resolve_target_node_uuids(self, conn) -> list[UUID]:
         root_uuid = self._resolve_node_uuid(conn)
-        subtree_uuids = resolve_subtree_uuids(conn, root_uuid)
         if not self._where_filters:
-            return subtree_uuids
+            return resolve_subtree_uuids(conn, root_uuid)
 
-        conditions = ["uuid = ANY(%s)"]
-        params: list[Any] = [subtree_uuids]
-        if "node_type" in self._where_filters:
-            conditions.append("node_type = %s")
-            params.append(self._where_filters["node_type"])
-        if "name" in self._where_filters:
-            conditions.append("name = %s")
-            params.append(self._where_filters["name"])
-        for key, value in self._where_filters.items():
-            if key in ("node_type", "name"):
-                continue
-            conditions.append("data->>%s = %s")
-            params.append(key)
-            params.append(str(value))
-
-        where = " AND ".join(conditions)
-        rows = conn.execute(f"SELECT uuid FROM energydb.node WHERE {where}", params).fetchall()
+        # Subtree + filters in one round-trip: the recursive CTE materializes
+        # the candidate set, the outer SELECT applies the predicates.
+        filter_conds, filter_params = build_node_filter_conditions(self._where_filters, table_alias="n")
+        extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
+        sql = f"""
+            WITH RECURSIVE subtree AS (
+                SELECT uuid FROM energydb.node WHERE uuid = %s
+                UNION ALL
+                SELECT n.uuid FROM energydb.node n
+                JOIN subtree s ON n.parent_uuid = s.uuid
+            ) CYCLE uuid SET _is_cycle USING _cycle_path
+            SELECT n.uuid
+            FROM energydb.node n
+            JOIN subtree s ON n.uuid = s.uuid
+            WHERE NOT s._is_cycle{extra}
+        """
+        rows = conn.execute(sql, (root_uuid, *filter_params)).fetchall()
         return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
@@ -610,13 +610,13 @@ class NodeScope(_BaseScope):
                 SELECT n.uuid, n.node_type, n.name, n.data
                 FROM energydb.node n
                 JOIN subtree s ON n.uuid = s.uuid
-                WHERE NOT s._is_cycle AND n.uuid != %s
+                WHERE NOT s._is_cycle
+                  AND n.uuid != %s
+                  AND (%s::text IS NULL OR n.node_type = %s::text)
                 ORDER BY n.name
                 """,
-                (node_uuid, node_uuid),
+                (node_uuid, node_uuid, type, type),
             ).fetchall()
-            if type:
-                rows = [r for r in rows if r[1] == type]
             return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
 
     def path(self) -> Path:
@@ -691,9 +691,10 @@ class NodeScope(_BaseScope):
             if new_parent_uuid == node_uuid:
                 raise ValueError("Cannot move a node into itself.")
 
-            # Walk up from new_parent_uuid; if node_uuid is among the ancestors,
-            # the move would create a cycle.
-            ancestors = conn.execute(
+            # Walk up from new_parent_uuid; if node_uuid appears on the chain
+            # the move would create a cycle. EXISTS short-circuits as soon as
+            # the row is found rather than streaming the whole chain back.
+            cycle_row = conn.execute(
                 """
                 WITH RECURSIVE chain AS (
                     SELECT uuid, parent_uuid
@@ -702,11 +703,11 @@ class NodeScope(_BaseScope):
                     SELECT n.uuid, n.parent_uuid
                     FROM energydb.node n JOIN chain c ON n.uuid = c.parent_uuid
                 ) CYCLE uuid SET _is_cycle USING _cycle_path
-                SELECT uuid FROM chain WHERE NOT _is_cycle
+                SELECT EXISTS (SELECT 1 FROM chain WHERE NOT _is_cycle AND uuid = %s)
                 """,
-                (new_parent_uuid,),
-            ).fetchall()
-            if any(r[0] == node_uuid for r in ancestors):
+                (new_parent_uuid, node_uuid),
+            ).fetchone()
+            if cycle_row and cycle_row[0]:
                 raise ValueError("Cannot move a node into its own subtree (would create a cycle).")
 
             conn.execute(

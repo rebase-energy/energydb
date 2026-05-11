@@ -46,6 +46,7 @@ from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
     Path,
+    build_node_filter_conditions,
     resolve_node_uuid,
     resolve_path,
     resolve_paths_bulk,
@@ -251,25 +252,21 @@ class Client:
         ``within`` accepts a path (tuple/list), a single name (str), or a
         :class:`UUID`.
         """
-        conditions: list[str] = []
-        params: list[Any] = []
+        where_filters: dict[str, Any] = dict(property_filters)
+        if type is not None:
+            where_filters["node_type"] = type
 
         with self._pool.connection() as conn:
+            filter_conds, filter_params = build_node_filter_conditions(where_filters)
+            conditions: list[str] = list(filter_conds)
+            params: list[Any] = list(filter_params)
+
             if within is not None:
                 within_uuid = (
                     within if isinstance(within, UUID) else resolve_node_uuid(conn, _coerce_path((), kwarg=within))
                 )
                 conditions.append("uuid = ANY(%s)")
                 params.append(resolve_subtree_uuids(conn, within_uuid))
-
-            if type is not None:
-                conditions.append("node_type = %s")
-                params.append(type)
-
-            for key, value in property_filters.items():
-                conditions.append("data->>%s = %s")
-                params.append(key)
-                params.append(str(value))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
