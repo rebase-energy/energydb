@@ -16,9 +16,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "timedatamodel>=0.3.0",
-    "timedb>=0.2.0",
-    "energydatamodel>=0.1.0",
+    "timedatamodel==0.3.0",
+    "timedb==0.2.1",
+    "energydatamodel==0.2.0",
     "psycopg[binary]>=3.1",
     "psycopg_pool>=3.1",
     "sqlalchemy>=2.0",
