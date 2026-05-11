@@ -241,13 +241,12 @@ class TestTreeDiffPrint:
         assert "~ Site 'NewName'" in out
         assert "rename 'OldName' → 'NewName'" in out
 
-    def test_delete_marker_with_warning(self):
+    def test_delete_marker(self):
         u = uuid4()
         d = TreeDiff(node_changes=[NodeChange(old=_node(u, type="Battery", name="B1"), new=None)])
         out = self._capture(d)
         assert "- Battery 'B1'" in out
         assert "[delete]" in out
-        assert "allow_delete required" in out
 
     def test_data_edit_summary(self):
         u = uuid4()

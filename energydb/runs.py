@@ -65,7 +65,8 @@ def upsert_run(
 
 
 def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
-    """Hydrate run metadata by id. Returns rows in input order where found."""
+    """Hydrate run metadata by id. Returns matched rows ordered by
+    ``inserted_at`` descending (latest run first)."""
     if not run_ids:
         return []
     rows = conn.execute(

@@ -49,6 +49,22 @@ def _dry_run_unsupported_in_txn() -> None:
     raise ValueError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
 
 
+def _ts_io_unsupported_in_txn(op: str) -> None:
+    """Reject time-series I/O on a txn-bound scope.
+
+    ``scope.write`` / ``scope.read`` route through the connection pool and
+    (for writes) ClickHouse, neither of which participates in the PG
+    transaction. Allowing them silently would let a successful ``write``
+    persist data that a later rollback couldn't undo. Call
+    ``client.write``/``client.read`` directly outside the transaction.
+    """
+    raise RuntimeError(
+        f"scope.{op}() is not supported inside a transaction(); time-series I/O does "
+        f"not participate in the PG transaction. Call client.{op}() directly outside "
+        f"the transaction block."
+    )
+
+
 def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Path:
     """Accept variadic names, a single tuple/list, or a kwarg form.
 
@@ -553,6 +569,8 @@ class NodeScope:
         and delegates to :meth:`Client.write`. Returns the ``run_id``
         used.
         """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("write")
         with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
         manifest = _attach_routing(
@@ -595,6 +613,8 @@ class NodeScope:
         :meth:`Client.read`. Returns pandas by default; pass
         ``output="polars"`` for a polars DataFrame.
         """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("read")
         manifest = self._build_read_manifest(data_type=data_type, name=name)
         if manifest is None:
             return to_output(pl.DataFrame(), output)
@@ -619,6 +639,8 @@ class NodeScope:
         output: OutputType = "pandas",
         **td_read_kwargs,
     ) -> pl.DataFrame | pd.DataFrame:
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("read_relative")
         manifest = self._build_read_manifest(data_type=data_type, name=name)
         if manifest is None:
             return to_output(pl.DataFrame(), output)
@@ -933,6 +955,8 @@ class EdgeScope:
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
     ) -> int:
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("write")
         with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
         manifest = _attach_routing(
@@ -968,6 +992,8 @@ class EdgeScope:
         include_knowledge_time: bool = False,
         output: OutputType = "pandas",
     ) -> pl.DataFrame | pd.DataFrame:
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("read")
         with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None

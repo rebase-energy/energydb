@@ -303,7 +303,7 @@ def _render_row_for_node(change: NodeChange) -> _RenderRow:
         return _RenderRow(
             marker="-",
             label=label,
-            note="  [delete] (allow_delete required)",
+            note="  [delete]",
             parent_uuid=snap.parent_uuid,
         )
 
@@ -376,7 +376,7 @@ def _edge_change_note(change: EdgeChange) -> str:
     if change.kind == "insert":
         return "  [insert]"
     if change.kind == "delete":
-        return "  [delete] (allow_delete required)"
+        return "  [delete]"
     notes: list[str] = []
     if change.endpoints_changed:
         notes.append("endpoints changed")

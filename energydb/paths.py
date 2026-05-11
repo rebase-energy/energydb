@@ -346,7 +346,7 @@ def _resolve_manifest_node(conn, manifest: pl.DataFrame) -> pl.DataFrame:
         left_on=["node_uuid", "data_type", "name"],
         right_on=["node_uuid", "_dt", "_name"],
         how="left",
-    ).drop([c for c in ("_dt", "_name") if c in manifest.columns])
+    ).drop("_dt", "_name", strict=False)
 
     _raise_on_unresolved(resolved, "node_uuid")
     return resolved
@@ -370,7 +370,7 @@ def _resolve_manifest_edge(conn, manifest: pl.DataFrame) -> pl.DataFrame:
         left_on=["edge_uuid", "data_type", "name"],
         right_on=["edge_uuid", "_dt", "_name"],
         how="left",
-    ).drop([c for c in ("_dt", "_name") if c in manifest.columns])
+    ).drop("_dt", "_name", strict=False)
 
     _raise_on_unresolved(resolved, "edge_uuid")
     return resolved

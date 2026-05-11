@@ -166,3 +166,29 @@ def test_double_commit_raises(populated):
         txn.get_node("P", "S", "T1").rename("T1-A")
         txn.commit()
         txn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Time-series I/O is rejected on txn-bound scopes
+# ---------------------------------------------------------------------------
+
+
+def test_node_scope_write_inside_txn_raises(populated):
+    import polars as pl
+
+    df = pl.DataFrame({"valid_time": [], "value": []})
+    with pytest.raises(RuntimeError, match="not supported inside a transaction"), populated.transaction() as txn:
+        txn.get_node("P", "S", "T1").write(df, data_type="actual", name="power")
+        txn.commit()
+
+
+def test_node_scope_read_inside_txn_raises(populated):
+    with pytest.raises(RuntimeError, match="not supported inside a transaction"), populated.transaction() as txn:
+        txn.get_node("P", "S", "T1").read()
+        txn.commit()
+
+
+def test_node_scope_read_relative_inside_txn_raises(populated):
+    with pytest.raises(RuntimeError, match="not supported inside a transaction"), populated.transaction() as txn:
+        txn.get_node("P", "S", "T1").read_relative(data_type="actual", name="power")
+        txn.commit()
