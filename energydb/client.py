@@ -212,6 +212,14 @@ class Client:
         under which the tree's root is grafted; ``None`` means create at
         root. Raises if ``under`` points at a non-existent parent.
 
+        Series declarations attached to nodes/edges on the tree **are**
+        registered alongside their owners but are not represented in the
+        returned :class:`TreeDiff`. Adding a series to a node that
+        already exists in the DB is not supported here (the create-only
+        pre-check rejects the whole payload); use
+        :meth:`NodeScope.register_series` /
+        :meth:`EdgeScope.register_series` instead.
+
         Returns the ``uuid`` of the tree's root, except when
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
         """

@@ -105,39 +105,6 @@ def register_series(
     return existing_sid
 
 
-def resolve_for_write(
-    conn,
-    *,
-    node_uuid: UUID | None = None,
-    edge_uuid: UUID | None = None,
-    data_type: str,
-    name: str,
-) -> dict[str, Any]:
-    """Resolve a single series for a write.
-
-    Returns dict with series_id, canonical_unit, timeseries_type, retention.
-    Raises if not found.
-    """
-    if (node_uuid is None) == (edge_uuid is None):
-        raise ValueError("Exactly one of node_uuid or edge_uuid must be set.")
-    owner_col = "node_uuid" if node_uuid is not None else "edge_uuid"
-    owner_val = node_uuid if node_uuid is not None else edge_uuid
-    row = conn.execute(
-        f"SELECT series_id, canonical_unit, timeseries_type, retention "
-        f"FROM energydb.series "
-        f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
-        (owner_val, data_type, name),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"No series found for {owner_col}={owner_val}, data_type={data_type!r}, name={name!r}")
-    return {
-        "series_id": row[0],
-        "canonical_unit": row[1],
-        "timeseries_type": row[2],
-        "retention": row[3],
-    }
-
-
 def resolve_for_read(
     conn,
     *,
