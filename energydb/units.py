@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import pint
 import polars as pl
 
 
@@ -24,8 +25,6 @@ def compute_unit_factor(from_unit: str, to_unit: str) -> float | None:
     """
     if from_unit == to_unit or from_unit == "dimensionless":
         return None
-    import pint
-
     ureg = pint.application_registry.get()
     try:
         return float(ureg.Quantity(1, from_unit).to(to_unit).magnitude)

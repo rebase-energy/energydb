@@ -7,7 +7,6 @@ row, and calls ``td.write`` with that id already stamped on the dataframe.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from typing import Any
 
@@ -86,7 +85,7 @@ def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
             "model_name": r[2],
             "run_start_time": r[3],
             "run_finish_time": r[4],
-            "run_params": r[5] if isinstance(r[5], dict) else json.loads(r[5]),
+            "run_params": r[5],
             "inserted_at": r[6],
         }
         for r in rows

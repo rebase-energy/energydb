@@ -127,16 +127,13 @@ def reconstruct_edge(row: dict[str, Any]):
     uuid_val = row["uuid"]
     data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
 
+    # Endpoints come from the FK columns, not the JSONB blob — those are
+    # the authoritative source. We attach them as ``Reference`` after
+    # ``element_from_json`` so stale endpoint refs that might survive in
+    # ``data`` are overwritten unconditionally.
+    obj = edm.element_from_json(data)
     from_uuid = row.get("from_node_uuid")
     to_uuid = row.get("to_node_uuid")
-    if from_uuid is not None:
-        data["from_element"] = {"__ref__": str(from_uuid) if isinstance(from_uuid, UUID) else from_uuid}
-    if to_uuid is not None:
-        data["to_element"] = {"__ref__": str(to_uuid) if isinstance(to_uuid, UUID) else to_uuid}
-
-    obj = edm.element_from_json(data)
-    # Defensive: if the JSON blob carried stale endpoint refs, the FK columns
-    # we just attached are authoritative — overwrite.
     if from_uuid is not None:
         obj.from_element = Reference(from_uuid if isinstance(from_uuid, UUID) else UUID(str(from_uuid)))
     if to_uuid is not None:

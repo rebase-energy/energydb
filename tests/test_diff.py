@@ -209,14 +209,14 @@ class TestTreeDiffBins:
 
 
 # ---------------------------------------------------------------------------
-# TreeDiff.print() — tree-shaped output
+# TreeDiff.render() — tree-shaped output
 # ---------------------------------------------------------------------------
 
 
-class TestTreeDiffPrint:
+class TestTreeDiffRender:
     def _capture(self, diff: TreeDiff) -> str:
         buf = io.StringIO()
-        diff.print(file=buf)
+        diff.render(file=buf)
         return buf.getvalue()
 
     def test_empty_diff_prints_no_changes(self):
@@ -294,7 +294,7 @@ class TestTreeDiffPrint:
     def test_change_under_unchanged_ancestor_renders(self):
         """A change whose parent is unchanged (and thus absent from the diff)
         must still render — it becomes a render trunk in its own right.
-        Regression for `diff.print()` silently producing no output when
+        Regression for `diff.render()` silently producing no output when
         ``replace_subtree`` only edits a deep node."""
         unchanged_portfolio = uuid4()
         site_uuid = uuid4()

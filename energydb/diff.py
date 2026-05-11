@@ -220,7 +220,7 @@ class TreeDiff:
     # Pretty-print (tree-shaped)
     # ------------------------------------------------------------------
 
-    def print(self, file: IO[str] | None = None) -> None:
+    def render(self, file: IO[str] | None = None) -> None:
         """Render the diff as a tree-shaped textual preview.
 
         Output format::

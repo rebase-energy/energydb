@@ -48,8 +48,6 @@ from energydb.paths import (
     Path,
     build_node_filter_conditions,
     resolve_node_uuid,
-    resolve_path,
-    resolve_paths_bulk,
     resolve_subtree_uuids,
 )
 from energydb.scope import EdgeScope, NodeScope, _coerce_path
@@ -74,6 +72,13 @@ class Client:
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
             raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
+        if "://" not in conninfo:
+            raise ValueError(
+                "pg_conninfo must be a URI (e.g. postgresql://user:pass@host/db); "
+                "key=value DSNs are not supported here because the schema-create path "
+                "needs a SQLAlchemy URL."
+            )
+        self._dsn = conninfo
 
         def _configure(conn):
             conn.execute(_SEARCH_PATH)
@@ -530,16 +535,4 @@ class Client:
     # ------------------------------------------------------------------
 
     def _sqlalchemy_url(self) -> str:
-        conninfo = self._pool.conninfo
-        if "://" in conninfo:
-            return f"postgresql+psycopg://{conninfo.split('://', 1)[-1]}"
-        return conninfo
-
-    @staticmethod
-    def _resolve_path(conn, node_uuid: UUID) -> Path:
-        """Convenience wrapper used by tests."""
-        return resolve_path(conn, node_uuid)
-
-    @staticmethod
-    def _resolve_paths_bulk(conn, node_uuids: list[UUID]) -> dict[UUID, Path]:
-        return resolve_paths_bulk(conn, node_uuids)
+        return f"postgresql+psycopg://{self._dsn.split('://', 1)[-1]}"
