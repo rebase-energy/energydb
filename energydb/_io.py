@@ -10,6 +10,7 @@ read pipeline and one write pipeline in the library.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import polars as pl
@@ -98,6 +99,36 @@ def write_manifest(
 # ---------------------------------------------------------------------------
 
 
+def _read_pipeline(
+    pool,
+    manifest: pl.DataFrame,
+    td_call: Callable[[list[int], list[str]], pl.DataFrame],
+    *,
+    unit: str | None,
+) -> pl.DataFrame:
+    """Shared read pipeline: resolve manifest → fetch from timedb → optional
+    unit scaling → hierarchy join.
+
+    ``td_call(series_ids, retentions)`` invokes the relevant ``td.read*``
+    method with the read-specific kwargs already bound (start_valid,
+    relative-window args, etc.).
+    """
+    is_edge = "edge_uuid" in manifest.columns
+    with pool.connection() as conn:
+        resolved = resolve_manifest(conn, manifest)
+        meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
+        series_ids = meta["series_id"].unique().to_list()
+        retentions = meta["retention"].unique().to_list()
+        result = td_call(series_ids, retentions)
+        if result.is_empty():
+            return result
+        if unit is not None:
+            result = apply_per_series_unit(result, meta, unit)
+        if is_edge:
+            return join_edge_hierarchy(conn, result, meta)
+        return join_hierarchy(conn, result, meta)
+
+
 def read_manifest(
     pool,
     td,
@@ -112,15 +143,9 @@ def read_manifest(
     include_knowledge_time: bool = False,
 ) -> pl.DataFrame:
     """Bulk read via manifest. Detects edge vs node routing automatically."""
-    is_edge = "edge_uuid" in manifest.columns
 
-    with pool.connection() as conn:
-        resolved = resolve_manifest(conn, manifest)
-        meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
-
-        series_ids = meta["series_id"].unique().to_list()
-        retentions = meta["retention"].unique().to_list()
-        result = td.read(
+    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
+        return td.read(
             series_ids=series_ids,
             retention=retentions,
             start_valid=start_valid,
@@ -130,15 +155,8 @@ def read_manifest(
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
         )
-        if result.is_empty():
-            return result
 
-        if unit is not None:
-            result = apply_per_series_unit(result, meta, unit)
-
-        if is_edge:
-            return join_edge_hierarchy(conn, result, meta)
-        return join_hierarchy(conn, result, meta)
+    return _read_pipeline(pool, manifest, _call, unit=unit)
 
 
 def read_relative_manifest(
@@ -150,28 +168,11 @@ def read_relative_manifest(
     **td_kwargs,
 ) -> pl.DataFrame:
     """Bulk relative read via manifest."""
-    is_edge = "edge_uuid" in manifest.columns
 
-    with pool.connection() as conn:
-        resolved = resolve_manifest(conn, manifest)
-        meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
+    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
+        return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-        series_ids = meta["series_id"].unique().to_list()
-        retentions = meta["retention"].unique().to_list()
-        result = td.read_relative(
-            series_ids=series_ids,
-            retention=retentions,
-            **td_kwargs,
-        )
-        if result.is_empty():
-            return result
-
-        if unit is not None:
-            result = apply_per_series_unit(result, meta, unit)
-
-        if is_edge:
-            return join_edge_hierarchy(conn, result, meta)
-        return join_hierarchy(conn, result, meta)
+    return _read_pipeline(pool, manifest, _call, unit=unit)
 
 
 def apply_per_series_unit(

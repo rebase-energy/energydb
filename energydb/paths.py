@@ -27,6 +27,21 @@ Path = tuple[str, ...]
 # ---------------------------------------------------------------------------
 
 
+# Shared recursive tail for ``resolve_node_uuid`` — the walk and final
+# SELECT are identical in both seed cases; only the seed row differs.
+_RESOLVE_NODE_UUID_TAIL = """
+        UNION ALL
+        SELECT n.uuid, w.depth + 1
+        FROM walk w
+        JOIN energydb.node n
+             ON n.parent_uuid = w.uuid
+            AND n.name = (%s::text[])[w.depth + 1]
+        WHERE w.depth < array_length(%s::text[], 1)
+    )
+    SELECT uuid FROM walk WHERE depth = array_length(%s::text[], 1)
+"""
+
+
 def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UUID:
     """Resolve a path tuple like ``("Europe", "Sweden", "Lillgrund")`` to a uuid.
 
@@ -45,41 +60,15 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
 
     p = list(path)
     if start_uuid is None:
-        rows = conn.execute(
-            """
-            WITH RECURSIVE walk AS (
-                SELECT uuid, 1 AS depth
-                FROM energydb.node
-                WHERE name = (%s::text[])[1] AND parent_uuid IS NULL
-                UNION ALL
-                SELECT n.uuid, w.depth + 1
-                FROM walk w
-                JOIN energydb.node n
-                     ON n.parent_uuid = w.uuid
-                    AND n.name = (%s::text[])[w.depth + 1]
-                WHERE w.depth < array_length(%s::text[], 1)
-            )
-            SELECT uuid FROM walk WHERE depth = array_length(%s::text[], 1)
-            """,
-            (p, p, p, p),
-        ).fetchall()
+        seed_sql = "SELECT uuid, 1 AS depth FROM energydb.node WHERE name = (%s::text[])[1] AND parent_uuid IS NULL"
+        seed_params: tuple = (p,)
     else:
-        rows = conn.execute(
-            """
-            WITH RECURSIVE walk AS (
-                SELECT %s::uuid AS uuid, 0 AS depth
-                UNION ALL
-                SELECT n.uuid, w.depth + 1
-                FROM walk w
-                JOIN energydb.node n
-                     ON n.parent_uuid = w.uuid
-                    AND n.name = (%s::text[])[w.depth + 1]
-                WHERE w.depth < array_length(%s::text[], 1)
-            )
-            SELECT uuid FROM walk WHERE depth = array_length(%s::text[], 1)
-            """,
-            (start_uuid, p, p, p),
-        ).fetchall()
+        seed_sql = "SELECT %s::uuid AS uuid, 0 AS depth"
+        seed_params = (start_uuid,)
+
+    sql = f"WITH RECURSIVE walk AS (\n        {seed_sql}{_RESOLVE_NODE_UUID_TAIL}"
+    rows = conn.execute(sql, (*seed_params, p, p, p)).fetchall()
+
     if len(rows) == 0:
         raise ValueError(f"Node not found: {'/'.join(path)}")
     if len(rows) > 1:
@@ -273,10 +262,10 @@ def resolve_manifest(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     if route == "edge_uuid":
-        return _resolve_manifest_edge(conn, manifest)
+        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid")
     if route == "path":
         manifest = _attach_node_uuid_from_path(conn, manifest)
-    return _resolve_manifest_node(conn, manifest)
+    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid")
 
 
 def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
@@ -322,57 +311,46 @@ def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
 
     Manifests may carry uuids as ``UUID`` objects, strings, or polars Utf8.
     Joins against PG-returned uuids work cleanly when both sides are str.
+    Fast-path the common case where the column is already ``Utf8``.
     """
-    series = manifest[col]
-    values = [str(v) if v is not None else None for v in series.to_list()]
+    if manifest[col].dtype == pl.Utf8:
+        return manifest
+    values = [str(v) if v is not None else None for v in manifest[col].to_list()]
     return manifest.with_columns(pl.Series(col, values, dtype=pl.Utf8))
 
 
-def _resolve_manifest_node(conn, manifest: pl.DataFrame) -> pl.DataFrame:
-    manifest = _coerce_uuid_col(manifest, "node_uuid")
-    node_uuids = [v for v in manifest["node_uuid"].unique().to_list() if v is not None]
-    if not node_uuids:
-        raise ValueError("No node_uuid values to resolve in manifest.")
+def _resolve_manifest_by_owner(
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    owner_col: str,
+) -> pl.DataFrame:
+    """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
+    against the series table.
+
+    The owner column is coerced to ``Utf8`` on entry so it can join against
+    the PG-side ``::text`` cast cleanly.
+    """
+    manifest = _coerce_uuid_col(manifest, owner_col)
+    owner_vals = [v for v in manifest[owner_col].unique().to_list() if v is not None]
+    if not owner_vals:
+        raise ValueError(f"No {owner_col} values to resolve in manifest.")
 
     rows = conn.execute(
-        "SELECT node_uuid, data_type, name, series_id, canonical_unit, timeseries_type, retention "
-        "FROM energydb.series WHERE node_uuid::text = ANY(%s)",
-        (node_uuids,),
+        f"SELECT {owner_col}, data_type, name, series_id, canonical_unit, timeseries_type, retention "
+        f"FROM energydb.series WHERE {owner_col}::text = ANY(%s)",
+        (owner_vals,),
     ).fetchall()
-    lookup = _series_lookup_df(rows, "node_uuid")
+    lookup = _series_lookup_df(rows, owner_col)
 
     resolved = manifest.join(
         lookup,
-        left_on=["node_uuid", "data_type", "name"],
-        right_on=["node_uuid", "_dt", "_name"],
+        left_on=[owner_col, "data_type", "name"],
+        right_on=[owner_col, "_dt", "_name"],
         how="left",
     ).drop("_dt", "_name", strict=False)
 
-    _raise_on_unresolved(resolved, "node_uuid")
-    return resolved
-
-
-def _resolve_manifest_edge(conn, manifest: pl.DataFrame) -> pl.DataFrame:
-    manifest = _coerce_uuid_col(manifest, "edge_uuid")
-    edge_uuids = [v for v in manifest["edge_uuid"].unique().to_list() if v is not None]
-    if not edge_uuids:
-        raise ValueError("No edge_uuid values to resolve in manifest.")
-
-    rows = conn.execute(
-        "SELECT edge_uuid, data_type, name, series_id, canonical_unit, timeseries_type, retention "
-        "FROM energydb.series WHERE edge_uuid::text = ANY(%s)",
-        (edge_uuids,),
-    ).fetchall()
-    lookup = _series_lookup_df(rows, "edge_uuid")
-
-    resolved = manifest.join(
-        lookup,
-        left_on=["edge_uuid", "data_type", "name"],
-        right_on=["edge_uuid", "_dt", "_name"],
-        how="left",
-    ).drop("_dt", "_name", strict=False)
-
-    _raise_on_unresolved(resolved, "edge_uuid")
+    _raise_on_unresolved(resolved, owner_col)
     return resolved
 
 

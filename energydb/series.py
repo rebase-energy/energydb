@@ -145,16 +145,19 @@ def resolve_for_read(
     rows = conn.execute(sql, params).fetchall()
 
     return pl.DataFrame(
-        {
-            "series_id": [r[0] for r in rows],
-            "canonical_unit": [r[1] for r in rows],
-            "timeseries_type": [r[2] for r in rows],
-            "retention": [r[3] for r in rows],
-            "node_uuid": [str(r[4]) if r[4] is not None else None for r in rows],
-            "edge_uuid": [str(r[5]) if r[5] is not None else None for r in rows],
-            "data_type": [r[6] for r in rows],
-            "name": [r[7] for r in rows],
-        },
+        [
+            {
+                "series_id": r[0],
+                "canonical_unit": r[1],
+                "timeseries_type": r[2],
+                "retention": r[3],
+                "node_uuid": str(r[4]) if r[4] is not None else None,
+                "edge_uuid": str(r[5]) if r[5] is not None else None,
+                "data_type": r[6],
+                "name": r[7],
+            }
+            for r in rows
+        ],
         schema={
             "series_id": pl.Int64,
             "canonical_unit": pl.Utf8,
