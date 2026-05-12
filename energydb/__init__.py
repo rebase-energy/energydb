@@ -1,6 +1,10 @@
 """EnergyDB — Energy database extending TimeDB with hierarchical asset management."""
 
-from energydatamodel import (
+from dotenv import find_dotenv, load_dotenv
+
+load_dotenv(find_dotenv())
+
+from energydatamodel import (  # noqa: E402
     # Areas
     Area,
     # Semantic bases
@@ -53,7 +57,7 @@ from energydatamodel import (
     weather,
     wind,
 )
-from timedatamodel import (
+from timedatamodel import (  # noqa: E402
     DataShape,
     DataType,
     Frequency,
@@ -61,11 +65,11 @@ from timedatamodel import (
     TimeSeriesType,
 )
 
-from energydb._transaction import Transaction
-from energydb.client import Client
-from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
-from energydb.scope import EdgeScope, NodeScope
-from energydb.units import IncompatibleUnitError
+from energydb._transaction import Transaction  # noqa: E402
+from energydb.client import Client  # noqa: E402
+from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff  # noqa: E402
+from energydb.scope import EdgeScope, NodeScope  # noqa: E402
+from energydb.units import IncompatibleUnitError  # noqa: E402
 
 __all__ = [
     # Client
