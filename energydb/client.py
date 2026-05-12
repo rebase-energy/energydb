@@ -36,7 +36,7 @@ import polars as pl
 from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
-from timedb import TimeDBClient
+from timedb import TimeDBClient, profiling
 
 from energydb import runs as runs_mod
 from energydb._frames import OutputType, to_output, to_polars
@@ -459,10 +459,12 @@ class Client:
         Series must already be registered (typically via
         :meth:`register_tree`). Returns the ``run_id`` used.
         """
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            df_pl = to_polars(df)
         return write_manifest(
             self._pool,
             self.td,
-            to_polars(df),
+            df_pl,
             knowledge_time=knowledge_time,
             run_id=run_id,
             workflow_id=workflow_id,
@@ -490,10 +492,12 @@ class Client:
         Accepts pandas or polars on input. Returns pandas by default; pass
         ``output="polars"`` for a polars DataFrame.
         """
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            manifest = to_polars(df)
         result = read_manifest(
             self._pool,
             self.td,
-            to_polars(df),
+            manifest,
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -502,7 +506,8 @@ class Client:
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
         )
-        return to_output(result, output)
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            return to_output(result, output)
 
     def read_relative(
         self,
@@ -520,8 +525,11 @@ class Client:
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
         """
-        result = read_relative_manifest(self._pool, self.td, to_polars(df), unit=unit, **td_kwargs)
-        return to_output(result, output)
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            manifest = to_polars(df)
+        result = read_relative_manifest(self._pool, self.td, manifest, unit=unit, **td_kwargs)
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            return to_output(result, output)
 
     # ------------------------------------------------------------------
     # Runs

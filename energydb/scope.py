@@ -17,6 +17,7 @@ resolution query and execute.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
@@ -27,6 +28,7 @@ import pandas as pd
 import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
+from timedb import profiling
 
 from energydb import series as series_mod
 from energydb._frames import OutputType, to_output, to_polars
@@ -206,12 +208,25 @@ class _BaseScope:
         (caller MUST NOT call ``.commit()`` / ``.rollback()``). Otherwise
         borrow from the pool; mutators are responsible for explicit
         ``commit()`` or ``rollback()``.
+
+        Only the pool *acquire* is timed as ``edb.conn_acquire`` — the body
+        of the caller's ``with`` block is its own work and is timed elsewhere.
+        Errors during the body propagate through the pool context manager's
+        ``__exit__`` so connection cleanup / rollback semantics are preserved.
         """
         if self._txn is not None:
             yield self._txn._conn
+            return
+        cm = self._pool.connection()
+        with profiling._phase(profiling.PHASE_EDB_CONN_ACQUIRE):
+            conn = cm.__enter__()
+        try:
+            yield conn
+        except BaseException:
+            if not cm.__exit__(*sys.exc_info()):
+                raise
         else:
-            with self._pool.connection() as conn:
-                yield conn
+            cm.__exit__(None, None, None)
 
     # -- subclass contract (overridden in NodeScope / EdgeScope) -------
 
@@ -341,14 +356,17 @@ class _BaseScope:
             _ts_io_unsupported_in_txn("write")
         with self._use_conn() as conn:
             owner_val = self._resolve_uuid(conn)
-        manifest = _attach_routing(
-            to_polars(df),
-            owner_col=self._owner_col,
-            owner_val=owner_val,
-            data_type=data_type,
-            name=name,
-            unit=unit,
-        )
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            df_pl = to_polars(df)
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            manifest = _attach_routing(
+                df_pl,
+                owner_col=self._owner_col,
+                owner_val=owner_val,
+                data_type=data_type,
+                name=name,
+                unit=unit,
+            )
         return self._client.write(
             manifest,
             knowledge_time=knowledge_time,
@@ -541,30 +559,31 @@ class NodeScope(_BaseScope):
         raise ValueError("NodeScope has no path or uuid to resolve.")
 
     def _resolve_target_node_uuids(self, conn) -> list[UUID]:
-        root_uuid = self._resolve_node_uuid(conn)
-        if not self._where_filters:
-            return resolve_subtree_uuids(conn, root_uuid)
+        with profiling._phase(profiling.PHASE_EDB_RESOLVE_SUBTREE):
+            root_uuid = self._resolve_node_uuid(conn)
+            if not self._where_filters:
+                return resolve_subtree_uuids(conn, root_uuid)
 
-        # Subtree + filters in one round-trip: the recursive CTE materializes
-        # the candidate set, the outer SELECT applies the predicates.
-        filter_conds, filter_params = build_filter_conditions(
-            self._where_filters, type_col="node_type", table_alias="n"
-        )
-        extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
-        sql = f"""
-            WITH RECURSIVE subtree AS (
-                SELECT uuid FROM energydb.node WHERE uuid = %s
-                UNION ALL
-                SELECT n.uuid FROM energydb.node n
-                JOIN subtree s ON n.parent_uuid = s.uuid
-            ) CYCLE uuid SET _is_cycle USING _cycle_path
-            SELECT n.uuid
-            FROM energydb.node n
-            JOIN subtree s ON n.uuid = s.uuid
-            WHERE NOT s._is_cycle{extra}
-        """
-        rows = conn.execute(sql, (root_uuid, *filter_params)).fetchall()
-        return [r[0] for r in rows]
+            # Subtree + filters in one round-trip: the recursive CTE materializes
+            # the candidate set, the outer SELECT applies the predicates.
+            filter_conds, filter_params = build_filter_conditions(
+                self._where_filters, type_col="node_type", table_alias="n"
+            )
+            extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
+            sql = f"""
+                WITH RECURSIVE subtree AS (
+                    SELECT uuid FROM energydb.node WHERE uuid = %s
+                    UNION ALL
+                    SELECT n.uuid FROM energydb.node n
+                    JOIN subtree s ON n.parent_uuid = s.uuid
+                ) CYCLE uuid SET _is_cycle USING _cycle_path
+                SELECT n.uuid
+                FROM energydb.node n
+                JOIN subtree s ON n.uuid = s.uuid
+                WHERE NOT s._is_cycle{extra}
+            """
+            rows = conn.execute(sql, (root_uuid, *filter_params)).fetchall()
+            return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # Get / hierarchy queries
@@ -774,16 +793,18 @@ class NodeScope(_BaseScope):
             if not target_uuids:
                 return None
             data_type_str = str(data_type).lower() if data_type else None
-            meta = series_mod.resolve_for_read(
-                conn,
-                owner_col="node_uuid",
-                owner_uuids=target_uuids,
-                data_type=data_type_str,
-                name=name,
-            )
+            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                meta = series_mod.resolve_for_read(
+                    conn,
+                    owner_col="node_uuid",
+                    owner_uuids=target_uuids,
+                    data_type=data_type_str,
+                    name=name,
+                )
         if meta.is_empty():
             return None
-        return meta.select(["node_uuid", "data_type", "name"]).unique()
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            return meta.select(["node_uuid", "data_type", "name"]).unique()
 
 
 # ---------------------------------------------------------------------------
@@ -980,13 +1001,15 @@ class EdgeScope(_BaseScope):
         with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None
-            meta = series_mod.resolve_for_read(
-                conn,
-                owner_col="edge_uuid",
-                owner_uuids=[edge_uuid],
-                data_type=data_type_str,
-                name=name,
-            )
+            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                meta = series_mod.resolve_for_read(
+                    conn,
+                    owner_col="edge_uuid",
+                    owner_uuids=[edge_uuid],
+                    data_type=data_type_str,
+                    name=name,
+                )
         if meta.is_empty():
             return None
-        return meta.select(["edge_uuid", "data_type", "name"]).unique()
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            return meta.select(["edge_uuid", "data_type", "name"]).unique()

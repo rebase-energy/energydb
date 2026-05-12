@@ -24,3 +24,4 @@ services:
       - "127.0.0.1:9000:9000"
     volumes:
       - ./chdata:/var/lib/clickhouse
+      - ./users.d/http_field_size.xml:/etc/clickhouse-server/users.d/http_field_size.xml:ro

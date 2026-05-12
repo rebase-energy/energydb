@@ -10,16 +10,39 @@ read pipeline and one write pipeline in the library.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 import polars as pl
+from timedb import profiling
 
 from energydb import runs as runs_mod
 from energydb._join import join_edge_hierarchy, join_hierarchy, meta_from_resolved_manifest
 from energydb._persist import apply_manifest_unit_conversion
 from energydb.paths import resolve_manifest
 from energydb.units import compute_unit_factor
+
+
+@contextmanager
+def _acquire_conn(pool):
+    """Borrow a connection from ``pool``, timing only the acquisition.
+
+    Errors during the body propagate through the pool context manager's
+    ``__exit__`` so connection cleanup / rollback semantics are preserved.
+    """
+    cm = pool.connection()
+    with profiling._phase(profiling.PHASE_EDB_CONN_ACQUIRE):
+        conn = cm.__enter__()
+    try:
+        yield conn
+    except BaseException:
+        if not cm.__exit__(*sys.exc_info()):
+            raise
+    else:
+        cm.__exit__(None, None, None)
+
 
 # ---------------------------------------------------------------------------
 # Write
@@ -60,8 +83,9 @@ def write_manifest(
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
 
-    with pool.connection() as conn:
-        resolved = resolve_manifest(conn, df)
+    with _acquire_conn(pool) as conn:
+        with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+            resolved = resolve_manifest(conn, df)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
         overlapping = resolved.filter(pl.col("timeseries_type") == "OVERLAPPING")
@@ -72,22 +96,25 @@ def write_manifest(
                 "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
             )
 
-        runs_mod.upsert_run(
-            conn,
-            run_id=rid,
-            workflow_id=workflow_id,
-            model_name=model_name,
-            run_start_time=run_start_time or datetime.now(UTC),
-            run_finish_time=run_finish_time,
-            run_params=run_params,
-        )
-        conn.commit()
+        with profiling._phase(profiling.PHASE_EDB_RUNS_UPSERT):
+            runs_mod.upsert_run(
+                conn,
+                run_id=rid,
+                workflow_id=workflow_id,
+                model_name=model_name,
+                run_start_time=run_start_time or datetime.now(UTC),
+                run_finish_time=run_finish_time,
+                run_params=run_params,
+            )
+            conn.commit()
 
     if "unit" in resolved.columns:
-        resolved = apply_manifest_unit_conversion(resolved)
+        with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
+            resolved = apply_manifest_unit_conversion(resolved)
 
-    keep = [c for c in resolved.columns if c not in _ROUTING_AND_META_COLS]
-    write_df = resolved.select(keep).with_columns(pl.lit(rid, dtype=pl.Int64).alias("run_id"))
+    with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+        keep = [c for c in resolved.columns if c not in _ROUTING_AND_META_COLS]
+        write_df = resolved.select(keep).with_columns(pl.lit(rid, dtype=pl.Int64).alias("run_id"))
 
     # PG state is committed; CH write happens after. A CH failure leaves an
     # orphaned runs row but no PG inconsistency — detectable by run_id.
@@ -115,19 +142,23 @@ def _read_pipeline(
     relative-window args, etc.).
     """
     is_edge = "edge_uuid" in manifest.columns
-    with pool.connection() as conn:
-        resolved = resolve_manifest(conn, manifest)
-        meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
-        series_ids = meta["series_id"].unique().to_list()
-        retentions = meta["retention"].unique().to_list()
+    with _acquire_conn(pool) as conn:
+        with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+            resolved = resolve_manifest(conn, manifest)
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
+            series_ids = meta["series_id"].unique().to_list()
+            retentions = meta["retention"].unique().to_list()
         result = td_call(series_ids, retentions)
         if result.is_empty():
             return result
         if unit is not None:
-            result = apply_per_series_unit(result, meta, unit)
-        if is_edge:
-            return join_edge_hierarchy(conn, result, meta)
-        return join_hierarchy(conn, result, meta)
+            with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
+                result = apply_per_series_unit(result, meta, unit)
+        with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
+            if is_edge:
+                return join_edge_hierarchy(conn, result, meta)
+            return join_hierarchy(conn, result, meta)
 
 
 def read_manifest(
