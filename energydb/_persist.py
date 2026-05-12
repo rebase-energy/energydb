@@ -17,7 +17,7 @@ Edge endpoints are written straight into the FK columns
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import energydatamodel as edm
@@ -28,6 +28,7 @@ from timedatamodel import TimeSeries, TimeSeriesType
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.serialization import serialize_edge, serialize_node
+from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
 # Node / edge persistence
@@ -51,7 +52,7 @@ def create_node(conn, edm_obj, *, parent_uuid: UUID | None) -> UUID:
         (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, row_data["data"]),
     )
 
-    register_node_descriptors(conn, uuid_val, edm_obj)
+    _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
     return uuid_val
 
 
@@ -105,7 +106,7 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
                 f"Edge type is immutable for a given id."
             )
 
-    register_edge_descriptors(conn, uuid_val, edm_obj)
+    _register_descriptors(conn, owner_col="edge_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
     return uuid_val
 
 
@@ -169,31 +170,42 @@ def register_tree_under(
     _validate_no_inline_data(edm_obj)
 
     target_nodes, target_edges, node_objs, edge_objs, root_uuid = _collect_target_state(edm_obj, parent_uuid)
-    current_nodes = _fetch_nodes_by_uuids(conn, list(target_nodes.keys()))
-    current_edges = _fetch_edges_by_uuids(conn, list(target_edges.keys()))
+    existing_node_uuids = _existing_uuids(conn, "node", list(target_nodes.keys()))
+    existing_edge_uuids = _existing_uuids(conn, "edge", list(target_edges.keys()))
 
-    if current_nodes or current_edges:
-        existing_nodes = ", ".join(f"{s.node_type}({s.name!r})" for s in current_nodes.values())
-        existing_edges = ", ".join(f"{s.edge_type}({s.name!r})" for s in current_edges.values())
+    if existing_node_uuids or existing_edge_uuids:
         parts = []
-        if existing_nodes:
-            parts.append(f"node(s): {existing_nodes}")
-        if existing_edges:
-            parts.append(f"edge(s): {existing_edges}")
+        if existing_node_uuids:
+            parts.append(f"node uuid(s): {', '.join(str(u) for u in existing_node_uuids)}")
+        if existing_edge_uuids:
+            parts.append(f"edge uuid(s): {', '.join(str(u) for u in existing_edge_uuids)}")
         raise ValueError(
-            f"register_tree is create-only; the payload contains {len(current_nodes)} "
-            f"node(s) and {len(current_edges)} edge(s) whose UUIDs already exist "
-            f"({'; '.join(parts)}). To modify existing rows use scope mutators "
+            f"register_tree is create-only; the payload contains "
+            f"{len(existing_node_uuids)} node(s) and {len(existing_edge_uuids)} "
+            f"edge(s) whose UUIDs already exist ({'; '.join(parts)}). "
+            f"To modify existing rows use scope mutators "
             f"(client.get_node(...).rename(), .update(), .delete(), .move_to()) "
             f"or batch them with client.transaction()."
         )
 
-    diff = _compute_diff(target_nodes, target_edges)
+    # Create-only path: every target row is an insert. No need for an
+    # update/delete branch — the existing-uuid pre-check above raises.
+    diff = TreeDiff(
+        node_changes=[NodeChange(old=None, new=s) for s in target_nodes.values()],
+        edge_changes=[EdgeChange(old=None, new=s) for s in target_edges.values()],
+    )
 
     if dry_run:
         return root_uuid, diff
 
-    _apply_diff(conn, edm_obj, node_objs, edge_objs, target_nodes)
+    # node_objs is in DFS order (parent-before-child) — exactly what the
+    # parent_uuid FK chain needs. Edges go second once their endpoints exist.
+    # Series declarations attached to each owner are registered as a side
+    # effect of create_node / create_edge.
+    for uid, obj in node_objs.items():
+        create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid)
+    for obj in edge_objs.values():
+        create_edge(conn, obj, tree_root=edm_obj)
     return root_uuid, diff
 
 
@@ -276,50 +288,22 @@ def _collect_target_state(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_subtree_state(
-    conn,
-    root_uuid: UUID,
-) -> tuple[dict[UUID, NodeSnapshot], dict[UUID, EdgeSnapshot]]:
-    """Recursive CTE: fetch every node and edge under ``root_uuid``."""
-    node_rows = conn.execute(
-        """
-        WITH RECURSIVE subtree AS (
-            SELECT uuid, node_type, name, parent_uuid, data
-            FROM energydb.node WHERE uuid = %s
-            UNION ALL
-            SELECT n.uuid, n.node_type, n.name, n.parent_uuid, n.data
-            FROM energydb.node n JOIN subtree s ON n.parent_uuid = s.uuid
-        ) CYCLE uuid SET _is_cycle USING _cycle_path
-        SELECT uuid, node_type, name, parent_uuid, data FROM subtree
-        WHERE NOT _is_cycle
-        """,
-        (root_uuid,),
-    ).fetchall()
-    nodes = {
-        r[0]: NodeSnapshot(uuid=r[0], node_type=r[1], name=r[2], parent_uuid=r[3], data=dict(r[4] or {}))
-        for r in node_rows
-    }
-    if not nodes:
-        return nodes, {}
+def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
+    """Return the subset of ``uuids`` that exist in ``energydb.{table}``.
 
-    edge_rows = conn.execute(
-        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data "
-        "FROM energydb.edge "
-        "WHERE from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s)",
-        (list(nodes.keys()), list(nodes.keys())),
+    Lighter than ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids``
+    when the caller only needs to know *whether* the rows exist (e.g. the
+    create-only pre-check on ``register_tree``). ``table`` is interpolated
+    into the SQL and must be one of the trusted internal values
+    ``"node"`` / ``"edge"``.
+    """
+    if not uuids:
+        return []
+    rows = conn.execute(
+        f"SELECT uuid FROM energydb.{table} WHERE uuid = ANY(%s)",
+        (uuids,),
     ).fetchall()
-    edges = {
-        r[0]: EdgeSnapshot(
-            uuid=r[0],
-            edge_type=r[1],
-            name=r[2],
-            from_node_uuid=r[3],
-            to_node_uuid=r[4],
-            data=dict(r[5] or {}),
-        )
-        for r in edge_rows
-    }
-    return nodes, edges
+    return [r[0] for r in rows]
 
 
 def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
@@ -354,53 +338,6 @@ def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Compute diff
-# ---------------------------------------------------------------------------
-
-
-def _compute_diff(
-    target_nodes: dict[UUID, NodeSnapshot],
-    target_edges: dict[UUID, EdgeSnapshot],
-) -> TreeDiff:
-    """Build an insert-only diff from the target state.
-
-    ``register_tree_under`` is create-only; the existing-uuid pre-check it
-    runs before calling here guarantees every target row is a brand-new
-    insert. There is no update or delete branch to compute.
-    """
-    return TreeDiff(
-        node_changes=[NodeChange(old=None, new=s) for s in target_nodes.values()],
-        edge_changes=[EdgeChange(old=None, new=s) for s in target_edges.values()],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Apply diff
-# ---------------------------------------------------------------------------
-
-
-def _apply_diff(
-    conn,
-    edm_obj,
-    node_objs: dict[UUID, Any],
-    edge_objs: dict[UUID, Any],
-    target_nodes: dict[UUID, NodeSnapshot],
-) -> None:
-    """Apply a create-only diff to the database.
-
-    ``node_objs`` is in DFS order, which is parent-before-child — exactly
-    what the parent_uuid FK chain needs. Edges go second once their
-    endpoints are guaranteed to exist. Series declarations attached to
-    each owner are registered as a side effect of
-    :func:`create_node` / :func:`create_edge`.
-    """
-    for uid, obj in node_objs.items():
-        create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid)
-    for obj in edge_objs.values():
-        create_edge(conn, obj, tree_root=edm_obj)
-
-
 def _validate_no_inline_data(edm_obj) -> None:
     """Raise if any node/edge in the tree carries non-empty TimeSeries data.
 
@@ -430,29 +367,16 @@ def _validate_no_inline_data(edm_obj) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register_node_descriptors(conn, node_uuid: UUID, edm_obj) -> None:
-    """Walk ``edm_obj.timeseries`` and register every entry on this node."""
-    ts_list = getattr(edm_obj, "timeseries", None)
-    if not ts_list:
-        return
-    for ts in ts_list:
-        _register_one(conn, node_uuid=node_uuid, edge_uuid=None, ts=ts)
-
-
-def register_edge_descriptors(conn, edge_uuid: UUID, edm_obj) -> None:
-    ts_list = getattr(edm_obj, "timeseries", None)
-    if not ts_list:
-        return
-    for ts in ts_list:
-        _register_one(conn, node_uuid=None, edge_uuid=edge_uuid, ts=ts)
+def _register_descriptors(
+    conn, *, owner_col: Literal["node_uuid", "edge_uuid"], owner_uuid: UUID, edm_obj
+) -> None:
+    """Walk ``edm_obj.timeseries`` and register every entry on this owner."""
+    for ts in getattr(edm_obj, "timeseries", None) or []:
+        _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts)
 
 
 def _register_one(
-    conn,
-    *,
-    node_uuid: UUID | None,
-    edge_uuid: UUID | None,
-    ts: TimeSeries,
+    conn, *, owner_col: Literal["node_uuid", "edge_uuid"], owner_uuid: UUID, ts: TimeSeries
 ) -> int:
     """Register one series row using ``series_mod.register_series``."""
     name = ts.name
@@ -470,8 +394,8 @@ def _register_one(
 
     return series_mod.register_series(
         conn,
-        node_uuid=node_uuid,
-        edge_uuid=edge_uuid,
+        owner_col=owner_col,
+        owner_uuid=owner_uuid,
         data_type=data_type,
         name=name,
         canonical_unit=canonical_unit,
@@ -491,8 +415,6 @@ def apply_manifest_unit_conversion(resolved: pl.DataFrame) -> pl.DataFrame:
     Operates on the unique (unit, canonical_unit) pairs so factor lookup runs
     once per pair rather than per row.
     """
-    from energydb.units import compute_unit_factor
-
     pairs = resolved.select(["unit", "canonical_unit"]).unique()
     factor_rows: list[dict[str, Any]] = []
     for row in pairs.iter_rows(named=True):

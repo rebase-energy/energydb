@@ -46,7 +46,7 @@ from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
     Path,
-    build_node_filter_conditions,
+    build_filter_conditions,
     resolve_node_uuid,
     resolve_subtree_uuids,
 )
@@ -262,7 +262,7 @@ class Client:
             where_filters["node_type"] = type
 
         with self._pool.connection() as conn:
-            filter_conds, filter_params = build_node_filter_conditions(where_filters)
+            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
             conditions: list[str] = list(filter_conds)
             params: list[Any] = list(filter_params)
 
@@ -310,9 +310,14 @@ class Client:
         ``within`` (path tuple/list, a single name as str, or a :class:`UUID`)
         restricts to edges where either endpoint is in that subtree.
         """
+        where_filters: dict[str, Any] = dict(property_filters)
+        if type is not None:
+            where_filters["edge_type"] = type
+
         with self._pool.connection() as conn:
-            conditions: list[str] = []
-            params: list[Any] = []
+            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
+            conditions: list[str] = list(filter_conds)
+            params: list[Any] = list(filter_params)
 
             if within is not None:
                 within_uuid = (
@@ -322,15 +327,6 @@ class Client:
                 conditions.append("(from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s))")
                 params.append(subtree)
                 params.append(subtree)
-
-            if type is not None:
-                conditions.append("edge_type = %s")
-                params.append(type)
-
-            for key, value in property_filters.items():
-                conditions.append("data->>%s = %s")
-                params.append(key)
-                params.append(str(value))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
@@ -370,6 +366,12 @@ class Client:
         With ``include_series=True``, every reconstructed node has its
         registered series attached as metadata-only :class:`TimeSeries`
         entries (``df=None``) on ``timeseries``.
+
+        **Edges are intentionally not attached to the returned tree.**
+        The result is a node-only subtree walked via ``parent_uuid``.
+        Edges (and their series) live alongside nodes in the schema but
+        outside the tree shape — query them separately with
+        :meth:`get_edge` or :meth:`query_edges`.
         """
         with self._pool.connection() as conn:
             if uuid is not None:
@@ -514,6 +516,9 @@ class Client:
 
         Accepts pandas or polars on input. Returns pandas by default; pass
         ``output="polars"`` for a polars DataFrame.
+
+        ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
+        see that signature for accepted arguments (window selectors, etc.).
         """
         result = read_relative_manifest(self._pool, self.td, to_polars(df), unit=unit, **td_kwargs)
         return to_output(result, output)

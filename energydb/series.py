@@ -1,8 +1,12 @@
-"""Series-table operations: register, resolve for write, resolve for read.
+"""Series-table operations: register, resolve for read.
 
 The series table is owned by exactly one of ``node_uuid`` / ``edge_uuid``
-(DB CHECK enforces). ``series_id BIGINT`` stays as the timedb-internal
-handle — it never leaves the energydb / timedb pair.
+(DB CHECK enforces). Internal APIs use a single ``(owner_col, owner_uuid)``
+shape — callers always know which side they're on, so encoding "set one,
+leave the other None" buys nothing.
+
+``series_id BIGINT`` stays as the timedb-internal handle — it never leaves
+the energydb / timedb pair.
 
 Retention tier names are owned by timedb (see :data:`timedb.RETENTION_TIERS`).
 energydb consumes the set as a runtime guard but does not encode the values
@@ -12,11 +16,13 @@ migration.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import polars as pl
 from timedb import RETENTION_TIERS
+
+OwnerCol = Literal["node_uuid", "edge_uuid"]
 
 _VALID_TIMESERIES_TYPES = {"FLAT", "OVERLAPPING"}
 
@@ -25,6 +31,11 @@ _VALID_TIMESERIES_TYPES = {"FLAT", "OVERLAPPING"}
 _DEFAULT_RETENTION_BY_SHAPE = {
     "FLAT": "forever",
     "OVERLAPPING": "medium",
+}
+
+_CONFLICT_CONSTRAINT_BY_OWNER = {
+    "node_uuid": "series_node_uniq",
+    "edge_uuid": "series_edge_uniq",
 }
 
 
@@ -41,8 +52,8 @@ def _validate_retention(retention: str) -> None:
 def register_series(
     conn,
     *,
-    node_uuid: UUID | None,
-    edge_uuid: UUID | None,
+    owner_col: OwnerCol,
+    owner_uuid: UUID,
     data_type: str,
     name: str,
     canonical_unit: str,
@@ -50,23 +61,26 @@ def register_series(
     retention: str | None = None,
     description: str | None = None,
 ) -> int:
-    """Insert a new series row; return its series_id.
+    """Insert a new series row owned by ``owner_uuid``; return its series_id.
 
-    Owner is exactly one of node_uuid/edge_uuid (DB CHECK enforces).
-    ``retention``, ``canonical_unit``, and the owner are immutable after
-    insert (DB trigger enforces). ``timeseries_type`` is mutable.
+    ``owner_col`` is one of ``"node_uuid"`` / ``"edge_uuid"``. The DB
+    CHECK enforces that exactly one of those columns is non-null on each
+    row. ``retention``, ``canonical_unit``, and the owner are immutable
+    after insert (DB trigger enforces). ``timeseries_type`` is mutable.
 
     If ``retention`` is omitted, it is derived from ``timeseries_type``:
     FLAT (actuals) → ``"forever"``, OVERLAPPING (forecasts) → ``"medium"``.
     """
-    if (node_uuid is None) == (edge_uuid is None):
-        raise ValueError("Exactly one of node_uuid or edge_uuid must be set.")
     _validate_timeseries_type(timeseries_type)
     if retention is None:
         retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
     _validate_retention(retention)
 
-    conflict_constraint = "series_node_uniq" if node_uuid is not None else "series_edge_uniq"
+    # Populate the right column based on owner_col; the other stays NULL.
+    node_uuid = owner_uuid if owner_col == "node_uuid" else None
+    edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
+    conflict_constraint = _CONFLICT_CONSTRAINT_BY_OWNER[owner_col]
+
     row = conn.execute(
         f"""
         INSERT INTO energydb.series
@@ -83,20 +97,18 @@ def register_series(
         return row[0]
 
     # Conflict: fetch the existing row and verify the immutable fields agree.
-    owner_col = "node_uuid" if node_uuid is not None else "edge_uuid"
-    owner_val = node_uuid if node_uuid is not None else edge_uuid
     existing = conn.execute(
         f"SELECT series_id, canonical_unit, retention "
         f"FROM energydb.series "
         f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
-        (owner_val, data_type, name),
+        (owner_uuid, data_type, name),
     ).fetchone()
     if existing is None:
         raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
     existing_sid, existing_unit, existing_retention = existing
     if existing_unit != canonical_unit or existing_retention != retention:
         raise ValueError(
-            f"Series ({owner_col}={owner_val}, data_type={data_type!r}, name={name!r}) "
+            f"Series ({owner_col}={owner_uuid}, data_type={data_type!r}, name={name!r}) "
             f"already exists with canonical_unit={existing_unit!r}, "
             f"retention={existing_retention!r}; cannot re-register with "
             f"canonical_unit={canonical_unit!r}, retention={retention!r}. "
@@ -108,8 +120,8 @@ def register_series(
 def resolve_for_read(
     conn,
     *,
-    node_uuids: list[UUID] | None = None,
-    edge_uuids: list[UUID] | None = None,
+    owner_col: OwnerCol,
+    owner_uuids: list[UUID],
     data_type: str | None = None,
     name: str | None = None,
 ) -> pl.DataFrame:
@@ -121,14 +133,8 @@ def resolve_for_read(
     string-form ids the manifest pipeline carries. Empty df if nothing
     matches.
     """
-    if (node_uuids is None) == (edge_uuids is None):
-        raise ValueError("Exactly one of node_uuids or edge_uuids must be set.")
-
-    owner_col = "node_uuid" if node_uuids is not None else "edge_uuid"
-    owner_vals = node_uuids if node_uuids is not None else edge_uuids
-
     conditions = [f"{owner_col} = ANY(%s)"]
-    params: list[Any] = [owner_vals]
+    params: list[Any] = [owner_uuids]
 
     if data_type:
         conditions.append("data_type = %s")

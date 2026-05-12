@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 import pandas as pd
@@ -34,7 +34,7 @@ from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, regi
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
     Path,
-    build_node_filter_conditions,
+    build_filter_conditions,
     resolve_edge_uuid,
     resolve_node_uuid,
     resolve_path,
@@ -215,7 +215,7 @@ class _BaseScope:
 
     # -- subclass contract (overridden in NodeScope / EdgeScope) -------
 
-    _owner_col: str  # "node_uuid" or "edge_uuid" — see series_mod.register_series
+    _owner_col: Literal["node_uuid", "edge_uuid"]
 
     def _resolve_uuid(self, conn) -> UUID:
         raise NotImplementedError
@@ -305,13 +305,10 @@ class _BaseScope:
             description=description,
         )
         with self._use_conn() as conn:
-            owner_uuid = self._resolve_uuid(conn)
-            node_uuid = owner_uuid if self._owner_col == "node_uuid" else None
-            edge_uuid = owner_uuid if self._owner_col == "edge_uuid" else None
             sid = series_mod.register_series(
                 conn,
-                node_uuid=node_uuid,
-                edge_uuid=edge_uuid,
+                owner_col=self._owner_col,
+                owner_uuid=self._resolve_uuid(conn),
                 retention=retention,
                 **args,
             )
@@ -409,6 +406,12 @@ class _BaseScope:
         output: OutputType = "pandas",
         **td_read_kwargs,
     ) -> pl.DataFrame | pd.DataFrame:
+        """Relative-window read for this scope.
+
+        ``**td_read_kwargs`` are forwarded to
+        :meth:`timedb.TimeDBClient.read_relative`; see that signature for
+        accepted window-selector arguments.
+        """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read_relative")
         manifest = self._build_read_manifest(data_type=data_type, name=name)
@@ -544,7 +547,9 @@ class NodeScope(_BaseScope):
 
         # Subtree + filters in one round-trip: the recursive CTE materializes
         # the candidate set, the outer SELECT applies the predicates.
-        filter_conds, filter_params = build_node_filter_conditions(self._where_filters, table_alias="n")
+        filter_conds, filter_params = build_filter_conditions(
+            self._where_filters, type_col="node_type", table_alias="n"
+        )
         extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
         sql = f"""
             WITH RECURSIVE subtree AS (
@@ -771,7 +776,8 @@ class NodeScope(_BaseScope):
             data_type_str = str(data_type).lower() if data_type else None
             meta = series_mod.resolve_for_read(
                 conn,
-                node_uuids=target_uuids,
+                owner_col="node_uuid",
+                owner_uuids=target_uuids,
                 data_type=data_type_str,
                 name=name,
             )
@@ -976,7 +982,8 @@ class EdgeScope(_BaseScope):
             data_type_str = str(data_type).lower() if data_type else None
             meta = series_mod.resolve_for_read(
                 conn,
-                edge_uuids=[edge_uuid],
+                owner_col="edge_uuid",
+                owner_uuids=[edge_uuid],
                 data_type=data_type_str,
                 name=name,
             )

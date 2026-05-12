@@ -142,30 +142,32 @@ def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
 # ---------------------------------------------------------------------------
 
 
-def build_node_filter_conditions(
+def build_filter_conditions(
     where_filters: dict[str, Any],
     *,
+    type_col: str,
     table_alias: str = "",
 ) -> tuple[list[str], list[Any]]:
     """Translate ``where_filters`` into SQL fragments + bind params.
 
-    Recognized structural keys: ``node_type`` (column) and ``name`` (column).
-    Everything else is treated as a JSONB ``data->>`` predicate. Fragments
-    must be joined with ``AND`` by the caller. ``table_alias`` (e.g. ``"n"``)
-    is prefixed to each column reference when the filter is composed against
-    an aliased table in a join.
+    Recognized structural keys: ``type_col`` (typically ``"node_type"`` or
+    ``"edge_type"``) and ``"name"`` — both compared against their own
+    columns. Everything else is treated as a JSONB ``data->>`` predicate.
+    Fragments must be joined with ``AND`` by the caller. ``table_alias``
+    (e.g. ``"n"``) is prefixed to each column reference when the filter
+    is composed against an aliased table in a join.
     """
     prefix = f"{table_alias}." if table_alias else ""
     conditions: list[str] = []
     params: list[Any] = []
-    if "node_type" in where_filters:
-        conditions.append(f"{prefix}node_type = %s")
-        params.append(where_filters["node_type"])
+    if type_col in where_filters:
+        conditions.append(f"{prefix}{type_col} = %s")
+        params.append(where_filters[type_col])
     if "name" in where_filters:
         conditions.append(f"{prefix}name = %s")
         params.append(where_filters["name"])
     for key, value in where_filters.items():
-        if key in ("node_type", "name"):
+        if key in (type_col, "name"):
             continue
         conditions.append(f"{prefix}data->>%s = %s")
         params.append(key)

@@ -59,8 +59,8 @@ class TestRegisterSeriesShapeDefault:
         conn = self._mock_conn()
         series_mod.register_series(
             conn,
-            node_uuid=uuid4(),
-            edge_uuid=None,
+            owner_col="node_uuid",
+            owner_uuid=uuid4(),
             data_type="actual",
             name="power",
             canonical_unit="MW",
@@ -78,8 +78,8 @@ class TestRegisterSeriesShapeDefault:
         conn = self._mock_conn()
         series_mod.register_series(
             conn,
-            node_uuid=uuid4(),
-            edge_uuid=None,
+            owner_col="node_uuid",
+            owner_uuid=uuid4(),
             data_type="forecast",
             name="power",
             canonical_unit="MW",
@@ -96,8 +96,8 @@ class TestRegisterSeriesShapeDefault:
         conn = self._mock_conn()
         series_mod.register_series(
             conn,
-            node_uuid=uuid4(),
-            edge_uuid=None,
+            owner_col="node_uuid",
+            owner_uuid=uuid4(),
             data_type="actual",
             name="power",
             canonical_unit="MW",

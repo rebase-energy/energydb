@@ -19,6 +19,7 @@ from energydb import runs as runs_mod
 from energydb._join import join_edge_hierarchy, join_hierarchy, meta_from_resolved_manifest
 from energydb._persist import apply_manifest_unit_conversion
 from energydb.paths import resolve_manifest
+from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
 # Write
@@ -167,7 +168,11 @@ def read_relative_manifest(
     unit: str | None = None,
     **td_kwargs,
 ) -> pl.DataFrame:
-    """Bulk relative read via manifest."""
+    """Bulk relative read via manifest.
+
+    ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
+    see that signature for accepted arguments.
+    """
 
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
@@ -185,8 +190,6 @@ def apply_per_series_unit(
     Single join over (series_id, canonical_unit). Factor computed once per
     unique canonical_unit.
     """
-    from energydb.units import compute_unit_factor
-
     unique_units = meta["canonical_unit"].unique().to_list()
     factors = {u: (compute_unit_factor(u, requested_unit) or 1.0) for u in unique_units}
     factor_df = pl.DataFrame(

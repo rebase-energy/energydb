@@ -13,6 +13,7 @@ Identity is the EDM ``Element.id`` (UUID7) — round-tripped as the row's
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Any
 from uuid import UUID
 
@@ -27,9 +28,29 @@ _NODE_EXCLUDES = {"id", "timeseries"}
 _EDGE_EXCLUDES = {"id", "from_element", "to_element", "timeseries"}
 
 
+@cache
 def _type_registry() -> dict[str, type]:
-    """Name → class lookup for every EDM Element subclass (legacy re-export)."""
+    """Name → class lookup for every EDM Element subclass.
+
+    Cached for the process lifetime — the EDM class hierarchy is fixed at
+    import time, so we don't need to re-walk it on every reconstruct call.
+    """
     return get_registry()
+
+
+def _build_storage_dict(row: dict[str, Any], *, type_col: str) -> dict[str, Any]:
+    """Build the JSON dict that ``edm.element_from_json`` consumes.
+
+    Pulls the JSONB ``data`` blob, stamps the structural columns
+    (``__type__``, ``name``, ``id``) back on, and returns the result.
+    """
+    data = dict(row.get("data") or {})
+    data["__type__"] = row[type_col]
+    if row.get("name"):
+        data["name"] = row["name"]
+    uuid_val = row["uuid"]
+    data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -71,14 +92,7 @@ def reconstruct_node(row: dict[str, Any]):
     if not issubclass(cls, (edm.Node, edm.Collection)):
         raise TypeError(f"node table row has type {node_type} which is not a Node or Collection subclass")
 
-    data = dict(row.get("data") or {})
-    data["__type__"] = node_type
-    if row.get("name"):
-        data["name"] = row["name"]
-    # Carry the persistent uuid into the EDM ``id`` field via the wire format.
-    uuid_val = row["uuid"]
-    data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
-    return edm.element_from_json(data)
+    return edm.element_from_json(_build_storage_dict(row, type_col="node_type"))
 
 
 # ---------------------------------------------------------------------------
@@ -120,18 +134,11 @@ def reconstruct_edge(row: dict[str, Any]):
     if not issubclass(cls, edm.Edge):
         raise TypeError(f"edge table row has type {edge_type} which is not an Edge subclass")
 
-    data = dict(row.get("data") or {})
-    data["__type__"] = edge_type
-    if row.get("name"):
-        data["name"] = row["name"]
-    uuid_val = row["uuid"]
-    data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
-
     # Endpoints come from the FK columns, not the JSONB blob — those are
     # the authoritative source. We attach them as ``Reference`` after
     # ``element_from_json`` so stale endpoint refs that might survive in
     # ``data`` are overwritten unconditionally.
-    obj = edm.element_from_json(data)
+    obj = edm.element_from_json(_build_storage_dict(row, type_col="edge_type"))
     from_uuid = row.get("from_node_uuid")
     to_uuid = row.get("to_node_uuid")
     if from_uuid is not None:
