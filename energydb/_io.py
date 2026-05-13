@@ -21,6 +21,7 @@ from timedb import profiling
 from energydb import runs as runs_mod
 from energydb._join import join_edge_hierarchy, join_hierarchy, meta_from_resolved_manifest
 from energydb._persist import apply_manifest_unit_conversion
+from energydb._resolve_cache import SeriesRegistry
 from energydb.paths import resolve_manifest
 from energydb.units import compute_unit_factor
 
@@ -73,6 +74,7 @@ def write_manifest(
     run_start_time: datetime | None = None,
     run_finish_time: datetime | None = None,
     run_params: dict | None = None,
+    registry: SeriesRegistry | None = None,
 ) -> int:
     """Resolve a manifest's routing → series_id and bulk-write.
 
@@ -85,7 +87,7 @@ def write_manifest(
 
     with _acquire_conn(pool) as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            resolved = resolve_manifest(conn, df)
+            resolved = resolve_manifest(conn, df, registry=registry)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
         overlapping = resolved.filter(pl.col("timeseries_type") == "OVERLAPPING")
@@ -133,6 +135,7 @@ def _read_pipeline(
     td_call: Callable[[list[int], list[str]], pl.DataFrame],
     *,
     unit: str | None,
+    registry: SeriesRegistry | None = None,
 ) -> pl.DataFrame:
     """Shared read pipeline: resolve manifest → fetch from timedb → optional
     unit scaling → hierarchy join.
@@ -144,7 +147,7 @@ def _read_pipeline(
     is_edge = "edge_uuid" in manifest.columns
     with _acquire_conn(pool) as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            resolved = resolve_manifest(conn, manifest)
+            resolved = resolve_manifest(conn, manifest, registry=registry)
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
             meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
             series_ids = meta["series_id"].unique().to_list()
@@ -157,8 +160,8 @@ def _read_pipeline(
                 result = apply_per_series_unit(result, meta, unit)
         with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
             if is_edge:
-                return join_edge_hierarchy(conn, result, meta)
-            return join_hierarchy(conn, result, meta)
+                return join_edge_hierarchy(conn, result, meta, registry=registry)
+            return join_hierarchy(conn, result, meta, registry=registry)
 
 
 def read_manifest(
@@ -173,6 +176,7 @@ def read_manifest(
     end_known: datetime | None = None,
     include_updates: bool = False,
     include_knowledge_time: bool = False,
+    registry: SeriesRegistry | None = None,
 ) -> pl.DataFrame:
     """Bulk read via manifest. Detects edge vs node routing automatically."""
 
@@ -188,7 +192,7 @@ def read_manifest(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return _read_pipeline(pool, manifest, _call, unit=unit)
+    return _read_pipeline(pool, manifest, _call, unit=unit, registry=registry)
 
 
 def read_relative_manifest(
@@ -197,6 +201,7 @@ def read_relative_manifest(
     manifest: pl.DataFrame,
     *,
     unit: str | None = None,
+    registry: SeriesRegistry | None = None,
     **td_kwargs,
 ) -> pl.DataFrame:
     """Bulk relative read via manifest.
@@ -208,7 +213,7 @@ def read_relative_manifest(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return _read_pipeline(pool, manifest, _call, unit=unit)
+    return _read_pipeline(pool, manifest, _call, unit=unit, registry=registry)
 
 
 def apply_per_series_unit(

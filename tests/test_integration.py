@@ -230,7 +230,8 @@ def test_retention_immutable_trigger(edb):
 
 
 def test_pandas_in_pandas_out(edb):
-    """A pandas DataFrame goes in, a pandas DataFrame comes out by default."""
+    """A pandas DataFrame goes in, a pandas DataFrame comes out when
+    ``output="pandas"`` is requested."""
     edb.get_node("root").get_node("asset_a").register_series(
         name="capacity",
         canonical_unit="MW",
@@ -250,16 +251,16 @@ def test_pandas_in_pandas_out(edb):
     )
     edb.get_node("root").get_node("asset_a").write(pdf, data_type="actual", name="capacity")
 
-    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity")
+    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity", output="pandas")
     assert isinstance(result, pd.DataFrame)
     assert "valid_time" in result.columns
     assert "value" in result.columns
     assert result["value"].tolist() == [10.0, 11.0, 12.0]
 
 
-def test_pandas_empty_read(edb):
-    """An empty-result read with the default pandas output returns an empty
-    pandas DataFrame, not a polars one."""
+def test_default_polars_empty_read(edb):
+    """An empty-result read with the default polars output returns an empty
+    polars DataFrame."""
     result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="nonexistent")
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0

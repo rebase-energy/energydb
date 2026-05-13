@@ -26,6 +26,7 @@ from energydatamodel.reference import Reference
 from timedatamodel import TimeSeries, TimeSeriesType
 
 from energydb import series as series_mod
+from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.serialization import serialize_edge, serialize_node
 from energydb.units import compute_unit_factor
@@ -35,7 +36,13 @@ from energydb.units import compute_unit_factor
 # ---------------------------------------------------------------------------
 
 
-def create_node(conn, edm_obj, *, parent_uuid: UUID | None) -> UUID:
+def create_node(
+    conn,
+    edm_obj,
+    *,
+    parent_uuid: UUID | None,
+    registry: SeriesRegistry | None = None,
+) -> UUID:
     """Insert one node under ``parent_uuid`` (or as a root if ``None``).
 
     Caller (``_apply_diff``) is create-only and has already verified the
@@ -52,11 +59,17 @@ def create_node(conn, edm_obj, *, parent_uuid: UUID | None) -> UUID:
         (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, row_data["data"]),
     )
 
-    _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
+    _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj, registry=registry)
     return uuid_val
 
 
-def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
+def create_edge(
+    conn,
+    edm_obj,
+    *,
+    tree_root: edm.Element | None = None,
+    registry: SeriesRegistry | None = None,
+) -> UUID:
     """Upsert one edge.
 
     Endpoint UUIDs come from ``edm_obj.from_element`` / ``to_element``
@@ -106,7 +119,7 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
                 f"Edge type is immutable for a given id."
             )
 
-    _register_descriptors(conn, owner_col="edge_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
+    _register_descriptors(conn, owner_col="edge_uuid", owner_uuid=uuid_val, edm_obj=edm_obj, registry=registry)
     return uuid_val
 
 
@@ -148,6 +161,7 @@ def register_tree_under(
     *,
     parent_uuid: UUID | None,
     dry_run: bool = False,
+    registry: SeriesRegistry | None = None,
 ) -> tuple[UUID, TreeDiff]:
     """Walk the EDM tree DFS, insert nodes/edges, register series.
 
@@ -203,9 +217,9 @@ def register_tree_under(
     # Series declarations attached to each owner are registered as a side
     # effect of create_node / create_edge.
     for uid, obj in node_objs.items():
-        create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid)
+        create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid, registry=registry)
     for obj in edge_objs.values():
-        create_edge(conn, obj, tree_root=edm_obj)
+        create_edge(conn, obj, tree_root=edm_obj, registry=registry)
     return root_uuid, diff
 
 
@@ -368,15 +382,25 @@ def _validate_no_inline_data(edm_obj) -> None:
 
 
 def _register_descriptors(
-    conn, *, owner_col: Literal["node_uuid", "edge_uuid"], owner_uuid: UUID, edm_obj
+    conn,
+    *,
+    owner_col: Literal["node_uuid", "edge_uuid"],
+    owner_uuid: UUID,
+    edm_obj,
+    registry: SeriesRegistry | None = None,
 ) -> None:
     """Walk ``edm_obj.timeseries`` and register every entry on this owner."""
     for ts in getattr(edm_obj, "timeseries", None) or []:
-        _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts)
+        _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts, registry=registry)
 
 
 def _register_one(
-    conn, *, owner_col: Literal["node_uuid", "edge_uuid"], owner_uuid: UUID, ts: TimeSeries
+    conn,
+    *,
+    owner_col: Literal["node_uuid", "edge_uuid"],
+    owner_uuid: UUID,
+    ts: TimeSeries,
+    registry: SeriesRegistry | None = None,
 ) -> int:
     """Register one series row using ``series_mod.register_series``."""
     name = ts.name
@@ -401,6 +425,7 @@ def _register_one(
         canonical_unit=canonical_unit,
         timeseries_type=timeseries_type,
         description=ts.description,
+        registry=registry,
     )
 
 

@@ -325,6 +325,7 @@ class _BaseScope:
                 owner_col=self._owner_col,
                 owner_uuid=self._resolve_uuid(conn),
                 retention=retention,
+                registry=self._client._series_registry,
                 **args,
             )
             if self._txn is None:
@@ -390,13 +391,13 @@ class _BaseScope:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-        output: OutputType = "pandas",
+        output: OutputType = "polars",
     ) -> pl.DataFrame | pd.DataFrame:
         """Read time-series data for this scope.
 
         For :class:`NodeScope` the manifest spans the resolved subtree;
-        for :class:`EdgeScope` it's the single edge. Returns pandas by
-        default; pass ``output="polars"`` for polars.
+        for :class:`EdgeScope` it's the single edge. Returns polars by
+        default; pass ``output="pandas"`` for pandas.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
@@ -421,7 +422,7 @@ class _BaseScope:
         data_type: str,
         name: str,
         unit: str | None = None,
-        output: OutputType = "pandas",
+        output: OutputType = "polars",
         **td_read_kwargs,
     ) -> pl.DataFrame | pd.DataFrame:
         """Relative-window read for this scope.
@@ -654,13 +655,20 @@ class NodeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        captured: list[UUID] = []
+
         def _do(conn, node_uuid: UUID) -> None:
+            captured.append(node_uuid)
             conn.execute(
                 "UPDATE energydb.node SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, node_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            # Rename changes the node's name and shifts every descendant's path.
+            self._client._series_registry.evict_node_subtree(str(captured[0]))
+        return result
 
     def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
         """Patch the node's JSONB ``data`` column.
@@ -681,10 +689,18 @@ class NodeScope(_BaseScope):
         return self._apply_mutation(_do, dry_run=dry_run)
 
     def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        captured: list[UUID] = []
+
         def _do(conn, node_uuid: UUID) -> None:
+            captured.append(node_uuid)
             conn.execute("DELETE FROM energydb.node WHERE uuid = %s", (node_uuid,))
 
-        return self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        result = self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        if not dry_run and captured:
+            registry = self._client._series_registry
+            registry.evict_owner(str(captured[0]))
+            registry.evict_node_subtree(str(captured[0]))
+        return result
 
     def move_to(self, target: NodeScope | Path | list[str], *, dry_run: bool = False) -> TreeDiff | None:
         """Re-parent this node to ``target``.
@@ -704,7 +720,10 @@ class NodeScope(_BaseScope):
             target_path = tuple(target)
             target_node_uuid = None
 
+        captured: list[UUID] = []
+
         def _do(conn, node_uuid: UUID) -> None:
+            captured.append(node_uuid)
             if target_path:
                 new_parent_uuid = resolve_node_uuid(conn, target_path, start_uuid=target_node_uuid)
             elif target_node_uuid is not None:
@@ -739,7 +758,11 @@ class NodeScope(_BaseScope):
                 (new_parent_uuid, node_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            # Re-parenting shifts the moved node's path and every descendant's.
+            self._client._series_registry.evict_node_subtree(str(captured[0]))
+        return result
 
     def add(self, edm_obj, *, dry_run: bool = False) -> NodeScope | TreeDiff:
         """Add a new child node (or subtree) under this scope.
@@ -929,13 +952,19 @@ class EdgeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        captured: list[UUID] = []
+
         def _do(conn, edge_uuid: UUID) -> None:
+            captured.append(edge_uuid)
             conn.execute(
                 "UPDATE energydb.edge SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, edge_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            self._client._series_registry.evict_edge(str(captured[0]))
+        return result
 
     def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
         """Patch the edge's JSONB ``data`` column.
@@ -968,7 +997,10 @@ class EdgeScope(_BaseScope):
         surfaces collisions with an existing edge as a Postgres error.
         """
 
+        captured: list[UUID] = []
+
         def _do(conn, edge_uuid: UUID) -> None:
+            captured.append(edge_uuid)
             new_from_uuid = _resolve_endpoint(conn, from_node)
             new_to_uuid = _resolve_endpoint(conn, to_node)
             if new_from_uuid == new_to_uuid:
@@ -978,13 +1010,24 @@ class EdgeScope(_BaseScope):
                 (new_from_uuid, new_to_uuid, edge_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            self._client._series_registry.evict_edge(str(captured[0]))
+        return result
 
     def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        captured: list[UUID] = []
+
         def _do(conn, edge_uuid: UUID) -> None:
+            captured.append(edge_uuid)
             conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (edge_uuid,))
 
-        return self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        result = self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        if not dry_run and captured:
+            registry = self._client._series_registry
+            registry.evict_owner(str(captured[0]))
+            registry.evict_edge(str(captured[0]))
+        return result
 
     # ------------------------------------------------------------------
     # Manifest builder for the shared _BaseScope read/read_relative

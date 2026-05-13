@@ -34,10 +34,13 @@ def _simple_df(n: int = 3) -> pl.DataFrame:
 
 def _mock_client(monkeypatch) -> Client:
     """Build a Client with both pool and td fully mocked."""
+    from energydb._resolve_cache import SeriesRegistry
+
     monkeypatch.setattr(Client, "__init__", lambda self: None)
     client = Client()  # type: ignore[call-arg]
     client._pool = MagicMock()
     client.td = MagicMock()
+    client._series_registry = SeriesRegistry()
     return client
 
 
@@ -116,7 +119,7 @@ class TestRegisterTree:
 
         calls: list[tuple[str, UUID | None]] = []
 
-        def fake_create_node(_pool, edm_obj, *, parent_uuid=None):
+        def fake_create_node(_pool, edm_obj, *, parent_uuid=None, registry=None):
             calls.append((edm_obj.name, parent_uuid))
             return edm_obj.id
 
@@ -154,7 +157,7 @@ class TestRegisterTree:
         client = _mock_client(monkeypatch)
         monkeypatch.setattr(
             "energydb._persist.create_node",
-            lambda _pool, obj, *, parent_uuid=None: obj.id,
+            lambda _pool, obj, *, parent_uuid=None, registry=None: obj.id,
         )
 
         tree = edb.wind.WindTurbine(
@@ -210,7 +213,7 @@ class TestRegisterTree:
 
         captured_parent: list[UUID | None] = []
 
-        def fake_create_node(_pool, obj, *, parent_uuid=None):
+        def fake_create_node(_pool, obj, *, parent_uuid=None, registry=None):
             captured_parent.append(parent_uuid)
             return obj.id
 
@@ -227,11 +230,11 @@ class TestTwoPassWalk:
         node_calls: list[str] = []
         edge_calls: list[str] = []
 
-        def fake_create_node(_pool, obj, *, parent_uuid=None):
+        def fake_create_node(_pool, obj, *, parent_uuid=None, registry=None):
             node_calls.append(obj.name)
             return obj.id
 
-        def fake_create_edge(_pool, obj, *, tree_root=None):
+        def fake_create_edge(_pool, obj, *, tree_root=None, registry=None):
             edge_calls.append(obj.name)
             return obj.id
 

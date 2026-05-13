@@ -42,6 +42,7 @@ from energydb import runs as runs_mod
 from energydb._frames import OutputType, to_output, to_polars
 from energydb._io import read_manifest, read_relative_manifest, write_manifest
 from energydb._persist import create_edge, register_tree_under
+from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
@@ -92,6 +93,7 @@ class Client:
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
+        self._series_registry = SeriesRegistry()
 
     # ------------------------------------------------------------------
     # Schema management
@@ -121,6 +123,32 @@ class Client:
 
     def close(self) -> None:
         self._pool.close()
+
+    # ------------------------------------------------------------------
+    # Resolve cache
+    # ------------------------------------------------------------------
+
+    def invalidate_series_cache(self, owner_uuid: UUID | None = None) -> None:
+        """Drop cached series metadata.
+
+        With no argument, clears every entry. With an ``owner_uuid``, evicts
+        only entries owned by that node or edge.
+
+        The cache is normally maintained automatically — in-process
+        registrations and node/edge deletions update it transparently.
+        Call this only to recover from a cross-process modification that
+        invalidated state held in this client (another process registered,
+        deleted, or flipped ``timeseries_type`` on a series this client had
+        cached).
+        """
+        if owner_uuid is None:
+            self._series_registry.clear()
+        else:
+            self._series_registry.evict_owner(str(owner_uuid))
+
+    def resolve_cache_stats(self) -> dict[str, int]:
+        """Return cumulative resolve cache hits/misses and current size."""
+        return self._series_registry.stats()
 
     # ------------------------------------------------------------------
     # Fluent entry — scopes for navigation & single-element ops
@@ -236,6 +264,7 @@ class Client:
                 edm_obj,
                 parent_uuid=parent_uuid,
                 dry_run=dry_run,
+                registry=None if dry_run else self._series_registry,
             )
             if dry_run:
                 conn.rollback()
@@ -294,7 +323,7 @@ class Client:
         index in one pass.
         """
         with self._pool.connection() as conn:
-            edge_uuid = create_edge(conn, edm_obj, tree_root=None)
+            edge_uuid = create_edge(conn, edm_obj, tree_root=None, registry=self._series_registry)
             conn.commit()
         return edge_uuid
 
@@ -472,6 +501,7 @@ class Client:
             run_start_time=run_start_time,
             run_finish_time=run_finish_time,
             run_params=run_params,
+            registry=self._series_registry,
         )
 
     def read(
@@ -485,12 +515,12 @@ class Client:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-        output: OutputType = "pandas",
+        output: OutputType = "polars",
     ) -> pl.DataFrame | pd.DataFrame:
         """Bulk read via manifest. Detects edge vs node routing automatically.
 
-        Accepts pandas or polars on input. Returns pandas by default; pass
-        ``output="polars"`` for a polars DataFrame.
+        Accepts pandas or polars on input. Returns polars by default; pass
+        ``output="pandas"`` for a pandas DataFrame.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
@@ -505,6 +535,7 @@ class Client:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            registry=self._series_registry,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             return to_output(result, output)
@@ -514,20 +545,22 @@ class Client:
         df: pl.DataFrame | pd.DataFrame,
         *,
         unit: str | None = None,
-        output: OutputType = "pandas",
+        output: OutputType = "polars",
         **td_kwargs,
     ) -> pl.DataFrame | pd.DataFrame:
         """Bulk relative read via manifest.
 
-        Accepts pandas or polars on input. Returns pandas by default; pass
-        ``output="polars"`` for a polars DataFrame.
+        Accepts pandas or polars on input. Returns polars by default; pass
+        ``output="pandas"`` for a pandas DataFrame.
 
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = read_relative_manifest(self._pool, self.td, manifest, unit=unit, **td_kwargs)
+        result = read_relative_manifest(
+            self._pool, self.td, manifest, unit=unit, registry=self._series_registry, **td_kwargs
+        )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             return to_output(result, output)
 

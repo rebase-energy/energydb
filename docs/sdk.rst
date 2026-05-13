@@ -443,8 +443,8 @@ subtree. Pass ``data_type=`` and ``name=`` to narrow:
        data_type="actual", name="power",
    )
 
-The read returns a pandas DataFrame by default; pass ``output="polars"`` for
-polars. Columns include the standard timedb output (``series_id``,
+The read returns a polars DataFrame by default; pass ``output="pandas"`` for
+pandas. Columns include the standard timedb output (``series_id``,
 ``valid_time``, ``value``, plus optional ``knowledge_time`` /
 ``change_time`` flags) joined with the energydb-side hierarchy info:
 ``path`` (List[str]), ``node`` (display name), ``node_type``, ``node_uuid``,
@@ -568,7 +568,7 @@ The read manifest is the same shape, minus the data columns:
        end_valid=datetime(2026, 2, 1, tzinfo=UTC),
    )
 
-Returns a pandas DataFrame by default; pass ``output="polars"`` for polars.
+Returns a polars DataFrame by default; pass ``output="pandas"`` for pandas.
 
 Optional kwargs:
 

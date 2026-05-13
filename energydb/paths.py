@@ -19,6 +19,8 @@ from uuid import UUID
 
 import polars as pl
 
+from energydb._resolve_cache import EdgeMeta, NodeMeta, SeriesMeta, SeriesRegistry
+
 # A path is a tuple of names from the tree root.
 Path = tuple[str, ...]
 
@@ -220,6 +222,79 @@ def resolve_path(conn, node_uuid: UUID) -> Path:
     return tuple(r[0] for r in rows)
 
 
+def fetch_node_hierarchy_bulk(
+    conn,
+    node_uuid_strs: list[str],
+) -> dict[str, tuple[NodeMeta, str | None]]:
+    """Bulk: ``uuid → (NodeMeta, parent_uuid_str | None)`` in one round-trip.
+
+    Returns ``name``, ``node_type``, ``parent_uuid`` and the root→leaf
+    ``path`` for each requested uuid. Used as the cold-miss fetch behind
+    :func:`energydb._join.join_hierarchy`; one recursive CTE replaces the
+    earlier flat-SELECT + :func:`resolve_paths_bulk` round-trip pair.
+
+    Input uuids are passed as strings (the form the manifest carries) and
+    cast to ``uuid[]`` on the PG side.
+    """
+    if not node_uuid_strs:
+        return {}
+    rows = conn.execute(
+        """
+        WITH RECURSIVE ancestors AS (
+            SELECT uuid AS target_uuid, uuid, name, node_type, parent_uuid, 0 AS depth
+            FROM energydb.node WHERE uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT a.target_uuid, n.uuid, n.name, n.node_type, n.parent_uuid, a.depth + 1
+            FROM energydb.node n
+            JOIN ancestors a ON n.uuid = a.parent_uuid
+        ) CYCLE uuid SET _is_cycle USING _cycle_path
+        SELECT target_uuid, name, node_type, parent_uuid, depth FROM ancestors
+        WHERE NOT _is_cycle
+        ORDER BY target_uuid, depth DESC
+        """,
+        (node_uuid_strs,),
+    ).fetchall()
+
+    # depth=0 is the requested node itself; higher depths are ancestors,
+    # iterated DESC so the leaf row arrives last with the correct
+    # parent_uuid for the requested uuid.
+    parts: dict[str, list[str]] = {}
+    leaves: dict[str, tuple[str, str, str | None]] = {}
+    for target_uuid, name, node_type, parent_uuid, depth in rows:
+        key = str(target_uuid)
+        parts.setdefault(key, []).append(name)
+        if depth == 0:
+            leaves[key] = (name, node_type, str(parent_uuid) if parent_uuid is not None else None)
+
+    out: dict[str, tuple[NodeMeta, str | None]] = {}
+    for uid, (name, node_type, parent_uuid) in leaves.items():
+        out[uid] = (NodeMeta(path=tuple(parts[uid]), name=name, node_type=node_type), parent_uuid)
+    return out
+
+
+def fetch_edge_hierarchy_bulk(conn, edge_uuid_strs: list[str]) -> dict[str, EdgeMeta]:
+    """Bulk: ``uuid → EdgeMeta`` for many edges in one round-trip.
+
+    Endpoint *paths* aren't fetched here — the caller resolves them via the
+    node cache on ``from_node_uuid`` / ``to_node_uuid``.
+    """
+    if not edge_uuid_strs:
+        return {}
+    rows = conn.execute(
+        "SELECT uuid, name, edge_type, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = ANY(%s::uuid[])",
+        (edge_uuid_strs,),
+    ).fetchall()
+    return {
+        str(uuid_): EdgeMeta(
+            name=name,
+            edge_type=edge_type,
+            from_node_uuid=str(from_uuid),
+            to_node_uuid=str(to_uuid),
+        )
+        for uuid_, name, edge_type, from_uuid, to_uuid in rows
+    }
+
+
 def resolve_paths_bulk(conn, node_uuids: list[UUID]) -> dict[UUID, Path]:
     """Bulk: ``uuid → path tuple`` for many nodes in one CTE."""
     if not node_uuids:
@@ -275,7 +350,12 @@ _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 
 
-def resolve_manifest(conn, manifest: pl.DataFrame) -> pl.DataFrame:
+def resolve_manifest(
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    registry: SeriesRegistry | None = None,
+) -> pl.DataFrame:
     """Resolve a routing manifest to series metadata.
 
     Detects routing mode from the columns present:
@@ -287,6 +367,9 @@ def resolve_manifest(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     The manifest must also carry ``data_type`` and ``name`` columns. Returns
     the original frame plus ``series_id``, ``retention``, ``canonical_unit``,
     and ``timeseries_type``.
+
+    When ``registry`` is provided, cached entries are served without a PG
+    round-trip and freshly-fetched entries are inserted into the cache.
     """
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
     if len(present_routes) == 0:
@@ -302,10 +385,10 @@ def resolve_manifest(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     if route == "edge_uuid":
-        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid")
+        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", registry=registry)
     if route == "path":
         manifest = _attach_node_uuid_from_path(conn, manifest)
-    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid")
+    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", registry=registry)
 
 
 def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
@@ -320,30 +403,6 @@ def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     path_to_uuid = resolve_paths_to_uuids(conn, unique_paths)
     node_uuids = [str(path_to_uuid[tuple(p)]) if p is not None else None for p in paths_lists]
     return manifest.with_columns(pl.Series("node_uuid", node_uuids, dtype=pl.Utf8))
-
-
-def _series_lookup_df(rows: list[tuple], owner_col: str) -> pl.DataFrame:
-    """Build the (owner_uuid, data_type, name) → series-meta lookup frame."""
-    return pl.DataFrame(
-        {
-            owner_col: [str(r[0]) for r in rows],
-            "_dt": [r[1] for r in rows],
-            "_name": [r[2] for r in rows],
-            "series_id": [r[3] for r in rows],
-            "canonical_unit": [r[4] for r in rows],
-            "timeseries_type": [r[5] for r in rows],
-            "retention": [r[6] for r in rows],
-        },
-        schema={
-            owner_col: pl.Utf8,
-            "_dt": pl.Utf8,
-            "_name": pl.Utf8,
-            "series_id": pl.Int64,
-            "canonical_unit": pl.Utf8,
-            "timeseries_type": pl.Utf8,
-            "retention": pl.Utf8,
-        },
-    )
 
 
 def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -364,54 +423,141 @@ def _resolve_manifest_by_owner(
     manifest: pl.DataFrame,
     *,
     owner_col: str,
+    registry: SeriesRegistry | None = None,
 ) -> pl.DataFrame:
     """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
     against the series table.
 
-    The owner column is coerced to ``Utf8`` on entry so it can join against
-    the PG-side ``::text`` cast cleanly.
+    Workflow:
+
+    1. Build the unique ``(owner_uuid, data_type, name)`` triples present in
+       the manifest. With ``registry`` provided, partition into cache hits
+       and misses; without it, every triple is a miss.
+    2. If misses remain, issue one round-trip — a join against
+       ``unnest(uuid[], text[], text[])`` so each triple is served by a
+       single probe of the ``series_node_uniq`` / ``series_edge_uniq`` index.
+       Populate the registry from the result.
+    3. Build the resolved frame by joining the per-triple meta lookup back
+       onto the manifest. The lookup is at most ``unique_triples`` rows
+       (typically thousands at most), so the join is hash-join over a small
+       right side — orders of magnitude cheaper than a per-row Python loop
+       on write manifests, which carry one row per data point (millions).
     """
     manifest = _coerce_uuid_col(manifest, owner_col)
-    owner_vals = [v for v in manifest[owner_col].unique().to_list() if v is not None]
-    if not owner_vals:
+
+    triples_df = manifest.select([owner_col, "data_type", "name"]).drop_nulls(subset=[owner_col]).unique()
+    if triples_df.height == 0:
         raise ValueError(f"No {owner_col} values to resolve in manifest.")
 
-    rows = conn.execute(
-        f"SELECT {owner_col}, data_type, name, series_id, canonical_unit, timeseries_type, retention "
-        f"FROM energydb.series WHERE {owner_col}::text = ANY(%s)",
-        (owner_vals,),
-    ).fetchall()
-    lookup = _series_lookup_df(rows, owner_col)
-
-    resolved = manifest.join(
-        lookup,
-        left_on=[owner_col, "data_type", "name"],
-        right_on=[owner_col, "_dt", "_name"],
-        how="left",
-    ).drop("_dt", "_name", strict=False)
-
-    _raise_on_unresolved(resolved, owner_col)
-    return resolved
-
-
-def _raise_on_unresolved(resolved: pl.DataFrame, owner_col: str) -> None:
-    missing = resolved.filter(pl.col("series_id").is_null())
-    if missing.height == 0:
-        return
-    sample = missing.row(0, named=True)
-    raise ValueError(
-        f"Series not registered for {owner_col}={sample[owner_col]!r}, "
-        f"data_type={sample['data_type']!r}, name={sample['name']!r}."
+    triples: list[tuple[str, str, str]] = list(
+        zip(
+            triples_df[owner_col].to_list(),
+            triples_df["data_type"].to_list(),
+            triples_df["name"].to_list(),
+            strict=True,
+        )
     )
+
+    if registry is not None:
+        hits, misses = registry.lookup_triples(triples)
+        meta_map: dict[tuple[str, str, str], SeriesMeta] = dict(hits)
+    else:
+        meta_map = {}
+        misses = triples
+
+    if misses:
+        owner_vals = [t[0] for t in misses]
+        dt_vals = [t[1] for t in misses]
+        name_vals = [t[2] for t in misses]
+        rows = conn.execute(
+            f"""
+            SELECT s.{owner_col}, s.data_type, s.name, s.series_id,
+                   s.canonical_unit, s.timeseries_type, s.retention
+            FROM unnest(%s::uuid[], %s::text[], %s::text[]) AS q(owner_uuid, data_type, name)
+            JOIN energydb.series s
+              ON s.{owner_col} = q.owner_uuid
+             AND s.data_type   = q.data_type
+             AND s.name        = q.name
+            """,
+            (owner_vals, dt_vals, name_vals),
+        ).fetchall()
+        for owner, dt, name, sid, unit, ts_type, retention in rows:
+            owner_str = str(owner)
+            meta = SeriesMeta(
+                series_id=sid,
+                canonical_unit=unit,
+                timeseries_type=ts_type,
+                retention=retention,
+            )
+            meta_map[(owner_str, dt, name)] = meta
+            if registry is not None:
+                registry.insert(owner_str, dt, name, meta)
+
+    return _build_resolved_frame(manifest, owner_col, meta_map)
+
+
+def _build_resolved_frame(
+    manifest: pl.DataFrame,
+    owner_col: str,
+    meta_map: dict[tuple[str, str, str], SeriesMeta],
+) -> pl.DataFrame:
+    """Append ``(series_id, canonical_unit, timeseries_type, retention)`` to
+    each manifest row by joining a small ``triple → meta`` lookup frame.
+
+    Raises :class:`ValueError` on a null routing value or the first
+    unresolved triple.
+    """
+    if manifest[owner_col].null_count() > 0:
+        null_row = manifest.filter(pl.col(owner_col).is_null()).row(0, named=True)
+        raise ValueError(
+            f"Series not registered for {owner_col}=None, "
+            f"data_type={null_row['data_type']!r}, name={null_row['name']!r}."
+        )
+
+    keys = list(meta_map.keys())
+    metas = list(meta_map.values())
+    lookup = pl.DataFrame(
+        {
+            owner_col: [k[0] for k in keys],
+            "data_type": [k[1] for k in keys],
+            "name": [k[2] for k in keys],
+            "series_id": [m.series_id for m in metas],
+            "canonical_unit": [m.canonical_unit for m in metas],
+            "timeseries_type": [m.timeseries_type for m in metas],
+            "retention": [m.retention for m in metas],
+        },
+        schema={
+            owner_col: pl.Utf8,
+            "data_type": pl.Utf8,
+            "name": pl.Utf8,
+            "series_id": pl.Int64,
+            "canonical_unit": pl.Utf8,
+            "timeseries_type": pl.Utf8,
+            "retention": pl.Utf8,
+        },
+    )
+
+    resolved = manifest.join(lookup, on=[owner_col, "data_type", "name"], how="left")
+
+    unresolved = resolved.filter(pl.col("series_id").is_null())
+    if unresolved.height > 0:
+        bad = unresolved.row(0, named=True)
+        raise ValueError(
+            f"Series not registered for {owner_col}={bad[owner_col]!r}, "
+            f"data_type={bad['data_type']!r}, name={bad['name']!r}."
+        )
+    return resolved
 
 
 __all__ = [
     "Path",
-    "resolve_node_uuid",
-    "resolve_paths_to_uuids",
-    "resolve_subtree_uuids",
-    "resolve_path",
-    "resolve_paths_bulk",
+    "fetch_edge_hierarchy_bulk",
+    "fetch_node_hierarchy_bulk",
     "resolve_edge_uuid",
     "resolve_manifest",
+    "resolve_node_uuid",
+    "resolve_path",
+    "resolve_paths_bulk",
+    "resolve_paths_to_uuids",
+    "resolve_subtree_uuids",
 ]
