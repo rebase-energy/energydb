@@ -29,6 +29,7 @@ from energydb import series as series_mod
 from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.serialization import serialize_edge, serialize_node
+from energydb.series import validate_name
 from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ def create_node(
     """
     row_data = serialize_node(edm_obj)
     uuid_val: UUID = row_data["uuid"]
+    validate_name(row_data["name"], kind="node")
 
     conn.execute(
         "INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, data) VALUES (%s, %s, %s, %s, %s)",
@@ -85,6 +87,8 @@ def create_edge(
     """
     row_data = serialize_edge(edm_obj)
     uuid_val: UUID = row_data["uuid"]
+    if row_data["name"] is not None:
+        validate_name(row_data["name"], kind="edge")
 
     from_uuid = _endpoint_uuid(edm_obj, "from_element", tree_root)
     to_uuid = _endpoint_uuid(edm_obj, "to_element", tree_root)

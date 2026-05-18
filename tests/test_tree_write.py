@@ -299,7 +299,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
 
     write_df = pl.DataFrame(
         {
-            "path": [["P", "S", "T1"]] * 3,
+            "path": ["P/S/T1"] * 3,
             "data_type": ["actual"] * 3,
             "name": ["power"] * 3,
             "valid_time": [base + timedelta(hours=i) for i in range(3)],
@@ -308,7 +308,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
     )
     live_edb.write(write_df)
 
-    out = live_edb.get_node("P").get_node("S").get_node("T1").read(data_type="actual", name="power", output="polars")
+    out = live_edb.get_node("P").get_node("S").get_node("T1").read(data_type="actual", name="power")
     assert out["value"].to_list() == [1.0, 2.0, 3.0]
 
 
@@ -343,7 +343,7 @@ def test_live_create_edge_with_series(live_edb):
         }
     )
     scope.write(flow, data_type="actual", name="power_flow")
-    out = scope.read(data_type="actual", name="power_flow", output="polars")
+    out = scope.read(data_type="actual", name="power_flow")
     assert out["value"].to_list() == [200.0, 250.0]
 
 
@@ -369,7 +369,7 @@ def test_live_manifest_read(live_edb):
 
     write_df = pl.DataFrame(
         {
-            "path": [["P", "T1"]] * 2 + [["P", "T2"]] * 2,
+            "path": ["P/T1"] * 2 + ["P/T2"] * 2,
             "data_type": ["actual"] * 4,
             "name": ["power"] * 4,
             "valid_time": [base + timedelta(hours=i) for i in range(2)] * 2,
@@ -380,14 +380,16 @@ def test_live_manifest_read(live_edb):
 
     manifest = pl.DataFrame(
         {
-            "path": [["P", "T1"], ["P", "T2"]],
+            "path": ["P/T1", "P/T2"],
             "data_type": ["actual", "actual"],
             "name": ["power", "power"],
         }
     )
-    out = live_edb.read(manifest, output="polars")
-    assert set(out["node"].unique().to_list()) == {"T1", "T2"}
-    assert "path" in out.columns
+    out = live_edb.read(manifest)
+    # Path is the customer-facing identity; node/node_type/node_uuid no longer
+    # leak onto rows.
+    assert set(out["path"].unique().to_list()) == {"P/T1", "P/T2"}
+    assert "node" not in out.columns
 
 
 @pytestmark_live

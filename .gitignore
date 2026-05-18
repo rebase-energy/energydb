@@ -47,3 +47,6 @@ ARCHITECTURE.md
 .claude/
 
 benchmarks/
+
+# Local engineering notes (perf scratch, etc.)
+notes/

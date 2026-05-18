@@ -51,6 +51,25 @@ def _validate_retention(retention: str) -> None:
         raise ValueError(f"Unknown retention {retention!r}. Valid values: {sorted(RETENTION_TIERS)}")
 
 
+def validate_name(name: str, *, kind: str) -> None:
+    """Reject empty names or names containing ``/``.
+
+    ``/`` is the path separator on the read API (``path: pl.Utf8`` joined
+    with ``/``), so allowing it inside a node/edge/series name would make
+    the joined path ambiguous. The same constraint is enforced at the PG
+    level by ``CheckConstraint("name !~ '/' AND length(name) > 0")``.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"{kind} name must be a string, got {type(name).__name__}")
+    if len(name) == 0:
+        raise ValueError(f"{kind} name must be non-empty.")
+    if "/" in name:
+        raise ValueError(
+            f"{kind} name {name!r} contains '/'. '/' is reserved as the path "
+            f"separator and may not appear inside a node, edge, or series name."
+        )
+
+
 def register_series(
     conn,
     *,
@@ -79,6 +98,7 @@ def register_series(
     entry reflects the row already in the DB, not the rejected new args.
     """
     _validate_timeseries_type(timeseries_type)
+    validate_name(name, kind="series")
     if retention is None:
         retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
     _validate_retention(retention)

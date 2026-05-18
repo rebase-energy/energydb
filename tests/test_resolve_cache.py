@@ -138,7 +138,7 @@ class TestSeriesRegistryUnit:
 class TestNodeCacheUnit:
     def test_insert_then_lookup_is_a_hit(self):
         reg = SeriesRegistry()
-        meta = NodeMeta(path=("Europe", "Sweden"), name="Sweden", node_type="Country")
+        meta = NodeMeta.from_path(("Europe", "Sweden"), name="Sweden", node_type="Country")
         reg.insert_node("u-se", meta, parent_uuid="u-eu")
 
         hits, misses = reg.lookup_nodes(["u-se"])
@@ -148,7 +148,7 @@ class TestNodeCacheUnit:
 
     def test_mixed_node_hit_and_miss(self):
         reg = SeriesRegistry()
-        meta = NodeMeta(path=("A",), name="A", node_type="X")
+        meta = NodeMeta.from_path(("A",), name="A", node_type="X")
         reg.insert_node("u-a", meta, parent_uuid=None)
 
         hits, misses = reg.lookup_nodes(["u-a", "u-b", "u-a"])
@@ -161,9 +161,9 @@ class TestNodeCacheUnit:
     def test_evict_node_subtree_walks_children(self):
         reg = SeriesRegistry()
         # u-eu -> u-se -> u-sthlm
-        reg.insert_node("u-eu", NodeMeta(path=("EU",), name="EU", node_type="X"), parent_uuid=None)
-        reg.insert_node("u-se", NodeMeta(path=("EU", "SE"), name="SE", node_type="X"), parent_uuid="u-eu")
-        reg.insert_node("u-sthlm", NodeMeta(path=("EU", "SE", "S"), name="S", node_type="X"), parent_uuid="u-se")
+        reg.insert_node("u-eu", NodeMeta.from_path(("EU",), name="EU", node_type="X"), parent_uuid=None)
+        reg.insert_node("u-se", NodeMeta.from_path(("EU", "SE"), name="SE", node_type="X"), parent_uuid="u-eu")
+        reg.insert_node("u-sthlm", NodeMeta.from_path(("EU", "SE", "S"), name="S", node_type="X"), parent_uuid="u-se")
 
         reg.evict_node_subtree("u-se")
         assert reg.get_node("u-eu") is not None
@@ -172,21 +172,149 @@ class TestNodeCacheUnit:
 
     def test_evict_node_subtree_for_unknown_uuid_is_noop(self):
         reg = SeriesRegistry()
-        reg.insert_node("u-a", NodeMeta(path=("A",), name="A", node_type="X"), parent_uuid=None)
+        reg.insert_node("u-a", NodeMeta.from_path(("A",), name="A", node_type="X"), parent_uuid=None)
         reg.evict_node_subtree("nonexistent")
         assert reg.get_node("u-a") is not None
 
     def test_reparent_in_cache_updates_indexes(self):
         reg = SeriesRegistry()
-        reg.insert_node("u-a", NodeMeta(path=("A",), name="A", node_type="X"), parent_uuid=None)
-        reg.insert_node("u-b", NodeMeta(path=("A", "B"), name="B", node_type="X"), parent_uuid="u-a")
+        reg.insert_node("u-a", NodeMeta.from_path(("A",), name="A", node_type="X"), parent_uuid=None)
+        reg.insert_node("u-b", NodeMeta.from_path(("A", "B"), name="B", node_type="X"), parent_uuid="u-a")
         # Move B under a fresh parent C; later evicting old parent A must not
         # take B with it.
-        reg.insert_node("u-c", NodeMeta(path=("C",), name="C", node_type="X"), parent_uuid=None)
-        reg.insert_node("u-b", NodeMeta(path=("C", "B"), name="B", node_type="X"), parent_uuid="u-c")
+        reg.insert_node("u-c", NodeMeta.from_path(("C",), name="C", node_type="X"), parent_uuid=None)
+        reg.insert_node("u-b", NodeMeta.from_path(("C", "B"), name="B", node_type="X"), parent_uuid="u-c")
         reg.evict_node_subtree("u-a")
         assert reg.get_node("u-a") is None
         assert reg.get_node("u-b") is not None
+
+
+class TestHashMemo:
+    """The ``hash_rows`` → ``SeriesMeta`` memo powers the warm-cache
+    short-circuit in :func:`resolve_manifest` — once a triple's polars
+    hash has been seen, subsequent resolves skip the 4-column unique on
+    the manifest and attach metadata directly via this memo."""
+
+    def _seed(self, reg: SeriesRegistry) -> tuple[tuple[str, str, str], int, SeriesMeta]:
+        triple = ("u1", "actual", "power")
+        h = 12345  # arbitrary 64-bit value; the actual polars hash isn't relevant in unit tests.
+        meta = SeriesMeta(series_id=42, canonical_unit="MW", timeseries_type="FLAT", retention="forever")
+        reg.insert(*triple, meta)
+        reg.populate_memo([(h, triple, meta)])
+        return triple, h, meta
+
+    def test_populate_then_lookup_is_a_hit(self):
+        reg = SeriesRegistry()
+        _, h, meta = self._seed(reg)
+        hits, misses = reg.lookup_hashes([h, 999])
+        assert hits == {h: meta}
+        assert misses == [999]
+        stats = reg.stats()
+        assert stats["hash_hits"] == 1
+        assert stats["hash_misses"] == 1
+        assert stats["hash_memo_size"] == 1
+
+    def test_evict_owner_drops_memo_entry(self):
+        reg = SeriesRegistry()
+        triple, h, _ = self._seed(reg)
+        reg.evict_owner(triple[0])
+        hits, misses = reg.lookup_hashes([h])
+        assert hits == {}
+        assert misses == [h]
+        # Reverse map is gone too.
+        assert reg.stats()["hash_memo_size"] == 0
+
+    def test_clear_empties_memo_and_reverse_map(self):
+        reg = SeriesRegistry()
+        _, h, _ = self._seed(reg)
+        reg.clear()
+        stats = reg.stats()
+        assert stats["hash_memo_size"] == 0
+        assert stats["hash_hits"] == 0
+        assert stats["hash_misses"] == 0
+        hits, _ = reg.lookup_hashes([h])
+        assert hits == {}
+
+    def test_insert_updates_memo_for_seen_triple(self):
+        """If a triple has been seen by the memo, re-inserting it (e.g. an
+        in-process registration update) must keep memo and triple cache
+        in sync — otherwise the warm path would serve stale metadata."""
+        reg = SeriesRegistry()
+        triple, h, _ = self._seed(reg)
+        new_meta = SeriesMeta(series_id=42, canonical_unit="kW", timeseries_type="FLAT", retention="medium")
+        reg.insert(*triple, new_meta)
+        hits, _ = reg.lookup_hashes([h])
+        assert hits == {h: new_meta}
+
+    def test_insert_does_not_invent_memo_entries(self):
+        """A bare ``insert`` of a triple never seen by the memo must not
+        create a phantom memo entry — we don't know the polars hash for
+        it. The memo populates lazily on the next resolve."""
+        reg = SeriesRegistry()
+        reg.insert(
+            "u1",
+            "actual",
+            "power",
+            SeriesMeta(series_id=42, canonical_unit="MW", timeseries_type="FLAT", retention="forever"),
+        )
+        assert reg.stats()["hash_memo_size"] == 0
+
+
+class TestReversePathIndex:
+    """The ``joined_path → node_uuid`` reverse index powers warm-cache
+    short-circuit on path-routed writes."""
+
+    def test_lookup_paths_empty_returns_all_misses(self):
+        reg = SeriesRegistry()
+        hits, misses = reg.lookup_paths(["A/B", "C"])
+        assert hits == {}
+        assert sorted(misses) == ["A/B", "C"]
+
+    def test_insert_node_populates_reverse_index(self):
+        reg = SeriesRegistry()
+        reg.insert_node(
+            "u-1",
+            NodeMeta.from_path(("Europe", "Sweden"), name="Sweden", node_type="Country"),
+            parent_uuid=None,
+        )
+        hits, misses = reg.lookup_paths(["Europe/Sweden", "Europe/Norway"])
+        assert hits == {"Europe/Sweden": "u-1"}
+        assert misses == ["Europe/Norway"]
+
+    def test_evict_node_subtree_drops_reverse_entry(self):
+        reg = SeriesRegistry()
+        reg.insert_node("u-eu", NodeMeta.from_path(("EU",), name="EU", node_type="X"), parent_uuid=None)
+        reg.insert_node("u-se", NodeMeta.from_path(("EU", "SE"), name="SE", node_type="X"), parent_uuid="u-eu")
+        reg.insert_node(
+            "u-sthlm",
+            NodeMeta.from_path(("EU", "SE", "S"), name="S", node_type="X"),
+            parent_uuid="u-se",
+        )
+        # Reverse index has all three before eviction.
+        assert reg.lookup_paths(["EU/SE", "EU/SE/S"])[0] == {"EU/SE": "u-se", "EU/SE/S": "u-sthlm"}
+
+        reg.evict_node_subtree("u-se")
+        hits, _ = reg.lookup_paths(["EU", "EU/SE", "EU/SE/S"])
+        # Only the un-evicted ancestor survives.
+        assert hits == {"EU": "u-eu"}
+
+    def test_rename_in_cache_drops_stale_path(self):
+        """A re-insert under a new path must not leave the old path key dangling."""
+        reg = SeriesRegistry()
+        reg.insert_node("u-1", NodeMeta.from_path(("A",), name="A", node_type="X"), parent_uuid=None)
+        # Simulate rename: same uuid, new joined_path.
+        reg.insert_node("u-1", NodeMeta.from_path(("A2",), name="A2", node_type="X"), parent_uuid=None)
+        hits, misses = reg.lookup_paths(["A", "A2"])
+        assert hits == {"A2": "u-1"}
+        assert misses == ["A"]
+
+    def test_clear_drops_reverse_index(self):
+        reg = SeriesRegistry()
+        reg.insert_node("u-1", NodeMeta.from_path(("A",), name="A", node_type="X"), parent_uuid=None)
+        reg.clear()
+        hits, misses = reg.lookup_paths(["A"])
+        assert hits == {}
+        assert misses == ["A"]
 
 
 class TestEdgeCacheUnit:
@@ -281,11 +409,17 @@ class TestRegistryWithLiveDB:
         live_client.get_node("T1").write(_ts_df(), data_type="actual", name="power")
         stats_after_first = live_client.resolve_cache_stats()
 
-        # Second write should be served purely from the cache.
+        # Second write should be served purely from the cache. Resolve now
+        # has two probe layers — the hash memo (fast path) and the triple
+        # cache (slow path, hit on cold memo). A warm second write may hit
+        # either layer; the invariant that matters is "no new misses".
         live_client.get_node("T1").write(_ts_df(), data_type="actual", name="power")
         stats_after_second = live_client.resolve_cache_stats()
-        assert stats_after_second["hits"] > stats_after_first["hits"]
+        total_hits_first = stats_after_first["hits"] + stats_after_first["hash_hits"]
+        total_hits_second = stats_after_second["hits"] + stats_after_second["hash_hits"]
+        assert total_hits_second > total_hits_first
         assert stats_after_second["misses"] == stats_after_first["misses"]
+        assert stats_after_second["hash_misses"] == stats_after_first["hash_misses"]
 
     def test_unregistered_triple_raises_and_does_not_poison_cache(self, live_client):
         import energydb as edb
@@ -412,11 +546,20 @@ class TestRegistryWithLiveDB:
 
         live_client.get_node("A", "T1").move_to(live_client.get_node("B"))
         # Subsequent read under the new path must succeed and reflect the move.
+        # Scope-style read on a single-series target auto-strips identity cols
+        # (path/data_type/name) — to confirm the moved path is observable
+        # through the read pipeline, use Client.read directly with a manifest.
         result = live_client.get_node("B", "T1").read()
         assert result.height > 0
-        # The new path is reflected in the result.
-        first_path = result["path"].to_list()[0]
-        assert list(first_path) == ["B", "T1"]
+        manifest = pl.DataFrame(
+            {
+                "path": ["B/T1"],
+                "data_type": ["actual"],
+                "name": ["power"],
+            }
+        )
+        full = live_client.read(manifest)
+        assert full["path"].to_list()[0] == "B/T1"
 
     def test_resolve_query_uses_unnest_join_no_text_cast(self, live_client):
         """Smoke-test: the resolve query no longer carries a ``::text`` cast on
@@ -447,7 +590,15 @@ class TestRegistryWithLiveDB:
 
 class TestResolveSqlShape:
     """Regression guard: the resolve query must not cast the indexed UUID
-    column to text (that breaks the unique-constraint index)."""
+    column to text (that breaks the partial index on the owner column).
+
+    Phase 2 (2026-05-15) swapped the cold-resolve query from
+    ``unnest(...) JOIN series ON (owner, dt, name)`` to a bulk
+    ``WHERE owner_col = ANY(::uuid[])`` because the latter is 2.7–3.3×
+    faster — the unnest plan paid for materializing three arrays and a
+    three-column join when a single indexed scan already returns the rows
+    we need (extras land in the registry as free pre-warm).
+    """
 
     def test_no_text_cast_in_resolve_sql(self):
         import inspect
@@ -455,22 +606,20 @@ class TestResolveSqlShape:
         from energydb import paths
 
         src = inspect.getsource(paths._resolve_manifest_by_owner)
-        # Must use unnest-joined triple lookup.
-        assert "unnest(%s::uuid[], %s::text[], %s::text[])" in src
-        # Must not cast the owner column to text on the indexed side.
+        # Must not cast the owner column to text on the indexed side —
+        # ``ix_series_node_uuid`` / ``ix_series_edge_uuid`` are uuid-typed.
         assert "::text = ANY" not in src
         assert "owner_col}::text" not in src
 
-    def test_uses_index_aligned_join_predicates(self):
+    def test_uses_bulk_any_lookup(self):
         import inspect
 
         from energydb import paths
 
         src = inspect.getsource(paths._resolve_manifest_by_owner)
-        # Joins against series with all three columns of the unique
-        # constraint — that's what makes the index probe cheap.
-        assert "s.data_type   = q.data_type" in src
-        assert "s.name        = q.name" in src
+        # Cold-resolve fetches by owner via the partial uuid index — the
+        # query must pass a uuid[] (not text[]) to keep the index applicable.
+        assert "{owner_col} = ANY(%s::uuid[])" in src
 
 
 # Quiet pyright/ty about the unused uuid4 import (kept for future tests).

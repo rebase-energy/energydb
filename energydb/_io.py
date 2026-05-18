@@ -10,40 +10,23 @@ read pipeline and one write pipeline in the library.
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable
-from contextlib import contextmanager
 from datetime import UTC, datetime
 
 import polars as pl
 from timedb import profiling
 
 from energydb import runs as runs_mod
-from energydb._join import join_edge_hierarchy, join_hierarchy, meta_from_resolved_manifest
+from energydb._join import (
+    attach_edge_hierarchy,
+    attach_node_hierarchy,
+    partition_edge_by_path,
+    partition_node_by_path,
+)
 from energydb._persist import apply_manifest_unit_conversion
 from energydb._resolve_cache import SeriesRegistry
 from energydb.paths import resolve_manifest
 from energydb.units import compute_unit_factor
-
-
-@contextmanager
-def _acquire_conn(pool):
-    """Borrow a connection from ``pool``, timing only the acquisition.
-
-    Errors during the body propagate through the pool context manager's
-    ``__exit__`` so connection cleanup / rollback semantics are preserved.
-    """
-    cm = pool.connection()
-    with profiling._phase(profiling.PHASE_EDB_CONN_ACQUIRE):
-        conn = cm.__enter__()
-    try:
-        yield conn
-    except BaseException:
-        if not cm.__exit__(*sys.exc_info()):
-            raise
-    else:
-        cm.__exit__(None, None, None)
-
 
 # ---------------------------------------------------------------------------
 # Write
@@ -57,7 +40,6 @@ _ROUTING_AND_META_COLS = (
     "data_type",
     "name",
     "canonical_unit",
-    "timeseries_type",
     "unit",
 )
 
@@ -85,16 +67,14 @@ def write_manifest(
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
 
-    with _acquire_conn(pool) as conn:
+    with pool.connection() as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            resolved = resolve_manifest(conn, df, registry=registry)
+            resolved, summary = resolve_manifest(conn, df, registry=registry)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
-        overlapping = resolved.filter(pl.col("timeseries_type") == "OVERLAPPING")
-        if overlapping.height > 0 and knowledge_time is None and "knowledge_time" not in resolved.columns:
-            sample_sid = overlapping["series_id"].to_list()[0]
+        if summary.has_overlapping and knowledge_time is None and "knowledge_time" not in resolved.columns:
             raise ValueError(
-                f"knowledge_time is required for OVERLAPPING series (series_id={sample_sid}); "
+                "knowledge_time is required for OVERLAPPING series; "
                 "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
             )
 
@@ -129,39 +109,143 @@ def write_manifest(
 # ---------------------------------------------------------------------------
 
 
+def _execute_read(
+    pool,
+    meta: pl.DataFrame,
+    td_call: Callable[[list[int], list[str]], pl.DataFrame],
+    *,
+    unit: str | None,
+    output: str,
+    registry: SeriesRegistry | None,
+) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+    """Execute a read given fully-resolved per-series ``meta``.
+
+    ``meta`` must carry ``series_id``, ``retention``, ``canonical_unit``,
+    ``data_type``, ``name``, plus exactly one of ``node_uuid`` / ``edge_uuid``
+    — one row per series. No PG round-trip happens here unless the hierarchy
+    attach hits a cache miss; the pool is borrowed lazily by the join layer.
+    """
+    if output not in {"frame", "by_path"}:
+        raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")
+    is_edge = "edge_uuid" in meta.columns
+
+    series_ids = meta["series_id"].unique().to_list()
+    retentions = meta["retention"].unique().to_list()
+    result = td_call(series_ids, retentions)
+
+    if unit is not None and not result.is_empty():
+        with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
+            result = apply_per_series_unit(result, meta, unit)
+
+    if output == "by_path":
+        with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
+            if is_edge:
+                return partition_edge_by_path(pool, result, meta, registry=registry)
+            return partition_node_by_path(pool, result, meta, registry=registry)
+
+    if result.is_empty():
+        # CH returned no rows — drop the internal series_id and bail. The
+        # public column shape is incomplete on empty (no path / data_type /
+        # name) but callers typically branch on is_empty() first.
+        return result.drop("series_id") if "series_id" in result.columns else result
+
+    with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
+        if is_edge:
+            return attach_edge_hierarchy(pool, result, meta, registry=registry)
+        return attach_node_hierarchy(pool, result, meta, registry=registry)
+
+
 def _read_pipeline(
     pool,
     manifest: pl.DataFrame,
     td_call: Callable[[list[int], list[str]], pl.DataFrame],
     *,
     unit: str | None,
+    output: str = "frame",
     registry: SeriesRegistry | None = None,
-) -> pl.DataFrame:
-    """Shared read pipeline: resolve manifest → fetch from timedb → optional
-    unit scaling → hierarchy join.
+) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+    """Manifest-driven read: resolve then execute. Used by ``Client.read`` and
+    ``Client.read_relative`` (which both accept a routing manifest).
 
-    ``td_call(series_ids, retentions)`` invokes the relevant ``td.read*``
-    method with the read-specific kwargs already bound (start_valid,
-    relative-window args, etc.).
+    Scope reads bypass this and call :func:`read_resolved` directly with
+    meta they already have from the scope's PG resolve.
     """
     is_edge = "edge_uuid" in manifest.columns
-    with _acquire_conn(pool) as conn:
-        with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            resolved = resolve_manifest(conn, manifest, registry=registry)
-        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            meta = meta_from_resolved_manifest(resolved, is_edge=is_edge)
-            series_ids = meta["series_id"].unique().to_list()
-            retentions = meta["retention"].unique().to_list()
-        result = td_call(series_ids, retentions)
-        if result.is_empty():
-            return result
-        if unit is not None:
-            with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
-                result = apply_per_series_unit(result, meta, unit)
-        with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
-            if is_edge:
-                return join_edge_hierarchy(conn, result, meta, registry=registry)
-            return join_hierarchy(conn, result, meta, registry=registry)
+    with pool.connection() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
+        resolved, _summary = resolve_manifest(conn, manifest, registry=registry)
+    with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+        meta = _meta_from_resolved(resolved, is_edge=is_edge)
+    return _execute_read(pool, meta, td_call, unit=unit, output=output, registry=registry)
+
+
+def read_resolved(
+    pool,
+    td,
+    meta: pl.DataFrame,
+    *,
+    unit: str | None = None,
+    start_valid: datetime | None = None,
+    end_valid: datetime | None = None,
+    start_known: datetime | None = None,
+    end_known: datetime | None = None,
+    include_updates: bool = False,
+    include_knowledge_time: bool = False,
+    output: str = "frame",
+    registry: SeriesRegistry | None = None,
+) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+    """Read entry-point for callers who already have per-series meta.
+
+    Skips :func:`resolve_manifest` entirely — scope reads compute ``meta``
+    via :func:`series.resolve_for_read` (one PG round-trip) and feed it
+    straight in, avoiding the manifest hash / unique / lookup-join pass.
+    """
+
+    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
+        return td.read(
+            series_ids=series_ids,
+            retention=retentions,
+            start_valid=start_valid,
+            end_valid=end_valid,
+            start_known=start_known,
+            end_known=end_known,
+            include_updates=include_updates,
+            include_knowledge_time=include_knowledge_time,
+        )
+
+    return _execute_read(pool, meta, _call, unit=unit, output=output, registry=registry)
+
+
+def read_relative_resolved(
+    pool,
+    td,
+    meta: pl.DataFrame,
+    *,
+    unit: str | None = None,
+    output: str = "frame",
+    registry: SeriesRegistry | None = None,
+    **td_kwargs,
+) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+    """Like :func:`read_resolved` but routes through ``td.read_relative``."""
+
+    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
+        return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
+
+    return _execute_read(pool, meta, _call, unit=unit, output=output, registry=registry)
+
+
+def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
+    """Project the per-series meta columns the read pipeline needs.
+
+    Returns ``(series_id, data_type, name, canonical_unit, retention,
+    node_uuid|edge_uuid)`` deduplicated by series. Used to derive the CH
+    fetch params and to power the path-attachment step.
+    """
+    cols = ["series_id", "data_type", "name", "canonical_unit", "retention"]
+    cols.append("edge_uuid" if is_edge else "node_uuid")
+    if not is_edge and "node_uuid" not in resolved.columns:
+        # path-routed manifest: node_uuid is attached during resolve_manifest.
+        raise RuntimeError("resolve_manifest did not attach node_uuid for a node-routed manifest")
+    return resolved.select(cols).unique()
 
 
 def read_manifest(
@@ -176,9 +260,15 @@ def read_manifest(
     end_known: datetime | None = None,
     include_updates: bool = False,
     include_knowledge_time: bool = False,
+    output: str = "frame",
     registry: SeriesRegistry | None = None,
-) -> pl.DataFrame:
-    """Bulk read via manifest. Detects edge vs node routing automatically."""
+) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+    """Bulk read via manifest. Detects edge vs node routing automatically.
+
+    ``output="frame"`` returns a single long DataFrame; ``output="by_path"``
+    returns a ``dict[(path, data_type, name), DataFrame]`` (or edge
+    equivalent). See :meth:`Client.read` for the public contract.
+    """
 
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read(
@@ -192,7 +282,7 @@ def read_manifest(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return _read_pipeline(pool, manifest, _call, unit=unit, registry=registry)
+    return _read_pipeline(pool, manifest, _call, unit=unit, output=output, registry=registry)
 
 
 def read_relative_manifest(
@@ -201,19 +291,21 @@ def read_relative_manifest(
     manifest: pl.DataFrame,
     *,
     unit: str | None = None,
+    output: str = "frame",
     registry: SeriesRegistry | None = None,
     **td_kwargs,
-) -> pl.DataFrame:
+) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
     """Bulk relative read via manifest.
 
     ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
-    see that signature for accepted arguments.
+    see that signature for accepted arguments. See :meth:`Client.read_relative`
+    for the public contract of ``output``.
     """
 
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return _read_pipeline(pool, manifest, _call, unit=unit, registry=registry)
+    return _read_pipeline(pool, manifest, _call, unit=unit, output=output, registry=registry)
 
 
 def apply_per_series_unit(

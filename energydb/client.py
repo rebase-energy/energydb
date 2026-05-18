@@ -39,7 +39,7 @@ from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, profiling
 
 from energydb import runs as runs_mod
-from energydb._frames import OutputType, to_output, to_polars
+from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import read_manifest, read_relative_manifest, write_manifest
 from energydb._persist import create_edge, register_tree_under
 from energydb._resolve_cache import SeriesRegistry
@@ -515,12 +515,32 @@ class Client:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-        output: OutputType = "polars",
-    ) -> pl.DataFrame | pd.DataFrame:
+        output: Output = "frame",
+        backend: Backend = "polars",
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
         """Bulk read via manifest. Detects edge vs node routing automatically.
 
-        Accepts pandas or polars on input. Returns polars by default; pass
-        ``output="pandas"`` for a pandas DataFrame.
+        Accepts pandas or polars on input. Output shape:
+
+        * ``output="frame"`` (default): a single DataFrame with columns
+          ``(path, data_type, name, valid_time, value, …)`` for node-routed
+          reads, or ``(from_path, to_path, edge_type, data_type, name,
+          valid_time, value, …)`` for edge-routed reads. ``path`` /
+          ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``.
+          Optional columns appear when ``include_knowledge_time`` /
+          ``include_updates`` are set.
+        * ``output="by_path"``: a ``dict`` keyed by
+          ``(path, data_type, name)`` (or the edge equivalent) with
+          per-series DataFrames carrying only the data columns
+          (``valid_time``, ``value``, plus opt-in time/audit columns).
+          Each sub-frame is sorted by ``valid_time`` ascending; secondary
+          sort keys are ``knowledge_time`` and/or ``change_time`` when
+          requested.
+
+        ``backend="polars"`` (default) returns polars frames;
+        ``backend="pandas"`` converts at the boundary. Internal
+        identifiers (``series_id``, ``node_uuid``, ``edge_uuid``) are
+        never exposed on the result.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
@@ -535,34 +555,40 @@ class Client:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            output=output,
             registry=self._series_registry,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
-            return to_output(result, output)
+            return to_backend(result, backend)
 
     def read_relative(
         self,
         df: pl.DataFrame | pd.DataFrame,
         *,
         unit: str | None = None,
-        output: OutputType = "polars",
+        output: Output = "frame",
+        backend: Backend = "polars",
         **td_kwargs,
-    ) -> pl.DataFrame | pd.DataFrame:
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
         """Bulk relative read via manifest.
 
-        Accepts pandas or polars on input. Returns polars by default; pass
-        ``output="pandas"`` for a pandas DataFrame.
-
+        See :meth:`read` for the ``output`` / ``backend`` contract.
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
         result = read_relative_manifest(
-            self._pool, self.td, manifest, unit=unit, registry=self._series_registry, **td_kwargs
+            self._pool,
+            self.td,
+            manifest,
+            unit=unit,
+            output=output,
+            registry=self._series_registry,
+            **td_kwargs,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
-            return to_output(result, output)
+            return to_backend(result, backend)
 
     # ------------------------------------------------------------------
     # Runs

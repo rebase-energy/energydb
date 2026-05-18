@@ -51,6 +51,7 @@ class Node(Base):
         ),
         sa.Index("ix_node_parent_uuid", "parent_uuid"),
         sa.Index("ix_node_data_gin", "data", postgresql_using="gin"),
+        sa.CheckConstraint("name !~ '/' AND length(name) > 0", name="node_name_valid"),
         {"schema": "energydb"},
     )
 
@@ -77,6 +78,11 @@ class Edge(Base):
 
     __table_args__ = (
         sa.UniqueConstraint("edge_type", "from_node_uuid", "to_node_uuid", name="edge_uniq"),
+        # NULL names are allowed; CHECK runs only when name IS NOT NULL.
+        sa.CheckConstraint(
+            "name IS NULL OR (name !~ '/' AND length(name) > 0)",
+            name="edge_name_valid",
+        ),
         {"schema": "energydb"},
     )
 
@@ -119,6 +125,7 @@ class Series(Base):
         sa.UniqueConstraint("node_uuid", "data_type", "name", name="series_node_uniq"),
         sa.UniqueConstraint("edge_uuid", "data_type", "name", name="series_edge_uniq"),
         sa.CheckConstraint("timeseries_type IN ('FLAT','OVERLAPPING')", name="valid_timeseries_type"),
+        sa.CheckConstraint("name !~ '/' AND length(name) > 0", name="series_name_valid"),
         sa.Index("ix_series_node_uuid", "node_uuid", postgresql_where=sa.text("node_uuid IS NOT NULL")),
         sa.Index("ix_series_edge_uuid", "edge_uuid", postgresql_where=sa.text("edge_uuid IS NOT NULL")),
         {"schema": "energydb"},

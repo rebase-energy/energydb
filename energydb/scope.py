@@ -17,11 +17,10 @@ resolution query and execute.
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
 import pandas as pd
@@ -31,7 +30,8 @@ from timedatamodel import TimeSeries, TimeSeriesType
 from timedb import profiling
 
 from energydb import series as series_mod
-from energydb._frames import OutputType, to_output, to_polars
+from energydb._frames import Backend, Output, to_backend, to_polars
+from energydb._io import read_relative_resolved, read_resolved
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
@@ -152,6 +152,24 @@ def _normalize_series_register_args(
     }
 
 
+_SCOPE_IDENTITY_NODE = ("path", "data_type", "name")
+_SCOPE_IDENTITY_EDGE = ("from_path", "to_path", "edge_type", "data_type", "name")
+
+
+def _strip_scope_identity(result: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
+    """Drop identity columns the scope caller already knows.
+
+    Applied when a scope read resolves to exactly one series — the caller
+    is unambiguously asking for that series' data, so re-broadcasting the
+    path / data_type / name on every row is pure noise. Multi-series
+    scope reads keep the full shape because callers need the identity
+    columns to disambiguate.
+    """
+    cols = _SCOPE_IDENTITY_EDGE if is_edge else _SCOPE_IDENTITY_NODE
+    present = [c for c in cols if c in result.columns]
+    return result.drop(present) if present else result
+
+
 def _attach_routing(
     df: pl.DataFrame,
     *,
@@ -208,25 +226,12 @@ class _BaseScope:
         (caller MUST NOT call ``.commit()`` / ``.rollback()``). Otherwise
         borrow from the pool; mutators are responsible for explicit
         ``commit()`` or ``rollback()``.
-
-        Only the pool *acquire* is timed as ``edb.conn_acquire`` — the body
-        of the caller's ``with`` block is its own work and is timed elsewhere.
-        Errors during the body propagate through the pool context manager's
-        ``__exit__`` so connection cleanup / rollback semantics are preserved.
         """
         if self._txn is not None:
             yield self._txn._conn
             return
-        cm = self._pool.connection()
-        with profiling._phase(profiling.PHASE_EDB_CONN_ACQUIRE):
-            conn = cm.__enter__()
-        try:
+        with self._pool.connection() as conn:
             yield conn
-        except BaseException:
-            if not cm.__exit__(*sys.exc_info()):
-                raise
-        else:
-            cm.__exit__(None, None, None)
 
     # -- subclass contract (overridden in NodeScope / EdgeScope) -------
 
@@ -247,8 +252,14 @@ class _BaseScope:
     def _not_found_msg(self, uuid_: UUID) -> str:
         raise NotImplementedError
 
-    def _build_read_manifest(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
-        """Subclass-specific: resolve scope's targets to a routing manifest."""
+    def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
+        """Subclass-specific: resolve the scope to per-series meta in PG.
+
+        Returns one row per series with columns ``(series_id, retention,
+        canonical_unit, data_type, name)`` plus exactly one of
+        ``node_uuid`` / ``edge_uuid`` — the input shape :func:`read_resolved`
+        expects. Returns ``None`` when the scope is empty / nothing matches.
+        """
         raise NotImplementedError
 
     # -- shared mutation machinery -------------------------------------
@@ -391,30 +402,43 @@ class _BaseScope:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-        output: OutputType = "polars",
-    ) -> pl.DataFrame | pd.DataFrame:
+        output: Output = "frame",
+        backend: Backend = "polars",
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
         """Read time-series data for this scope.
 
         For :class:`NodeScope` the manifest spans the resolved subtree;
-        for :class:`EdgeScope` it's the single edge. Returns polars by
-        default; pass ``output="pandas"`` for pandas.
+        for :class:`EdgeScope` it's the single edge. See :meth:`Client.read`
+        for the ``output`` / ``backend`` contract.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
-        manifest = self._build_read_manifest(data_type=data_type, name=name)
-        if manifest is None:
-            return to_output(pl.DataFrame(), output)
-        return self._client.read(
-            manifest,
-            unit=unit,
-            start_valid=start_valid,
-            end_valid=end_valid,
-            start_known=start_known,
-            end_known=end_known,
-            include_updates=include_updates,
-            include_knowledge_time=include_knowledge_time,
-            output=output,
+        meta = self._build_resolved_meta(data_type=data_type, name=name)
+        if meta is None:
+            empty: pl.DataFrame | dict[tuple, pl.DataFrame] = {} if output == "by_path" else pl.DataFrame()
+            return to_backend(empty, backend)
+        # Take the polars result first so the auto-strip is a single dtype op;
+        # convert to the requested backend at the boundary.
+        result = cast(
+            "pl.DataFrame | dict[tuple, pl.DataFrame]",
+            read_resolved(
+                self._pool,
+                self._td,
+                meta,
+                unit=unit,
+                start_valid=start_valid,
+                end_valid=end_valid,
+                start_known=start_known,
+                end_known=end_known,
+                include_updates=include_updates,
+                include_knowledge_time=include_knowledge_time,
+                output=output,
+                registry=self._client._series_registry,
+            ),
         )
+        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
+            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+        return to_backend(result, backend)
 
     def read_relative(
         self,
@@ -422,9 +446,10 @@ class _BaseScope:
         data_type: str,
         name: str,
         unit: str | None = None,
-        output: OutputType = "polars",
+        output: Output = "frame",
+        backend: Backend = "polars",
         **td_read_kwargs,
-    ) -> pl.DataFrame | pd.DataFrame:
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
         """Relative-window read for this scope.
 
         ``**td_read_kwargs`` are forwarded to
@@ -433,10 +458,25 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read_relative")
-        manifest = self._build_read_manifest(data_type=data_type, name=name)
-        if manifest is None:
-            return to_output(pl.DataFrame(), output)
-        return self._client.read_relative(manifest, unit=unit, output=output, **td_read_kwargs)
+        meta = self._build_resolved_meta(data_type=data_type, name=name)
+        if meta is None:
+            empty: pl.DataFrame | dict[tuple, pl.DataFrame] = {} if output == "by_path" else pl.DataFrame()
+            return to_backend(empty, backend)
+        result = cast(
+            "pl.DataFrame | dict[tuple, pl.DataFrame]",
+            read_relative_resolved(
+                self._pool,
+                self._td,
+                meta,
+                unit=unit,
+                output=output,
+                registry=self._client._series_registry,
+                **td_read_kwargs,
+            ),
+        )
+        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
+            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+        return to_backend(result, backend)
 
 
 # ---------------------------------------------------------------------------
@@ -801,15 +841,19 @@ class NodeScope(_BaseScope):
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
 
-    def _build_read_manifest(
+    def _build_resolved_meta(
         self,
         *,
         data_type: str | None,
         name: str | None,
     ) -> pl.DataFrame | None:
-        """Resolve the scope's subtree to a node-routed manifest.
+        """Resolve the scope's subtree to per-series read meta in one PG round-trip.
 
-        Returns ``None`` when the scope is empty or no series match.
+        Returns the per-series ``(series_id, retention, canonical_unit,
+        data_type, name, node_uuid)`` frame :func:`read_resolved` consumes
+        directly — no second hash-and-join pass through
+        :func:`resolve_manifest`. ``None`` when the subtree is empty or no
+        series match the optional ``data_type`` / ``name`` filters.
         """
         with self._use_conn() as conn:
             target_uuids = self._resolve_target_node_uuids(conn)
@@ -827,7 +871,9 @@ class NodeScope(_BaseScope):
         if meta.is_empty():
             return None
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            return meta.select(["node_uuid", "data_type", "name"]).unique()
+            # Drop the unused owner column; resolve_for_read guarantees one
+            # row per series, so no extra dedupe pass.
+            return meta.drop("edge_uuid")
 
 
 # ---------------------------------------------------------------------------
@@ -1033,14 +1079,13 @@ class EdgeScope(_BaseScope):
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
 
-    def _build_read_manifest(
+    def _build_resolved_meta(
         self,
         *,
         data_type: str | None,
         name: str | None,
     ) -> pl.DataFrame | None:
-        """Resolve this edge to an edge-routed manifest. Returns ``None``
-        when no series match the given filters."""
+        """Resolve this edge to per-series read meta. ``None`` if no series match."""
         with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None
@@ -1055,4 +1100,4 @@ class EdgeScope(_BaseScope):
         if meta.is_empty():
             return None
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            return meta.select(["edge_uuid", "data_type", "name"]).unique()
+            return meta.drop("node_uuid")
