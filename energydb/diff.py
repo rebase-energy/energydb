@@ -53,23 +53,29 @@ class EdgeSnapshot:
 
 
 @dataclass(frozen=True)
-class NodeChange:
-    """A single node-level diff entry.
+class _BaseChange[SnapshotT]:
+    """Shared structure for :class:`NodeChange` and :class:`EdgeChange`.
 
     ``old`` is the DB state before the change; ``new`` is the target state
-    after. Inserts have ``old=None``; deletes have ``new=None``.
+    after. Inserts have ``old=None``; deletes have ``new=None``. At least
+    one must be set.
     """
 
-    old: NodeSnapshot | None
-    new: NodeSnapshot | None
+    old: SnapshotT | None
+    new: SnapshotT | None
 
     def __post_init__(self):
         if self.old is None and self.new is None:
-            raise ValueError("NodeChange must have at least one of old/new set.")
+            raise ValueError(f"{type(self).__name__} must have at least one of old/new set.")
+
+    def _present(self) -> SnapshotT:
+        """Return whichever of ``new`` / ``old`` is non-null. For inserts
+        and updates that's ``new``; for deletes it's ``old``."""
+        return self.new if self.new is not None else self.old  # type: ignore[return-value]
 
     @property
     def uuid(self) -> UUID:
-        return self.new.uuid if self.new is not None else self.old.uuid  # type: ignore[union-attr]
+        return self._present().uuid  # type: ignore[attr-defined]
 
     @property
     def kind(self) -> str:
@@ -80,16 +86,21 @@ class NodeChange:
         return "update"
 
     @property
+    def data_changed(self) -> bool:
+        return self.kind == "update" and self.old.data != self.new.data  # type: ignore[union-attr]
+
+
+@dataclass(frozen=True)
+class NodeChange(_BaseChange[NodeSnapshot]):
+    """A single node-level diff entry."""
+
+    @property
     def display_name(self) -> str:
-        if self.new is not None:
-            return self.new.name
-        return self.old.name  # type: ignore[union-attr]
+        return self._present().name
 
     @property
     def display_type(self) -> str:
-        if self.new is not None:
-            return self.new.node_type
-        return self.old.node_type  # type: ignore[union-attr]
+        return self._present().node_type
 
     @property
     def renamed(self) -> bool:
@@ -99,45 +110,19 @@ class NodeChange:
     def moved(self) -> bool:
         return self.kind == "update" and self.old.parent_uuid != self.new.parent_uuid  # type: ignore[union-attr]
 
-    @property
-    def data_changed(self) -> bool:
-        return self.kind == "update" and self.old.data != self.new.data  # type: ignore[union-attr]
-
 
 @dataclass(frozen=True)
-class EdgeChange:
+class EdgeChange(_BaseChange[EdgeSnapshot]):
     """A single edge-level diff entry."""
-
-    old: EdgeSnapshot | None
-    new: EdgeSnapshot | None
-
-    def __post_init__(self):
-        if self.old is None and self.new is None:
-            raise ValueError("EdgeChange must have at least one of old/new set.")
-
-    @property
-    def uuid(self) -> UUID:
-        return self.new.uuid if self.new is not None else self.old.uuid  # type: ignore[union-attr]
-
-    @property
-    def kind(self) -> str:
-        if self.old is None:
-            return "insert"
-        if self.new is None:
-            return "delete"
-        return "update"
 
     @property
     def display_name(self) -> str:
-        if self.new is not None:
-            return self.new.name or self.new.edge_type
-        return self.old.name or self.old.edge_type  # type: ignore[union-attr]
+        snap = self._present()
+        return snap.name or snap.edge_type
 
     @property
     def display_type(self) -> str:
-        if self.new is not None:
-            return self.new.edge_type
-        return self.old.edge_type  # type: ignore[union-attr]
+        return self._present().edge_type
 
     @property
     def endpoints_changed(self) -> bool:
@@ -145,10 +130,6 @@ class EdgeChange:
             self.old.from_node_uuid != self.new.from_node_uuid  # type: ignore[union-attr]
             or self.old.to_node_uuid != self.new.to_node_uuid  # type: ignore[union-attr]
         )
-
-    @property
-    def data_changed(self) -> bool:
-        return self.kind == "update" and self.old.data != self.new.data  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +201,7 @@ class TreeDiff:
     # Pretty-print (tree-shaped)
     # ------------------------------------------------------------------
 
-    def print(self, file: IO[str] | None = None) -> None:
+    def render(self, file: IO[str] | None = None) -> None:
         """Render the diff as a tree-shaped textual preview.
 
         Output format::
@@ -303,7 +284,7 @@ def _render_row_for_node(change: NodeChange) -> _RenderRow:
         return _RenderRow(
             marker="-",
             label=label,
-            note="  [delete] (allow_delete required)",
+            note="  [delete]",
             parent_uuid=snap.parent_uuid,
         )
 
@@ -376,7 +357,7 @@ def _edge_change_note(change: EdgeChange) -> str:
     if change.kind == "insert":
         return "  [insert]"
     if change.kind == "delete":
-        return "  [delete] (allow_delete required)"
+        return "  [delete]"
     notes: list[str] = []
     if change.endpoints_changed:
         notes.append("endpoints changed")

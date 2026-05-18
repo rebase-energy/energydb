@@ -36,19 +36,19 @@ import polars as pl
 from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
-from timedb import TimeDBClient
+from timedb import TimeDBClient, profiling
 
 from energydb import runs as runs_mod
-from energydb._frames import OutputType, to_output, to_polars
+from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import read_manifest, read_relative_manifest, write_manifest
 from energydb._persist import create_edge, register_tree_under
+from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
     Path,
+    build_filter_conditions,
     resolve_node_uuid,
-    resolve_path,
-    resolve_paths_bulk,
     resolve_subtree_uuids,
 )
 from energydb.scope import EdgeScope, NodeScope, _coerce_path
@@ -73,6 +73,13 @@ class Client:
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
             raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
+        if "://" not in conninfo:
+            raise ValueError(
+                "pg_conninfo must be a URI (e.g. postgresql://user:pass@host/db); "
+                "key=value DSNs are not supported here because the schema-create path "
+                "needs a SQLAlchemy URL."
+            )
+        self._dsn = conninfo
 
         def _configure(conn):
             conn.execute(_SEARCH_PATH)
@@ -86,6 +93,7 @@ class Client:
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
+        self._series_registry = SeriesRegistry()
 
     # ------------------------------------------------------------------
     # Schema management
@@ -115,6 +123,32 @@ class Client:
 
     def close(self) -> None:
         self._pool.close()
+
+    # ------------------------------------------------------------------
+    # Resolve cache
+    # ------------------------------------------------------------------
+
+    def invalidate_series_cache(self, owner_uuid: UUID | None = None) -> None:
+        """Drop cached series metadata.
+
+        With no argument, clears every entry. With an ``owner_uuid``, evicts
+        only entries owned by that node or edge.
+
+        The cache is normally maintained automatically — in-process
+        registrations and node/edge deletions update it transparently.
+        Call this only to recover from a cross-process modification that
+        invalidated state held in this client (another process registered,
+        deleted, or flipped ``timeseries_type`` on a series this client had
+        cached).
+        """
+        if owner_uuid is None:
+            self._series_registry.clear()
+        else:
+            self._series_registry.evict_owner(str(owner_uuid))
+
+    def resolve_cache_stats(self) -> dict[str, int]:
+        """Return cumulative resolve cache hits/misses and current size."""
+        return self._series_registry.stats()
 
     # ------------------------------------------------------------------
     # Fluent entry — scopes for navigation & single-element ops
@@ -212,6 +246,14 @@ class Client:
         under which the tree's root is grafted; ``None`` means create at
         root. Raises if ``under`` points at a non-existent parent.
 
+        Series declarations attached to nodes/edges on the tree **are**
+        registered alongside their owners but are not represented in the
+        returned :class:`TreeDiff`. Adding a series to a node that
+        already exists in the DB is not supported here (the create-only
+        pre-check rejects the whole payload); use
+        :meth:`NodeScope.register_series` /
+        :meth:`EdgeScope.register_series` instead.
+
         Returns the ``uuid`` of the tree's root, except when
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
         """
@@ -222,6 +264,7 @@ class Client:
                 edm_obj,
                 parent_uuid=parent_uuid,
                 dry_run=dry_run,
+                registry=None if dry_run else self._series_registry,
             )
             if dry_run:
                 conn.rollback()
@@ -243,25 +286,21 @@ class Client:
         ``within`` accepts a path (tuple/list), a single name (str), or a
         :class:`UUID`.
         """
-        conditions: list[str] = []
-        params: list[Any] = []
+        where_filters: dict[str, Any] = dict(property_filters)
+        if type is not None:
+            where_filters["node_type"] = type
 
         with self._pool.connection() as conn:
+            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
+            conditions: list[str] = list(filter_conds)
+            params: list[Any] = list(filter_params)
+
             if within is not None:
                 within_uuid = (
                     within if isinstance(within, UUID) else resolve_node_uuid(conn, _coerce_path((), kwarg=within))
                 )
                 conditions.append("uuid = ANY(%s)")
                 params.append(resolve_subtree_uuids(conn, within_uuid))
-
-            if type is not None:
-                conditions.append("node_type = %s")
-                params.append(type)
-
-            for key, value in property_filters.items():
-                conditions.append("data->>%s = %s")
-                params.append(key)
-                params.append(str(value))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
@@ -284,7 +323,7 @@ class Client:
         index in one pass.
         """
         with self._pool.connection() as conn:
-            edge_uuid = create_edge(conn, edm_obj, tree_root=None)
+            edge_uuid = create_edge(conn, edm_obj, tree_root=None, registry=self._series_registry)
             conn.commit()
         return edge_uuid
 
@@ -300,9 +339,14 @@ class Client:
         ``within`` (path tuple/list, a single name as str, or a :class:`UUID`)
         restricts to edges where either endpoint is in that subtree.
         """
+        where_filters: dict[str, Any] = dict(property_filters)
+        if type is not None:
+            where_filters["edge_type"] = type
+
         with self._pool.connection() as conn:
-            conditions: list[str] = []
-            params: list[Any] = []
+            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
+            conditions: list[str] = list(filter_conds)
+            params: list[Any] = list(filter_params)
 
             if within is not None:
                 within_uuid = (
@@ -312,15 +356,6 @@ class Client:
                 conditions.append("(from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s))")
                 params.append(subtree)
                 params.append(subtree)
-
-            if type is not None:
-                conditions.append("edge_type = %s")
-                params.append(type)
-
-            for key, value in property_filters.items():
-                conditions.append("data->>%s = %s")
-                params.append(key)
-                params.append(str(value))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
@@ -360,6 +395,12 @@ class Client:
         With ``include_series=True``, every reconstructed node has its
         registered series attached as metadata-only :class:`TimeSeries`
         entries (``df=None``) on ``timeseries``.
+
+        **Edges are intentionally not attached to the returned tree.**
+        The result is a node-only subtree walked via ``parent_uuid``.
+        Edges (and their series) live alongside nodes in the schema but
+        outside the tree shape — query them separately with
+        :meth:`get_edge` or :meth:`query_edges`.
         """
         with self._pool.connection() as conn:
             if uuid is not None:
@@ -447,10 +488,12 @@ class Client:
         Series must already be registered (typically via
         :meth:`register_tree`). Returns the ``run_id`` used.
         """
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            df_pl = to_polars(df)
         return write_manifest(
             self._pool,
             self.td,
-            to_polars(df),
+            df_pl,
             knowledge_time=knowledge_time,
             run_id=run_id,
             workflow_id=workflow_id,
@@ -458,6 +501,7 @@ class Client:
             run_start_time=run_start_time,
             run_finish_time=run_finish_time,
             run_params=run_params,
+            registry=self._series_registry,
         )
 
     def read(
@@ -471,17 +515,39 @@ class Client:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
-        output: OutputType = "pandas",
-    ) -> pl.DataFrame | pd.DataFrame:
+        output: Output = "frame",
+        backend: Backend = "polars",
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
         """Bulk read via manifest. Detects edge vs node routing automatically.
 
-        Accepts pandas or polars on input. Returns pandas by default; pass
-        ``output="polars"`` for a polars DataFrame.
+        Accepts pandas or polars on input. Output shape:
+
+        * ``output="frame"`` (default): a single DataFrame with columns
+          ``(path, data_type, name, valid_time, value, …)`` for node-routed
+          reads, or ``(from_path, to_path, edge_type, data_type, name,
+          valid_time, value, …)`` for edge-routed reads. ``path`` /
+          ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``.
+          Optional columns appear when ``include_knowledge_time`` /
+          ``include_updates`` are set.
+        * ``output="by_path"``: a ``dict`` keyed by
+          ``(path, data_type, name)`` (or the edge equivalent) with
+          per-series DataFrames carrying only the data columns
+          (``valid_time``, ``value``, plus opt-in time/audit columns).
+          Each sub-frame is sorted by ``valid_time`` ascending; secondary
+          sort keys are ``knowledge_time`` and/or ``change_time`` when
+          requested.
+
+        ``backend="polars"`` (default) returns polars frames;
+        ``backend="pandas"`` converts at the boundary. Internal
+        identifiers (``series_id``, ``node_uuid``, ``edge_uuid``) are
+        never exposed on the result.
         """
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            manifest = to_polars(df)
         result = read_manifest(
             self._pool,
             self.td,
-            to_polars(df),
+            manifest,
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -489,24 +555,40 @@ class Client:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            output=output,
+            registry=self._series_registry,
         )
-        return to_output(result, output)
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            return to_backend(result, backend)
 
     def read_relative(
         self,
         df: pl.DataFrame | pd.DataFrame,
         *,
         unit: str | None = None,
-        output: OutputType = "pandas",
+        output: Output = "frame",
+        backend: Backend = "polars",
         **td_kwargs,
-    ) -> pl.DataFrame | pd.DataFrame:
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
         """Bulk relative read via manifest.
 
-        Accepts pandas or polars on input. Returns pandas by default; pass
-        ``output="polars"`` for a polars DataFrame.
+        See :meth:`read` for the ``output`` / ``backend`` contract.
+        ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
+        see that signature for accepted arguments (window selectors, etc.).
         """
-        result = read_relative_manifest(self._pool, self.td, to_polars(df), unit=unit, **td_kwargs)
-        return to_output(result, output)
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            manifest = to_polars(df)
+        result = read_relative_manifest(
+            self._pool,
+            self.td,
+            manifest,
+            unit=unit,
+            output=output,
+            registry=self._series_registry,
+            **td_kwargs,
+        )
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            return to_backend(result, backend)
 
     # ------------------------------------------------------------------
     # Runs
@@ -525,16 +607,4 @@ class Client:
     # ------------------------------------------------------------------
 
     def _sqlalchemy_url(self) -> str:
-        conninfo = self._pool.conninfo
-        if "://" in conninfo:
-            return f"postgresql+psycopg://{conninfo.split('://', 1)[-1]}"
-        return conninfo
-
-    @staticmethod
-    def _resolve_path(conn, node_uuid: UUID) -> Path:
-        """Convenience wrapper used by tests."""
-        return resolve_path(conn, node_uuid)
-
-    @staticmethod
-    def _resolve_paths_bulk(conn, node_uuids: list[UUID]) -> dict[UUID, Path]:
-        return resolve_paths_bulk(conn, node_uuids)
+        return f"postgresql+psycopg://{self._dsn.split('://', 1)[-1]}"

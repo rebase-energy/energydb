@@ -193,7 +193,7 @@ preview the diff before applying. The call returns a
    diff = client.register_tree(
        portfolio, mode="replace_subtree", allow_delete=True, dry_run=True,
    )
-   diff.print()
+   diff.render()
 
    # Looks good — apply.
    client.register_tree(portfolio, mode="replace_subtree", allow_delete=True)
@@ -203,14 +203,14 @@ views (``node_inserts``, ``node_renames``, ``node_moves``,
 ``node_data_edits``, ``node_deletes``, ``edge_inserts`` / ``edge_updates``
 / ``edge_deletes``).
 
-``TreeDiff.print()`` renders a tree-shaped textual preview::
+``TreeDiff.render()`` renders a tree-shaped textual preview::
 
    Portfolio 'P'
    ├── ~ Site 'NewName'                            [rename 'OldName' → 'NewName']
    │   ├── + WindTurbine 'T03'                     [insert]
    │   ├──   WindTurbine 'T01'
    │   ├── ~ WindTurbine 'T02'                     [capacity: 3.5 → 4.0]
-   │   └── - Battery 'B1'                          [delete] (allow_delete required)
+   │   └── - Battery 'B1'                          [delete]
    └── → Site 'Other'                              [moved (parent <a> → <b>)]
    edges:
      + Line 'Cable-1' <a-uuid> → <b-uuid>          [insert]
@@ -443,8 +443,8 @@ subtree. Pass ``data_type=`` and ``name=`` to narrow:
        data_type="actual", name="power",
    )
 
-The read returns a pandas DataFrame by default; pass ``output="polars"`` for
-polars. Columns include the standard timedb output (``series_id``,
+The read returns a polars DataFrame by default; pass ``output="pandas"`` for
+pandas. Columns include the standard timedb output (``series_id``,
 ``valid_time``, ``value``, plus optional ``knowledge_time`` /
 ``change_time`` flags) joined with the energydb-side hierarchy info:
 ``path`` (List[str]), ``node`` (display name), ``node_type``, ``node_uuid``,
@@ -568,7 +568,7 @@ The read manifest is the same shape, minus the data columns:
        end_valid=datetime(2026, 2, 1, tzinfo=UTC),
    )
 
-Returns a pandas DataFrame by default; pass ``output="polars"`` for polars.
+Returns a polars DataFrame by default; pass ``output="pandas"`` for pandas.
 
 Optional kwargs:
 
@@ -669,7 +669,7 @@ Best Practices
    no delete-then-insert dance, no full tree round-trip.
 
 4. **Use ``dry_run=True`` before destructive ``replace_subtree``.** Inspect
-   the :class:`~energydb.TreeDiff` (or call ``.print()``) and confirm before
+   the :class:`~energydb.TreeDiff` (or call ``.render()``) and confirm before
    passing ``allow_delete=True``.
 
 5. **Pick a routing column per pipeline.** Mixing ``path`` and ``node_uuid``

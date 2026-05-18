@@ -1,4 +1,4 @@
-"""Write helpers — node/edge upserts, series registration, tree walks.
+"""Write helpers — node/edge inserts, series registration, tree walks.
 
 These helpers all take an open ``conn`` and do **not** commit. The caller
 controls the transaction boundary, which is how ``client.register_tree``
@@ -6,16 +6,18 @@ gets the whole structure walk persisted atomically. ``register_tree_under``
 is structure-only (no timeseries data); manifest data writes go through
 ``_io.write_manifest``.
 
-Identity is the EDM ``Element.id`` (UUID7). ``create_node`` uses
-``ON CONFLICT (uuid) DO UPDATE`` so renames, moves, and property edits all
-fall out of one statement. Edge endpoints are written straight into the FK
-columns ``from_node_uuid`` / ``to_node_uuid`` — no path resolution at write
-time.
+Identity is the EDM ``Element.id`` (UUID7). ``create_node`` is create-only
+(``register_tree`` pre-validates that the uuid does not exist). Renames,
+moves, and property edits go through the scope mutators on
+:class:`NodeScope`. ``create_edge`` keeps an ``ON CONFLICT`` upsert because
+it's exposed as :meth:`Client.create_edge` and documented as idempotent.
+Edge endpoints are written straight into the FK columns
+``from_node_uuid`` / ``to_node_uuid`` — no path resolution at write time.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import energydatamodel as edm
@@ -24,75 +26,52 @@ from energydatamodel.reference import Reference
 from timedatamodel import TimeSeries, TimeSeriesType
 
 from energydb import series as series_mod
+from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.serialization import serialize_edge, serialize_node
+from energydb.series import validate_name
+from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
 # Node / edge persistence
 # ---------------------------------------------------------------------------
 
 
-def create_node(conn, edm_obj, *, parent_uuid: UUID | None) -> UUID:
-    """Upsert one node under ``parent_uuid`` (or as a root if ``None``).
+def create_node(
+    conn,
+    edm_obj,
+    *,
+    parent_uuid: UUID | None,
+    registry: SeriesRegistry | None = None,
+) -> UUID:
+    """Insert one node under ``parent_uuid`` (or as a root if ``None``).
 
-    Identity is ``edm_obj.id`` (UUID7). ``ON CONFLICT (uuid)`` covers
-    renames, moves (``parent_uuid`` change), and property edits in a single
-    statement. Type changes for an existing uuid are rejected — the
-    conditional ``WHERE`` clause excludes the row, the row count comes back
-    zero, and we surface a clear error.
-
-    The conditional ``WHERE`` clause also skips the no-op UPDATE so
-    ``updated_at`` doesn't churn on idempotent re-writes with identical
-    content.
-
-    Same name + a *different* node_type under the same parent (different
-    uuid) raises via the ``UNIQUE (parent_uuid, name)`` constraint.
+    Caller (``_apply_diff``) is create-only and has already verified the
+    uuid does not exist, so a plain ``INSERT`` is enough. A colliding
+    ``(parent_uuid, name)`` pair surfaces as a uniqueness error from the
+    DB — kept implicit because the diff path can't reasonably preempt it
+    without a separate read round-trip.
     """
     row_data = serialize_node(edm_obj)
     uuid_val: UUID = row_data["uuid"]
-    node_type = row_data["node_type"]
-    name = row_data["name"]
-    data = row_data["data"]
+    validate_name(row_data["name"], kind="node")
 
-    sql = """
-        INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, data)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (uuid) DO UPDATE
-          SET name        = EXCLUDED.name,
-              parent_uuid = EXCLUDED.parent_uuid,
-              data        = EXCLUDED.data,
-              updated_at  = now()
-          WHERE energydb.node.node_type = EXCLUDED.node_type
-            AND (energydb.node.name, energydb.node.parent_uuid, energydb.node.data)
-                IS DISTINCT FROM
-                (EXCLUDED.name, EXCLUDED.parent_uuid, EXCLUDED.data)
-        RETURNING uuid
-    """
-    result = conn.execute(sql, (uuid_val, node_type, name, parent_uuid, data)).fetchone()
+    conn.execute(
+        "INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, data) VALUES (%s, %s, %s, %s, %s)",
+        (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, row_data["data"]),
+    )
 
-    if result is None:
-        # ON CONFLICT skipped UPDATE either because (a) data was identical
-        # (idempotent re-write — fine) or (b) node_type differs (illegal —
-        # raise). Disambiguate by re-fetching the existing row.
-        existing = conn.execute(
-            "SELECT node_type FROM energydb.node WHERE uuid = %s",
-            (uuid_val,),
-        ).fetchone()
-        if existing is None:
-            raise RuntimeError("upsert returned no row but follow-up SELECT found nothing — concurrency bug")
-        existing_type = existing[0]
-        if existing_type != node_type:
-            raise ValueError(
-                f"Cannot persist {node_type}({name!r}) with id={uuid_val}: a "
-                f"{existing_type} with the same id already exists. "
-                f"Element type is immutable for a given id — register a new id."
-            )
-
-    register_node_descriptors(conn, uuid_val, edm_obj)
+    _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj, registry=registry)
     return uuid_val
 
 
-def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
+def create_edge(
+    conn,
+    edm_obj,
+    *,
+    tree_root: edm.Element | None = None,
+    registry: SeriesRegistry | None = None,
+) -> UUID:
     """Upsert one edge.
 
     Endpoint UUIDs come from ``edm_obj.from_element`` / ``to_element``
@@ -108,6 +87,8 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
     """
     row_data = serialize_edge(edm_obj)
     uuid_val: UUID = row_data["uuid"]
+    if row_data["name"] is not None:
+        validate_name(row_data["name"], kind="edge")
 
     from_uuid = _endpoint_uuid(edm_obj, "from_element", tree_root)
     to_uuid = _endpoint_uuid(edm_obj, "to_element", tree_root)
@@ -142,7 +123,7 @@ def create_edge(conn, edm_obj, *, tree_root: edm.Element | None = None) -> UUID:
                 f"Edge type is immutable for a given id."
             )
 
-    register_edge_descriptors(conn, uuid_val, edm_obj)
+    _register_descriptors(conn, owner_col="edge_uuid", owner_uuid=uuid_val, edm_obj=edm_obj, registry=registry)
     return uuid_val
 
 
@@ -184,6 +165,7 @@ def register_tree_under(
     *,
     parent_uuid: UUID | None,
     dry_run: bool = False,
+    registry: SeriesRegistry | None = None,
 ) -> tuple[UUID, TreeDiff]:
     """Walk the EDM tree DFS, insert nodes/edges, register series.
 
@@ -205,54 +187,44 @@ def register_tree_under(
     """
     _validate_no_inline_data(edm_obj)
 
-    target_nodes, target_edges, root_uuid = _collect_target_state(edm_obj, parent_uuid)
-    current_nodes = _fetch_nodes_by_uuids(conn, list(target_nodes.keys()))
-    current_edges = _fetch_edges_by_uuids(conn, list(target_edges.keys()))
+    target_nodes, target_edges, node_objs, edge_objs, root_uuid = _collect_target_state(edm_obj, parent_uuid)
+    existing_node_uuids = _existing_uuids(conn, "node", list(target_nodes.keys()))
+    existing_edge_uuids = _existing_uuids(conn, "edge", list(target_edges.keys()))
 
-    if current_nodes or current_edges:
-        existing_nodes = ", ".join(f"{s.node_type}({s.name!r})" for s in current_nodes.values())
-        existing_edges = ", ".join(f"{s.edge_type}({s.name!r})" for s in current_edges.values())
+    if existing_node_uuids or existing_edge_uuids:
         parts = []
-        if existing_nodes:
-            parts.append(f"node(s): {existing_nodes}")
-        if existing_edges:
-            parts.append(f"edge(s): {existing_edges}")
+        if existing_node_uuids:
+            parts.append(f"node uuid(s): {', '.join(str(u) for u in existing_node_uuids)}")
+        if existing_edge_uuids:
+            parts.append(f"edge uuid(s): {', '.join(str(u) for u in existing_edge_uuids)}")
         raise ValueError(
-            f"register_tree is create-only; the payload contains {len(current_nodes)} "
-            f"node(s) and {len(current_edges)} edge(s) whose UUIDs already exist "
-            f"({'; '.join(parts)}). To modify existing rows use scope mutators "
+            f"register_tree is create-only; the payload contains "
+            f"{len(existing_node_uuids)} node(s) and {len(existing_edge_uuids)} "
+            f"edge(s) whose UUIDs already exist ({'; '.join(parts)}). "
+            f"To modify existing rows use scope mutators "
             f"(client.get_node(...).rename(), .update(), .delete(), .move_to()) "
             f"or batch them with client.transaction()."
         )
 
-    diff = _compute_diff(target_nodes, current_nodes, target_edges, current_edges)
-    _validate_no_type_changes(diff)
+    # Create-only path: every target row is an insert. No need for an
+    # update/delete branch — the existing-uuid pre-check above raises.
+    diff = TreeDiff(
+        node_changes=[NodeChange(old=None, new=s) for s in target_nodes.values()],
+        edge_changes=[EdgeChange(old=None, new=s) for s in target_edges.values()],
+    )
 
     if dry_run:
         return root_uuid, diff
 
-    _apply_diff(conn, edm_obj, diff, target_nodes, target_edges)
+    # node_objs is in DFS order (parent-before-child) — exactly what the
+    # parent_uuid FK chain needs. Edges go second once their endpoints exist.
+    # Series declarations attached to each owner are registered as a side
+    # effect of create_node / create_edge.
+    for uid, obj in node_objs.items():
+        create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid, registry=registry)
+    for obj in edge_objs.values():
+        create_edge(conn, obj, tree_root=edm_obj, registry=registry)
     return root_uuid, diff
-
-
-def _validate_no_type_changes(diff: TreeDiff) -> None:
-    """Raise if any update changes the node_type / edge_type of an existing
-    uuid. ``ON CONFLICT (uuid) WHERE node_type = EXCLUDED.node_type`` would
-    otherwise just silently no-op the row — better to fail loudly here so
-    the diff stays internally consistent.
-    """
-    for c in diff.node_updates:
-        assert c.old is not None and c.new is not None
-        if c.old.node_type != c.new.node_type:
-            raise ValueError(
-                f"Cannot change node_type for uuid={c.uuid}: "
-                f"{c.old.node_type!r} → {c.new.node_type!r}. "
-                f"Element type is immutable for a given id."
-            )
-    for c in diff.edge_updates:
-        assert c.old is not None and c.new is not None
-        if c.old.edge_type != c.new.edge_type:
-            raise ValueError(f"Cannot change edge_type for uuid={c.uuid}: {c.old.edge_type!r} → {c.new.edge_type!r}.")
 
 
 # ---------------------------------------------------------------------------
@@ -263,62 +235,70 @@ def _validate_no_type_changes(diff: TreeDiff) -> None:
 def _collect_target_state(
     edm_obj,
     parent_uuid: UUID | None,
-) -> tuple[dict[UUID, NodeSnapshot], dict[UUID, EdgeSnapshot], UUID]:
-    """Walk the EDM tree DFS; return (nodes, edges, root_uuid).
+) -> tuple[
+    dict[UUID, NodeSnapshot],
+    dict[UUID, EdgeSnapshot],
+    dict[UUID, Any],
+    dict[UUID, Any],
+    UUID,
+]:
+    """Walk the EDM tree once; collect node/edge snapshots and EDM-object refs.
 
-    Nodes are keyed by their UUID; same for edges. Each value is a
-    :class:`NodeSnapshot` / :class:`EdgeSnapshot` ready to compare to the
-    persisted state.
+    Returns ``(node_snaps, edge_snaps, node_objs, edge_objs, root_uuid)``.
+    ``node_objs`` is in DFS order so iterating it satisfies parent-before-
+    child for FK resolution. ``edge_objs`` is filled in a second linear
+    pass over the queued edges, after every node has been seen — that's
+    the only way to validate that edge endpoints aren't cross-tree.
     """
-    nodes: dict[UUID, NodeSnapshot] = {}
-    edges: dict[UUID, EdgeSnapshot] = {}
+    node_snaps: dict[UUID, NodeSnapshot] = {}
+    node_objs: dict[UUID, Any] = {}
+    edge_queue: list[Any] = []
 
-    def _visit_nodes(obj, parent_ref: UUID | None):
+    def _visit(obj, parent_ref: UUID | None) -> None:
         if isinstance(obj, edm.Edge):
-            return  # edges handled in pass 2
-        if obj.id in nodes:
+            edge_queue.append(obj)
+            return
+        if obj.id in node_snaps:
             raise ValueError(
                 f"Duplicate UUID {obj.id} on two distinct nodes in the tree. Each Element must have a unique id."
             )
         row = serialize_node(obj)
-        nodes[obj.id] = NodeSnapshot(
+        node_snaps[obj.id] = NodeSnapshot(
             uuid=obj.id,
             node_type=row["node_type"],
             name=row["name"],
             parent_uuid=parent_ref,
             data=row["data"].obj,
         )
+        node_objs[obj.id] = obj
         for child in obj.children():
-            _visit_nodes(child, obj.id)
+            _visit(child, obj.id)
 
-    def _visit_edges(obj):
-        for child in obj.children():
-            if isinstance(child, edm.Edge):
-                if child.id in edges:
-                    raise ValueError(f"Duplicate UUID {child.id} on two distinct edges in the tree.")
-                row = serialize_edge(child)
-                from_uuid = _endpoint_uuid(child, "from_element", obj)
-                to_uuid = _endpoint_uuid(child, "to_element", obj)
-                # Cross-tree edge check: endpoints must resolve in target nodes.
-                if from_uuid not in nodes:
-                    raise ValueError(f"Edge {child.id} from_element {from_uuid} is not in the tree.")
-                if to_uuid not in nodes:
-                    raise ValueError(f"Edge {child.id} to_element {to_uuid} is not in the tree.")
-                edges[child.id] = EdgeSnapshot(
-                    uuid=child.id,
-                    edge_type=row["edge_type"],
-                    name=row["name"],
-                    from_node_uuid=from_uuid,
-                    to_node_uuid=to_uuid,
-                    data=row["data"].obj,
-                )
-            else:
-                _visit_edges(child)
+    _visit(edm_obj, parent_uuid)
 
-    _visit_nodes(edm_obj, parent_uuid)
-    _visit_edges(edm_obj)
+    edge_snaps: dict[UUID, EdgeSnapshot] = {}
+    edge_objs: dict[UUID, Any] = {}
+    for child in edge_queue:
+        if child.id in edge_snaps:
+            raise ValueError(f"Duplicate UUID {child.id} on two distinct edges in the tree.")
+        row = serialize_edge(child)
+        from_uuid = _endpoint_uuid(child, "from_element", edm_obj)
+        to_uuid = _endpoint_uuid(child, "to_element", edm_obj)
+        if from_uuid not in node_snaps:
+            raise ValueError(f"Edge {child.id} from_element {from_uuid} is not in the tree.")
+        if to_uuid not in node_snaps:
+            raise ValueError(f"Edge {child.id} to_element {to_uuid} is not in the tree.")
+        edge_snaps[child.id] = EdgeSnapshot(
+            uuid=child.id,
+            edge_type=row["edge_type"],
+            name=row["name"],
+            from_node_uuid=from_uuid,
+            to_node_uuid=to_uuid,
+            data=row["data"].obj,
+        )
+        edge_objs[child.id] = child
 
-    return nodes, edges, edm_obj.id
+    return node_snaps, edge_snaps, node_objs, edge_objs, edm_obj.id
 
 
 # ---------------------------------------------------------------------------
@@ -326,50 +306,22 @@ def _collect_target_state(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_subtree_state(
-    conn,
-    root_uuid: UUID,
-) -> tuple[dict[UUID, NodeSnapshot], dict[UUID, EdgeSnapshot]]:
-    """Recursive CTE: fetch every node and edge under ``root_uuid``."""
-    node_rows = conn.execute(
-        """
-        WITH RECURSIVE subtree AS (
-            SELECT uuid, node_type, name, parent_uuid, data
-            FROM energydb.node WHERE uuid = %s
-            UNION ALL
-            SELECT n.uuid, n.node_type, n.name, n.parent_uuid, n.data
-            FROM energydb.node n JOIN subtree s ON n.parent_uuid = s.uuid
-        ) CYCLE uuid SET _is_cycle USING _cycle_path
-        SELECT uuid, node_type, name, parent_uuid, data FROM subtree
-        WHERE NOT _is_cycle
-        """,
-        (root_uuid,),
-    ).fetchall()
-    nodes = {
-        r[0]: NodeSnapshot(uuid=r[0], node_type=r[1], name=r[2], parent_uuid=r[3], data=dict(r[4] or {}))
-        for r in node_rows
-    }
-    if not nodes:
-        return nodes, {}
+def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
+    """Return the subset of ``uuids`` that exist in ``energydb.{table}``.
 
-    edge_rows = conn.execute(
-        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data "
-        "FROM energydb.edge "
-        "WHERE from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s)",
-        (list(nodes.keys()), list(nodes.keys())),
+    Lighter than ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids``
+    when the caller only needs to know *whether* the rows exist (e.g. the
+    create-only pre-check on ``register_tree``). ``table`` is interpolated
+    into the SQL and must be one of the trusted internal values
+    ``"node"`` / ``"edge"``.
+    """
+    if not uuids:
+        return []
+    rows = conn.execute(
+        f"SELECT uuid FROM energydb.{table} WHERE uuid = ANY(%s)",
+        (uuids,),
     ).fetchall()
-    edges = {
-        r[0]: EdgeSnapshot(
-            uuid=r[0],
-            edge_type=r[1],
-            name=r[2],
-            from_node_uuid=r[3],
-            to_node_uuid=r[4],
-            data=dict(r[5] or {}),
-        )
-        for r in edge_rows
-    }
-    return nodes, edges
+    return [r[0] for r in rows]
 
 
 def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
@@ -404,115 +356,6 @@ def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Compute diff
-# ---------------------------------------------------------------------------
-
-
-def _compute_diff(
-    target_nodes: dict[UUID, NodeSnapshot],
-    current_nodes: dict[UUID, NodeSnapshot],
-    target_edges: dict[UUID, EdgeSnapshot],
-    current_edges: dict[UUID, EdgeSnapshot],
-) -> TreeDiff:
-    diff = TreeDiff()
-
-    target_keys = set(target_nodes.keys())
-    current_keys = set(current_nodes.keys())
-
-    for uuid_val in target_keys - current_keys:
-        diff.node_changes.append(NodeChange(old=None, new=target_nodes[uuid_val]))
-    for uuid_val in target_keys & current_keys:
-        old = current_nodes[uuid_val]
-        new = target_nodes[uuid_val]
-        if (old.name, old.parent_uuid, old.data, old.node_type) != (
-            new.name,
-            new.parent_uuid,
-            new.data,
-            new.node_type,
-        ):
-            diff.node_changes.append(NodeChange(old=old, new=new))
-
-    target_edge_keys = set(target_edges.keys())
-    current_edge_keys = set(current_edges.keys())
-
-    for uuid_val in target_edge_keys - current_edge_keys:
-        diff.edge_changes.append(EdgeChange(old=None, new=target_edges[uuid_val]))
-    for uuid_val in target_edge_keys & current_edge_keys:
-        old_e = current_edges[uuid_val]
-        new_e = target_edges[uuid_val]
-        if (
-            old_e.name,
-            old_e.from_node_uuid,
-            old_e.to_node_uuid,
-            old_e.data,
-            old_e.edge_type,
-        ) != (
-            new_e.name,
-            new_e.from_node_uuid,
-            new_e.to_node_uuid,
-            new_e.data,
-            new_e.edge_type,
-        ):
-            diff.edge_changes.append(EdgeChange(old=old_e, new=new_e))
-
-    return diff
-
-
-# ---------------------------------------------------------------------------
-# Apply diff
-# ---------------------------------------------------------------------------
-
-
-def _apply_diff(
-    conn,
-    edm_obj,
-    diff: TreeDiff,
-    target_nodes: dict[UUID, NodeSnapshot],
-    target_edges: dict[UUID, EdgeSnapshot],
-) -> None:
-    """Apply the diff to the database (create-only).
-
-    1. Insert nodes (in DFS order so parent_uuid FKs always resolve).
-    2. Insert edges (endpoints now exist).
-
-    Series declarations are registered alongside their owners during the
-    insert walk via :func:`create_node` / :func:`create_edge`.
-    """
-    walked: set[UUID] = set()
-    edm_objects_by_uuid = _index_edm_objects(edm_obj)
-
-    def _walk_and_apply_nodes(obj):
-        if isinstance(obj, edm.Edge):
-            return
-        if obj.id in target_nodes:
-            create_node(conn, obj, parent_uuid=target_nodes[obj.id].parent_uuid)
-            walked.add(obj.id)
-        for child in obj.children():
-            _walk_and_apply_nodes(child)
-
-    _walk_and_apply_nodes(edm_obj)
-
-    for change in diff.edge_changes:
-        edge_obj = edm_objects_by_uuid.get(change.uuid)
-        if edge_obj is None:
-            raise RuntimeError(f"Edge {change.uuid} in diff has no corresponding EDM object.")
-        create_edge(conn, edge_obj, tree_root=edm_obj)
-
-
-def _index_edm_objects(edm_obj) -> dict[UUID, Any]:
-    """``{uuid: edm_object}`` for every node and edge reachable in the tree."""
-    out: dict[UUID, Any] = {}
-
-    def _walk(obj):
-        out[obj.id] = obj
-        for child in obj.children():
-            _walk(child)
-
-    _walk(edm_obj)
-    return out
-
-
 def _validate_no_inline_data(edm_obj) -> None:
     """Raise if any node/edge in the tree carries non-empty TimeSeries data.
 
@@ -542,29 +385,26 @@ def _validate_no_inline_data(edm_obj) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register_node_descriptors(conn, node_uuid: UUID, edm_obj) -> None:
-    """Walk ``edm_obj.timeseries`` and register every entry on this node."""
-    ts_list = getattr(edm_obj, "timeseries", None)
-    if not ts_list:
-        return
-    for ts in ts_list:
-        _register_one(conn, node_uuid=node_uuid, edge_uuid=None, ts=ts)
-
-
-def register_edge_descriptors(conn, edge_uuid: UUID, edm_obj) -> None:
-    ts_list = getattr(edm_obj, "timeseries", None)
-    if not ts_list:
-        return
-    for ts in ts_list:
-        _register_one(conn, node_uuid=None, edge_uuid=edge_uuid, ts=ts)
+def _register_descriptors(
+    conn,
+    *,
+    owner_col: Literal["node_uuid", "edge_uuid"],
+    owner_uuid: UUID,
+    edm_obj,
+    registry: SeriesRegistry | None = None,
+) -> None:
+    """Walk ``edm_obj.timeseries`` and register every entry on this owner."""
+    for ts in getattr(edm_obj, "timeseries", None) or []:
+        _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts, registry=registry)
 
 
 def _register_one(
     conn,
     *,
-    node_uuid: UUID | None,
-    edge_uuid: UUID | None,
+    owner_col: Literal["node_uuid", "edge_uuid"],
+    owner_uuid: UUID,
     ts: TimeSeries,
+    registry: SeriesRegistry | None = None,
 ) -> int:
     """Register one series row using ``series_mod.register_series``."""
     name = ts.name
@@ -582,13 +422,14 @@ def _register_one(
 
     return series_mod.register_series(
         conn,
-        node_uuid=node_uuid,
-        edge_uuid=edge_uuid,
+        owner_col=owner_col,
+        owner_uuid=owner_uuid,
         data_type=data_type,
         name=name,
         canonical_unit=canonical_unit,
         timeseries_type=timeseries_type,
         description=ts.description,
+        registry=registry,
     )
 
 
@@ -603,8 +444,6 @@ def apply_manifest_unit_conversion(resolved: pl.DataFrame) -> pl.DataFrame:
     Operates on the unique (unit, canonical_unit) pairs so factor lookup runs
     once per pair rather than per row.
     """
-    from energydb.units import compute_unit_factor
-
     pairs = resolved.select(["unit", "canonical_unit"]).unique()
     factor_rows: list[dict[str, Any]] = []
     for row in pairs.iter_rows(named=True):

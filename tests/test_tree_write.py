@@ -34,10 +34,13 @@ def _simple_df(n: int = 3) -> pl.DataFrame:
 
 def _mock_client(monkeypatch) -> Client:
     """Build a Client with both pool and td fully mocked."""
+    from energydb._resolve_cache import SeriesRegistry
+
     monkeypatch.setattr(Client, "__init__", lambda self: None)
     client = Client()  # type: ignore[call-arg]
     client._pool = MagicMock()
     client.td = MagicMock()
+    client._series_registry = SeriesRegistry()
     return client
 
 
@@ -59,8 +62,8 @@ class TestRegisterSeriesShapeDefault:
         conn = self._mock_conn()
         series_mod.register_series(
             conn,
-            node_uuid=uuid4(),
-            edge_uuid=None,
+            owner_col="node_uuid",
+            owner_uuid=uuid4(),
             data_type="actual",
             name="power",
             canonical_unit="MW",
@@ -78,8 +81,8 @@ class TestRegisterSeriesShapeDefault:
         conn = self._mock_conn()
         series_mod.register_series(
             conn,
-            node_uuid=uuid4(),
-            edge_uuid=None,
+            owner_col="node_uuid",
+            owner_uuid=uuid4(),
             data_type="forecast",
             name="power",
             canonical_unit="MW",
@@ -96,8 +99,8 @@ class TestRegisterSeriesShapeDefault:
         conn = self._mock_conn()
         series_mod.register_series(
             conn,
-            node_uuid=uuid4(),
-            edge_uuid=None,
+            owner_col="node_uuid",
+            owner_uuid=uuid4(),
             data_type="actual",
             name="power",
             canonical_unit="MW",
@@ -116,7 +119,7 @@ class TestRegisterTree:
 
         calls: list[tuple[str, UUID | None]] = []
 
-        def fake_create_node(_pool, edm_obj, *, parent_uuid=None):
+        def fake_create_node(_pool, edm_obj, *, parent_uuid=None, registry=None):
             calls.append((edm_obj.name, parent_uuid))
             return edm_obj.id
 
@@ -154,7 +157,7 @@ class TestRegisterTree:
         client = _mock_client(monkeypatch)
         monkeypatch.setattr(
             "energydb._persist.create_node",
-            lambda _pool, obj, *, parent_uuid=None: obj.id,
+            lambda _pool, obj, *, parent_uuid=None, registry=None: obj.id,
         )
 
         tree = edb.wind.WindTurbine(
@@ -210,7 +213,7 @@ class TestRegisterTree:
 
         captured_parent: list[UUID | None] = []
 
-        def fake_create_node(_pool, obj, *, parent_uuid=None):
+        def fake_create_node(_pool, obj, *, parent_uuid=None, registry=None):
             captured_parent.append(parent_uuid)
             return obj.id
 
@@ -227,11 +230,11 @@ class TestTwoPassWalk:
         node_calls: list[str] = []
         edge_calls: list[str] = []
 
-        def fake_create_node(_pool, obj, *, parent_uuid=None):
+        def fake_create_node(_pool, obj, *, parent_uuid=None, registry=None):
             node_calls.append(obj.name)
             return obj.id
 
-        def fake_create_edge(_pool, obj, *, tree_root=None):
+        def fake_create_edge(_pool, obj, *, tree_root=None, registry=None):
             edge_calls.append(obj.name)
             return obj.id
 
@@ -296,7 +299,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
 
     write_df = pl.DataFrame(
         {
-            "path": [["P", "S", "T1"]] * 3,
+            "path": ["P/S/T1"] * 3,
             "data_type": ["actual"] * 3,
             "name": ["power"] * 3,
             "valid_time": [base + timedelta(hours=i) for i in range(3)],
@@ -305,7 +308,7 @@ def test_live_register_tree_then_write_and_read(live_edb):
     )
     live_edb.write(write_df)
 
-    out = live_edb.get_node("P").get_node("S").get_node("T1").read(data_type="actual", name="power", output="polars")
+    out = live_edb.get_node("P").get_node("S").get_node("T1").read(data_type="actual", name="power")
     assert out["value"].to_list() == [1.0, 2.0, 3.0]
 
 
@@ -340,7 +343,7 @@ def test_live_create_edge_with_series(live_edb):
         }
     )
     scope.write(flow, data_type="actual", name="power_flow")
-    out = scope.read(data_type="actual", name="power_flow", output="polars")
+    out = scope.read(data_type="actual", name="power_flow")
     assert out["value"].to_list() == [200.0, 250.0]
 
 
@@ -366,7 +369,7 @@ def test_live_manifest_read(live_edb):
 
     write_df = pl.DataFrame(
         {
-            "path": [["P", "T1"]] * 2 + [["P", "T2"]] * 2,
+            "path": ["P/T1"] * 2 + ["P/T2"] * 2,
             "data_type": ["actual"] * 4,
             "name": ["power"] * 4,
             "valid_time": [base + timedelta(hours=i) for i in range(2)] * 2,
@@ -377,14 +380,16 @@ def test_live_manifest_read(live_edb):
 
     manifest = pl.DataFrame(
         {
-            "path": [["P", "T1"], ["P", "T2"]],
+            "path": ["P/T1", "P/T2"],
             "data_type": ["actual", "actual"],
             "name": ["power", "power"],
         }
     )
-    out = live_edb.read(manifest, output="polars")
-    assert set(out["node"].unique().to_list()) == {"T1", "T2"}
-    assert "path" in out.columns
+    out = live_edb.read(manifest)
+    # Path is the customer-facing identity; node/node_type/node_uuid no longer
+    # leak onto rows.
+    assert set(out["path"].unique().to_list()) == {"P/T1", "P/T2"}
+    assert "node" not in out.columns
 
 
 @pytestmark_live

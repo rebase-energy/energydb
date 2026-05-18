@@ -77,16 +77,9 @@ def test_register_flat_series_and_write_read(edb):
         name="capacity",
     )
 
-    result = (
-        edb.get_node("root")
-        .get_node("asset_a")
-        .read(
-            data_type="actual",
-            name="capacity",
-            output="polars",
-        )
-    )
-    assert "series_id" in result.columns
+    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity")
+    # series_id is no longer surfaced; the public result is slim.
+    assert "series_id" not in result.columns
     assert result["value"].to_list() == [0.0, 1.0, 2.0]
 
 
@@ -136,7 +129,6 @@ def test_overlapping_write_read_with_kt(edb):
         .read(
             data_type="forecast",
             name="power",
-            output="polars",
         )
     )
     assert latest["value"].to_list() == [100.0, 101.0]
@@ -149,7 +141,6 @@ def test_overlapping_write_read_with_kt(edb):
             data_type="forecast",
             name="power",
             include_knowledge_time=True,
-            output="polars",
         )
     )
     assert len(history) == 4
@@ -177,10 +168,13 @@ def test_cross_retention_read_is_single_query(edb):
     asset.write(_ts_df(2), data_type="actual", name="capacity")
     asset.write(_ts_df(2), data_type="forecast", name="power", knowledge_time=KT_1)
 
-    result = asset.read(output="polars")
+    result = asset.read()
     # Two series × 2 rows = 4 rows
     assert len(result) == 4
-    assert set(result["series_id"].unique().to_list()) == {1, 2} or len(result["series_id"].unique()) == 2
+    # Two distinct (data_type, name) pairs on the result — series_id is internal
+    # and no longer surfaced.
+    pairs = set(zip(result["data_type"].to_list(), result["name"].to_list(), strict=True))
+    assert pairs == {("actual", "capacity"), ("forecast", "power")}
 
 
 def test_read_runs_for_series_hydrates_pg_metadata(edb):
@@ -230,7 +224,8 @@ def test_retention_immutable_trigger(edb):
 
 
 def test_pandas_in_pandas_out(edb):
-    """A pandas DataFrame goes in, a pandas DataFrame comes out by default."""
+    """A pandas DataFrame goes in, a pandas DataFrame comes out when
+    ``backend="pandas"`` is requested."""
     edb.get_node("root").get_node("asset_a").register_series(
         name="capacity",
         canonical_unit="MW",
@@ -250,16 +245,16 @@ def test_pandas_in_pandas_out(edb):
     )
     edb.get_node("root").get_node("asset_a").write(pdf, data_type="actual", name="capacity")
 
-    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity")
+    result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity", backend="pandas")
     assert isinstance(result, pd.DataFrame)
     assert "valid_time" in result.columns
     assert "value" in result.columns
     assert result["value"].tolist() == [10.0, 11.0, 12.0]
 
 
-def test_pandas_empty_read(edb):
-    """An empty-result read with the default pandas output returns an empty
-    pandas DataFrame, not a polars one."""
+def test_default_polars_empty_read(edb):
+    """An empty-result read with the default polars output returns an empty
+    polars DataFrame."""
     result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="nonexistent")
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0

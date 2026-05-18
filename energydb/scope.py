@@ -17,22 +17,26 @@ resolution query and execute.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
 import pandas as pd
 import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
+from timedb import profiling
 
 from energydb import series as series_mod
-from energydb._frames import OutputType, to_output, to_polars
+from energydb._frames import Backend, Output, to_backend, to_polars
+from energydb._io import read_relative_resolved, read_resolved
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
     Path,
+    build_filter_conditions,
     resolve_edge_uuid,
     resolve_node_uuid,
     resolve_path,
@@ -45,8 +49,29 @@ if TYPE_CHECKING:
     from energydb.client import Client
 
 
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
 def _dry_run_unsupported_in_txn() -> None:
     raise ValueError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
+
+
+def _ts_io_unsupported_in_txn(op: str) -> None:
+    """Reject time-series I/O on a txn-bound scope.
+
+    ``scope.write`` / ``scope.read`` route through the connection pool and
+    (for writes) ClickHouse, neither of which participates in the PG
+    transaction. Allowing them silently would let a successful ``write``
+    persist data that a later rollback couldn't undo. Call
+    ``client.write``/``client.read`` directly outside the transaction.
+    """
+    raise RuntimeError(
+        f"scope.{op}() is not supported inside a transaction(); time-series I/O does "
+        f"not participate in the PG transaction. Call client.{op}() directly outside "
+        f"the transaction block."
+    )
 
 
 def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Path:
@@ -83,33 +108,109 @@ def _timeseries_type_from_ts(ts: TimeSeries) -> str | None:
     return ts_type.value if isinstance(ts_type, TimeSeriesType) else str(ts_type)
 
 
+def _normalize_series_register_args(
+    ts_or_name: TimeSeries | str | None,
+    *,
+    name: str | None,
+    canonical_unit: str | None,
+    data_type: str | None,
+    timeseries_type: str | None,
+    description: str | None,
+) -> dict[str, Any]:
+    """Normalize ``register_series`` inputs to the kwargs ``series_mod`` expects.
+
+    Pulls metadata off a :class:`TimeSeries` when one is supplied, otherwise
+    takes the explicit kwargs. Raises if any required field is still missing.
+    """
+    if isinstance(ts_or_name, TimeSeries):
+        ts = ts_or_name
+        name = name or ts.name
+        canonical_unit = canonical_unit or ts.unit
+        if data_type is None and ts.data_type is not None:
+            data_type = str(ts.data_type).lower()
+        if timeseries_type is None:
+            timeseries_type = _timeseries_type_from_ts(ts)
+        description = description or ts.description
+    elif isinstance(ts_or_name, str):
+        name = ts_or_name
+
+    if name is None:
+        raise ValueError("name is required")
+    if data_type is None:
+        raise ValueError("data_type is required")
+    if canonical_unit is None:
+        raise ValueError("canonical_unit is required")
+    if timeseries_type is None:
+        raise ValueError("timeseries_type is required (FLAT | OVERLAPPING)")
+
+    return {
+        "data_type": str(data_type).lower(),
+        "name": name,
+        "canonical_unit": canonical_unit,
+        "timeseries_type": timeseries_type,
+        "description": description,
+    }
+
+
+_SCOPE_IDENTITY_NODE = ("path", "data_type", "name")
+_SCOPE_IDENTITY_EDGE = ("from_path", "to_path", "edge_type", "data_type", "name")
+
+
+def _strip_scope_identity(result: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
+    """Drop identity columns the scope caller already knows.
+
+    Applied when a scope read resolves to exactly one series — the caller
+    is unambiguously asking for that series' data, so re-broadcasting the
+    path / data_type / name on every row is pure noise. Multi-series
+    scope reads keep the full shape because callers need the identity
+    columns to disambiguate.
+    """
+    cols = _SCOPE_IDENTITY_EDGE if is_edge else _SCOPE_IDENTITY_NODE
+    present = [c for c in cols if c in result.columns]
+    return result.drop(present) if present else result
+
+
+def _attach_routing(
+    df: pl.DataFrame,
+    *,
+    owner_col: str,
+    owner_val: UUID,
+    data_type: str,
+    name: str,
+    unit: str | None,
+) -> pl.DataFrame:
+    """Attach the routing columns required by the manifest pipeline.
+
+    ``owner_col`` is one of ``"node_uuid"`` / ``"edge_uuid"``. UUIDs are
+    serialized as strings on the manifest so polars-side joins work cleanly.
+    """
+    cols = [
+        pl.lit(str(owner_val), dtype=pl.Utf8).alias(owner_col),
+        pl.lit(str(data_type).lower(), dtype=pl.Utf8).alias("data_type"),
+        pl.lit(name, dtype=pl.Utf8).alias("name"),
+    ]
+    if unit is not None:
+        cols.append(pl.lit(unit, dtype=pl.Utf8).alias("unit"))
+    return df.with_columns(cols)
+
+
 # ---------------------------------------------------------------------------
-# NodeScope
+# _BaseScope — shared plumbing for NodeScope and EdgeScope.
 # ---------------------------------------------------------------------------
 
 
-class NodeScope:
-    """Accumulated scope for navigating and operating on a single node.
+class _BaseScope:
+    """Shared connection / mutation plumbing.
 
-    Identity is the ``uuid``. ``_path`` and ``_node_uuid`` accumulate as
-    the user calls ``.get_node(...)``; resolution happens on the next
-    terminal call.
+    Subclasses plug in their identity by implementing the small set of
+    abstract methods below; everything else (connection borrowing, txn
+    routing, the 8-step mutator boilerplate) lives here.
     """
 
-    def __init__(
-        self,
-        client: Client,
-        *,
-        node_uuid: UUID | None = None,
-        path: Path = (),
-        where_filters: dict[str, Any] | None = None,
-        txn: Transaction | None = None,
-    ):
-        self._client = client
-        self._node_uuid = node_uuid
-        self._path: Path = tuple(path)
-        self._where_filters = where_filters
-        self._txn = txn
+    _client: Client
+    _txn: Transaction | None
+
+    # -- shared properties / connection management ---------------------
 
     @property
     def _pool(self):
@@ -128,9 +229,285 @@ class NodeScope:
         """
         if self._txn is not None:
             yield self._txn._conn
-        else:
-            with self._pool.connection() as conn:
-                yield conn
+            return
+        with self._pool.connection() as conn:
+            yield conn
+
+    # -- subclass contract (overridden in NodeScope / EdgeScope) -------
+
+    _owner_col: Literal["node_uuid", "edge_uuid"]
+
+    def _resolve_uuid(self, conn) -> UUID:
+        raise NotImplementedError
+
+    def _fetch_snapshot(self, conn, uuid_: UUID):
+        raise NotImplementedError
+
+    def _record_to_txn(self, before, after) -> None:
+        raise NotImplementedError
+
+    def _wrap_in_diff(self, before, after) -> TreeDiff:
+        raise NotImplementedError
+
+    def _not_found_msg(self, uuid_: UUID) -> str:
+        raise NotImplementedError
+
+    def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
+        """Subclass-specific: resolve the scope to per-series meta in PG.
+
+        Returns one row per series with columns ``(series_id, retention,
+        canonical_unit, data_type, name)`` plus exactly one of
+        ``node_uuid`` / ``edge_uuid`` — the input shape :func:`read_resolved`
+        expects. Returns ``None`` when the scope is empty / nothing matches.
+        """
+        raise NotImplementedError
+
+    # -- shared mutation machinery -------------------------------------
+
+    def _apply_mutation(
+        self,
+        exec_fn: Callable[[Any, UUID], None],
+        *,
+        dry_run: bool,
+        fetch_after: bool = True,
+    ) -> TreeDiff | None:
+        """Run a single mutating statement against this scope's target.
+
+        ``exec_fn(conn, uuid_)`` runs after the pre-mutation snapshot is
+        captured; it may execute arbitrary additional queries (e.g. cycle
+        checks, endpoint resolution) before the actual UPDATE/DELETE.
+        ``fetch_after=False`` is for deletes — the post-state record is
+        ``None``.
+
+        Behavior matches the pre-refactor mutators exactly: txn-bound
+        scopes record (before, after) on the txn and return ``None``;
+        dry-run scopes roll back and return a :class:`TreeDiff`; plain
+        scopes commit and return ``None``.
+        """
+        if dry_run and self._txn is not None:
+            _dry_run_unsupported_in_txn()
+        with self._use_conn() as conn:
+            uuid_ = self._resolve_uuid(conn)
+            before = self._fetch_snapshot(conn, uuid_)
+            if before is None:
+                raise ValueError(self._not_found_msg(uuid_))
+            exec_fn(conn, uuid_)
+            after = self._fetch_snapshot(conn, uuid_) if fetch_after else None
+            if self._txn is not None:
+                self._record_to_txn(before, after)
+                return None
+            if dry_run:
+                conn.rollback()
+                return self._wrap_in_diff(before, after)
+            conn.commit()
+        return None
+
+    # -- shared series + timeseries I/O --------------------------------
+
+    def register_series(
+        self,
+        ts_or_name: TimeSeries | str | None = None,
+        *,
+        name: str | None = None,
+        canonical_unit: str | None = None,
+        data_type: str | None = None,
+        timeseries_type: str | None = None,
+        retention: str | None = None,
+        description: str | None = None,
+    ) -> int:
+        """Register a time series on this scope's owner (node or edge).
+
+        Accepts a ``TimeSeries`` (metadata extracted) or explicit kwargs.
+        When ``retention`` is omitted it is derived from
+        ``timeseries_type``: ``FLAT`` (actuals) → ``'forever'``,
+        ``OVERLAPPING`` (forecasts) → ``'medium'``.
+        """
+        args = _normalize_series_register_args(
+            ts_or_name,
+            name=name,
+            canonical_unit=canonical_unit,
+            data_type=data_type,
+            timeseries_type=timeseries_type,
+            description=description,
+        )
+        with self._use_conn() as conn:
+            sid = series_mod.register_series(
+                conn,
+                owner_col=self._owner_col,
+                owner_uuid=self._resolve_uuid(conn),
+                retention=retention,
+                registry=self._client._series_registry,
+                **args,
+            )
+            if self._txn is None:
+                conn.commit()
+        return sid
+
+    def write(
+        self,
+        df: pl.DataFrame | pd.DataFrame,
+        *,
+        data_type: str,
+        name: str,
+        unit: str | None = None,
+        knowledge_time: datetime | None = None,
+        run_id: int | None = None,
+        workflow_id: str | None = None,
+        model_name: str | None = None,
+        run_start_time: datetime | None = None,
+        run_finish_time: datetime | None = None,
+        run_params: dict | None = None,
+    ) -> int:
+        """Write time-series data for a single series on this scope's owner.
+
+        Builds a 1-route manifest (owner uuid, ``data_type``, ``name``,
+        plus optional ``unit``) over ``df`` (pandas or polars) and
+        delegates to :meth:`Client.write`. Returns the ``run_id`` used.
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("write")
+        with self._use_conn() as conn:
+            owner_val = self._resolve_uuid(conn)
+        with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
+            df_pl = to_polars(df)
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            manifest = _attach_routing(
+                df_pl,
+                owner_col=self._owner_col,
+                owner_val=owner_val,
+                data_type=data_type,
+                name=name,
+                unit=unit,
+            )
+        return self._client.write(
+            manifest,
+            knowledge_time=knowledge_time,
+            run_id=run_id,
+            workflow_id=workflow_id,
+            model_name=model_name,
+            run_start_time=run_start_time,
+            run_finish_time=run_finish_time,
+            run_params=run_params,
+        )
+
+    def read(
+        self,
+        *,
+        data_type: str | None = None,
+        name: str | None = None,
+        unit: str | None = None,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        start_known: datetime | None = None,
+        end_known: datetime | None = None,
+        include_updates: bool = False,
+        include_knowledge_time: bool = False,
+        output: Output = "frame",
+        backend: Backend = "polars",
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+        """Read time-series data for this scope.
+
+        For :class:`NodeScope` the manifest spans the resolved subtree;
+        for :class:`EdgeScope` it's the single edge. See :meth:`Client.read`
+        for the ``output`` / ``backend`` contract.
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("read")
+        meta = self._build_resolved_meta(data_type=data_type, name=name)
+        if meta is None:
+            empty: pl.DataFrame | dict[tuple, pl.DataFrame] = {} if output == "by_path" else pl.DataFrame()
+            return to_backend(empty, backend)
+        # Take the polars result first so the auto-strip is a single dtype op;
+        # convert to the requested backend at the boundary.
+        result = cast(
+            "pl.DataFrame | dict[tuple, pl.DataFrame]",
+            read_resolved(
+                self._pool,
+                self._td,
+                meta,
+                unit=unit,
+                start_valid=start_valid,
+                end_valid=end_valid,
+                start_known=start_known,
+                end_known=end_known,
+                include_updates=include_updates,
+                include_knowledge_time=include_knowledge_time,
+                output=output,
+                registry=self._client._series_registry,
+            ),
+        )
+        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
+            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+        return to_backend(result, backend)
+
+    def read_relative(
+        self,
+        *,
+        data_type: str,
+        name: str,
+        unit: str | None = None,
+        output: Output = "frame",
+        backend: Backend = "polars",
+        **td_read_kwargs,
+    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+        """Relative-window read for this scope.
+
+        ``**td_read_kwargs`` are forwarded to
+        :meth:`timedb.TimeDBClient.read_relative`; see that signature for
+        accepted window-selector arguments.
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("read_relative")
+        meta = self._build_resolved_meta(data_type=data_type, name=name)
+        if meta is None:
+            empty: pl.DataFrame | dict[tuple, pl.DataFrame] = {} if output == "by_path" else pl.DataFrame()
+            return to_backend(empty, backend)
+        result = cast(
+            "pl.DataFrame | dict[tuple, pl.DataFrame]",
+            read_relative_resolved(
+                self._pool,
+                self._td,
+                meta,
+                unit=unit,
+                output=output,
+                registry=self._client._series_registry,
+                **td_read_kwargs,
+            ),
+        )
+        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
+            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+        return to_backend(result, backend)
+
+
+# ---------------------------------------------------------------------------
+# NodeScope
+# ---------------------------------------------------------------------------
+
+
+class NodeScope(_BaseScope):
+    """Accumulated scope for navigating and operating on a single node.
+
+    Identity is the ``uuid``. ``_path`` and ``_node_uuid`` accumulate as
+    the user calls ``.get_node(...)``; resolution happens on the next
+    terminal call.
+    """
+
+    _owner_col = "node_uuid"
+
+    def __init__(
+        self,
+        client: Client,
+        *,
+        node_uuid: UUID | None = None,
+        path: Path = (),
+        where_filters: dict[str, Any] | None = None,
+        txn: Transaction | None = None,
+    ):
+        self._client = client
+        self._node_uuid = node_uuid
+        self._path: Path = tuple(path)
+        self._where_filters = where_filters
+        self._txn = txn
 
     def _with_txn(self, txn: Transaction) -> NodeScope:
         """Return a sibling scope bound to ``txn``."""
@@ -141,6 +518,26 @@ class NodeScope:
             where_filters=self._where_filters,
             txn=txn,
         )
+
+    # ------------------------------------------------------------------
+    # Subclass contract for _BaseScope._apply_mutation
+    # ------------------------------------------------------------------
+
+    def _resolve_uuid(self, conn) -> UUID:
+        return self._resolve_node_uuid(conn)
+
+    def _fetch_snapshot(self, conn, uuid_: UUID):
+        return _fetch_nodes_by_uuids(conn, [uuid_]).get(uuid_)
+
+    def _record_to_txn(self, before, after) -> None:
+        assert self._txn is not None
+        self._txn._record_node(before, after)
+
+    def _wrap_in_diff(self, before, after) -> TreeDiff:
+        return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
+
+    def _not_found_msg(self, uuid_: UUID) -> str:
+        return f"Node not found: uuid={uuid_}"
 
     # ------------------------------------------------------------------
     # Navigation (lazy)
@@ -203,29 +600,31 @@ class NodeScope:
         raise ValueError("NodeScope has no path or uuid to resolve.")
 
     def _resolve_target_node_uuids(self, conn) -> list[UUID]:
-        root_uuid = self._resolve_node_uuid(conn)
-        subtree_uuids = resolve_subtree_uuids(conn, root_uuid)
-        if not self._where_filters:
-            return subtree_uuids
+        with profiling._phase(profiling.PHASE_EDB_RESOLVE_SUBTREE):
+            root_uuid = self._resolve_node_uuid(conn)
+            if not self._where_filters:
+                return resolve_subtree_uuids(conn, root_uuid)
 
-        conditions = ["uuid = ANY(%s)"]
-        params: list[Any] = [subtree_uuids]
-        if "node_type" in self._where_filters:
-            conditions.append("node_type = %s")
-            params.append(self._where_filters["node_type"])
-        if "name" in self._where_filters:
-            conditions.append("name = %s")
-            params.append(self._where_filters["name"])
-        for key, value in self._where_filters.items():
-            if key in ("node_type", "name"):
-                continue
-            conditions.append("data->>%s = %s")
-            params.append(key)
-            params.append(str(value))
-
-        where = " AND ".join(conditions)
-        rows = conn.execute(f"SELECT uuid FROM energydb.node WHERE {where}", params).fetchall()
-        return [r[0] for r in rows]
+            # Subtree + filters in one round-trip: the recursive CTE materializes
+            # the candidate set, the outer SELECT applies the predicates.
+            filter_conds, filter_params = build_filter_conditions(
+                self._where_filters, type_col="node_type", table_alias="n"
+            )
+            extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
+            sql = f"""
+                WITH RECURSIVE subtree AS (
+                    SELECT uuid FROM energydb.node WHERE uuid = %s
+                    UNION ALL
+                    SELECT n.uuid FROM energydb.node n
+                    JOIN subtree s ON n.parent_uuid = s.uuid
+                ) CYCLE uuid SET _is_cycle USING _cycle_path
+                SELECT n.uuid
+                FROM energydb.node n
+                JOIN subtree s ON n.uuid = s.uuid
+                WHERE NOT s._is_cycle{extra}
+            """
+            rows = conn.execute(sql, (root_uuid, *filter_params)).fetchall()
+            return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # Get / hierarchy queries
@@ -276,13 +675,13 @@ class NodeScope:
                 SELECT n.uuid, n.node_type, n.name, n.data
                 FROM energydb.node n
                 JOIN subtree s ON n.uuid = s.uuid
-                WHERE NOT s._is_cycle AND n.uuid != %s
+                WHERE NOT s._is_cycle
+                  AND n.uuid != %s
+                  AND (%s::text IS NULL OR n.node_type = %s::text)
                 ORDER BY n.name
                 """,
-                (node_uuid, node_uuid),
+                (node_uuid, node_uuid, type, type),
             ).fetchall()
-            if type:
-                rows = [r for r in rows if r[1] == type]
             return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
 
     def path(self) -> Path:
@@ -296,26 +695,20 @@ class NodeScope:
     # ------------------------------------------------------------------
 
     def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if before is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+        captured: list[UUID] = []
+
+        def _do(conn, node_uuid: UUID) -> None:
+            captured.append(node_uuid)
             conn.execute(
                 "UPDATE energydb.node SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, node_uuid),
             )
-            after = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if self._txn is not None:
-                self._txn._record_node(before, after)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
-            conn.commit()
-        return None
+
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            # Rename changes the node's name and shifts every descendant's path.
+            self._client._series_registry.evict_node_subtree(str(captured[0]))
+        return result
 
     def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
         """Patch the node's JSONB ``data`` column.
@@ -325,45 +718,29 @@ class NodeScope:
         not deep-merged. Pass ``replace_data=True`` to fully replace the row's
         ``data`` instead. Renames go through :meth:`rename`.
         """
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
         op = "data = %s" if replace_data else "data = data || %s"
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if before is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+
+        def _do(conn, node_uuid: UUID) -> None:
             conn.execute(
                 f"UPDATE energydb.node SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), node_uuid),
             )
-            after = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if self._txn is not None:
-                self._txn._record_node(before, after)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
-            conn.commit()
-        return None
+
+        return self._apply_mutation(_do, dry_run=dry_run)
 
     def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if before is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+        captured: list[UUID] = []
+
+        def _do(conn, node_uuid: UUID) -> None:
+            captured.append(node_uuid)
             conn.execute("DELETE FROM energydb.node WHERE uuid = %s", (node_uuid,))
-            if self._txn is not None:
-                self._txn._record_node(before, None)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(node_changes=[NodeChange(old=before, new=None)])
-            conn.commit()
-        return None
+
+        result = self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        if not dry_run and captured:
+            registry = self._client._series_registry
+            registry.evict_owner(str(captured[0]))
+            registry.evict_node_subtree(str(captured[0]))
+        return result
 
     def move_to(self, target: NodeScope | Path | list[str], *, dry_run: bool = False) -> TreeDiff | None:
         """Re-parent this node to ``target``.
@@ -383,13 +760,10 @@ class NodeScope:
             target_path = tuple(target)
             target_node_uuid = None
 
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            before = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if before is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+        captured: list[UUID] = []
+
+        def _do(conn, node_uuid: UUID) -> None:
+            captured.append(node_uuid)
             if target_path:
                 new_parent_uuid = resolve_node_uuid(conn, target_path, start_uuid=target_node_uuid)
             elif target_node_uuid is not None:
@@ -400,9 +774,10 @@ class NodeScope:
             if new_parent_uuid == node_uuid:
                 raise ValueError("Cannot move a node into itself.")
 
-            # Walk up from new_parent_uuid; if node_uuid is among the ancestors,
-            # the move would create a cycle.
-            ancestors = conn.execute(
+            # Walk up from new_parent_uuid; if node_uuid appears on the chain
+            # the move would create a cycle. EXISTS short-circuits as soon as
+            # the row is found rather than streaming the whole chain back.
+            cycle_row = conn.execute(
                 """
                 WITH RECURSIVE chain AS (
                     SELECT uuid, parent_uuid
@@ -411,26 +786,23 @@ class NodeScope:
                     SELECT n.uuid, n.parent_uuid
                     FROM energydb.node n JOIN chain c ON n.uuid = c.parent_uuid
                 ) CYCLE uuid SET _is_cycle USING _cycle_path
-                SELECT uuid FROM chain WHERE NOT _is_cycle
+                SELECT EXISTS (SELECT 1 FROM chain WHERE NOT _is_cycle AND uuid = %s)
                 """,
-                (new_parent_uuid,),
-            ).fetchall()
-            if any(r[0] == node_uuid for r in ancestors):
+                (new_parent_uuid, node_uuid),
+            ).fetchone()
+            if cycle_row and cycle_row[0]:
                 raise ValueError("Cannot move a node into its own subtree (would create a cycle).")
 
             conn.execute(
                 "UPDATE energydb.node SET parent_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_parent_uuid, node_uuid),
             )
-            after = _fetch_nodes_by_uuids(conn, [node_uuid]).get(node_uuid)
-            if self._txn is not None:
-                self._txn._record_node(before, after)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
-            conn.commit()
-        return None
+
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            # Re-parenting shifts the moved node's path and every descendant's.
+            self._client._series_registry.evict_node_subtree(str(captured[0]))
+        return result
 
     def add(self, edm_obj, *, dry_run: bool = False) -> NodeScope | TreeDiff:
         """Add a new child node (or subtree) under this scope.
@@ -466,188 +838,42 @@ class NodeScope:
         return NodeScope(self._client, node_uuid=root_uuid)
 
     # ------------------------------------------------------------------
-    # Series registration
+    # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
 
-    def register_series(
-        self,
-        ts_or_name: TimeSeries | str | None = None,
-        *,
-        name: str | None = None,
-        canonical_unit: str | None = None,
-        data_type: str | None = None,
-        timeseries_type: str | None = None,
-        retention: str | None = None,
-        description: str | None = None,
-    ) -> int:
-        """Register a time series on this node.
-
-        Accepts a ``TimeSeries`` (metadata extracted) or explicit kwargs. When
-        ``retention`` is omitted it is derived from ``timeseries_type``:
-        ``FLAT`` (actuals) → ``'forever'``, ``OVERLAPPING`` (forecasts) →
-        ``'medium'``.
-        """
-        if isinstance(ts_or_name, TimeSeries):
-            ts = ts_or_name
-            name = name or ts.name
-            canonical_unit = canonical_unit or ts.unit
-            if data_type is None and ts.data_type is not None:
-                data_type = str(ts.data_type).lower()
-            if timeseries_type is None:
-                timeseries_type = _timeseries_type_from_ts(ts)
-            description = description or ts.description
-        elif isinstance(ts_or_name, str):
-            name = ts_or_name
-
-        if name is None:
-            raise ValueError("name is required")
-        if data_type is None:
-            raise ValueError("data_type is required")
-        if canonical_unit is None:
-            raise ValueError("canonical_unit is required")
-        if timeseries_type is None:
-            raise ValueError("timeseries_type is required (FLAT | OVERLAPPING)")
-
-        data_type_str = str(data_type).lower()
-
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            sid = series_mod.register_series(
-                conn,
-                node_uuid=node_uuid,
-                edge_uuid=None,
-                data_type=data_type_str,
-                name=name,
-                canonical_unit=canonical_unit,
-                timeseries_type=timeseries_type,
-                retention=retention,
-                description=description,
-            )
-            if self._txn is None:
-                conn.commit()
-        return sid
-
-    # ------------------------------------------------------------------
-    # Single-series timeseries I/O — manifest builders that delegate to client
-    # ------------------------------------------------------------------
-
-    def write(
-        self,
-        df: pl.DataFrame | pd.DataFrame,
-        *,
-        data_type: str,
-        name: str,
-        unit: str | None = None,
-        knowledge_time: datetime | None = None,
-        run_id: int | None = None,
-        workflow_id: str | None = None,
-        model_name: str | None = None,
-        run_start_time: datetime | None = None,
-        run_finish_time: datetime | None = None,
-        run_params: dict | None = None,
-    ) -> int:
-        """Write time-series data for a single series on this node.
-
-        Builds a 1-route manifest (``node_uuid``, ``data_type``, ``name``,
-        plus optional ``unit``) over the supplied ``df`` (pandas or polars)
-        and delegates to :meth:`Client.write`. Returns the ``run_id``
-        used.
-        """
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-        manifest = _attach_routing(
-            to_polars(df),
-            owner_col="node_uuid",
-            owner_val=node_uuid,
-            data_type=data_type,
-            name=name,
-            unit=unit,
-        )
-        return self._client.write(
-            manifest,
-            knowledge_time=knowledge_time,
-            run_id=run_id,
-            workflow_id=workflow_id,
-            model_name=model_name,
-            run_start_time=run_start_time,
-            run_finish_time=run_finish_time,
-            run_params=run_params,
-        )
-
-    def read(
-        self,
-        *,
-        data_type: str | None = None,
-        name: str | None = None,
-        unit: str | None = None,
-        start_valid: datetime | None = None,
-        end_valid: datetime | None = None,
-        start_known: datetime | None = None,
-        end_known: datetime | None = None,
-        include_updates: bool = False,
-        include_knowledge_time: bool = False,
-        output: OutputType = "pandas",
-    ) -> pl.DataFrame | pd.DataFrame:
-        """Read time-series data for this scope (node + descendants).
-
-        Builds a manifest of (``node_uuid``, ``data_type``, ``name``) rows
-        spanning the resolved subtree, then delegates to
-        :meth:`Client.read`. Returns pandas by default; pass
-        ``output="polars"`` for a polars DataFrame.
-        """
-        manifest = self._build_read_manifest(data_type=data_type, name=name)
-        if manifest is None:
-            return to_output(pl.DataFrame(), output)
-        return self._client.read(
-            manifest,
-            unit=unit,
-            start_valid=start_valid,
-            end_valid=end_valid,
-            start_known=start_known,
-            end_known=end_known,
-            include_updates=include_updates,
-            include_knowledge_time=include_knowledge_time,
-            output=output,
-        )
-
-    def read_relative(
-        self,
-        *,
-        data_type: str,
-        name: str,
-        unit: str | None = None,
-        output: OutputType = "pandas",
-        **td_read_kwargs,
-    ) -> pl.DataFrame | pd.DataFrame:
-        manifest = self._build_read_manifest(data_type=data_type, name=name)
-        if manifest is None:
-            return to_output(pl.DataFrame(), output)
-        return self._client.read_relative(manifest, unit=unit, output=output, **td_read_kwargs)
-
-    def _build_read_manifest(
+    def _build_resolved_meta(
         self,
         *,
         data_type: str | None,
         name: str | None,
     ) -> pl.DataFrame | None:
-        """Resolve the scope's subtree to a node-routed manifest.
+        """Resolve the scope's subtree to per-series read meta in one PG round-trip.
 
-        Returns ``None`` when the scope is empty or no series match.
+        Returns the per-series ``(series_id, retention, canonical_unit,
+        data_type, name, node_uuid)`` frame :func:`read_resolved` consumes
+        directly — no second hash-and-join pass through
+        :func:`resolve_manifest`. ``None`` when the subtree is empty or no
+        series match the optional ``data_type`` / ``name`` filters.
         """
         with self._use_conn() as conn:
             target_uuids = self._resolve_target_node_uuids(conn)
             if not target_uuids:
                 return None
             data_type_str = str(data_type).lower() if data_type else None
-            meta = series_mod.resolve_for_read(
-                conn,
-                node_uuids=target_uuids,
-                data_type=data_type_str,
-                name=name,
-            )
+            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                meta = series_mod.resolve_for_read(
+                    conn,
+                    owner_col="node_uuid",
+                    owner_uuids=target_uuids,
+                    data_type=data_type_str,
+                    name=name,
+                )
         if meta.is_empty():
             return None
-        return meta.select(["node_uuid", "data_type", "name"]).unique()
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            # Drop the unused owner column; resolve_for_read guarantees one
+            # row per series, so no extra dedupe pass.
+            return meta.drop("edge_uuid")
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +881,14 @@ class NodeScope:
 # ---------------------------------------------------------------------------
 
 
-class EdgeScope:
+class EdgeScope(_BaseScope):
     """Scope for operating on a single edge.
 
     Identified by ``uuid`` or by the ``(from_path, to_path, edge_type)``
     triple.
     """
+
+    _owner_col = "edge_uuid"
 
     def __init__(
         self,
@@ -679,22 +907,6 @@ class EdgeScope:
         self._to_path = tuple(to_path) if to_path is not None else None
         self._edge_type = edge_type
 
-    @property
-    def _pool(self):
-        return self._client._pool
-
-    @property
-    def _td(self):
-        return self._client.td
-
-    @contextmanager
-    def _use_conn(self):
-        if self._txn is not None:
-            yield self._txn._conn
-        else:
-            with self._pool.connection() as conn:
-                yield conn
-
     def _with_txn(self, txn: Transaction) -> EdgeScope:
         return EdgeScope(
             self._client,
@@ -705,6 +917,30 @@ class EdgeScope:
             txn=txn,
         )
 
+    # ------------------------------------------------------------------
+    # Subclass contract for _BaseScope._apply_mutation
+    # ------------------------------------------------------------------
+
+    def _resolve_uuid(self, conn) -> UUID:
+        return self._resolve_edge_uuid(conn)
+
+    def _fetch_snapshot(self, conn, uuid_: UUID):
+        return _fetch_edges_by_uuids(conn, [uuid_]).get(uuid_)
+
+    def _record_to_txn(self, before, after) -> None:
+        assert self._txn is not None
+        self._txn._record_edge(before, after)
+
+    def _wrap_in_diff(self, before, after) -> TreeDiff:
+        return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
+
+    def _not_found_msg(self, uuid_: UUID) -> str:
+        return f"Edge not found: uuid={uuid_}"
+
+    # ------------------------------------------------------------------
+    # Internal: identity resolution + endpoint helpers
+    # ------------------------------------------------------------------
+
     def _resolve_edge_uuid(self, conn) -> UUID:
         if self._edge_uuid is not None:
             return self._edge_uuid
@@ -712,7 +948,20 @@ class EdgeScope:
             return resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
         raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
 
-    # get / navigation -------------------------------------------------
+    def _endpoints(self, conn) -> tuple[UUID, UUID]:
+        """Fetch ``(from_node_uuid, to_node_uuid)`` for this edge in one query."""
+        edge_uuid = self._resolve_edge_uuid(conn)
+        row = conn.execute(
+            "SELECT from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
+            (edge_uuid,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Edge not found: uuid={edge_uuid}")
+        return row[0], row[1]
+
+    # ------------------------------------------------------------------
+    # get / navigation
+    # ------------------------------------------------------------------
 
     def get(self):
         with self._use_conn() as conn:
@@ -736,49 +985,32 @@ class EdgeScope:
 
     def from_node(self) -> NodeScope:
         with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            row = conn.execute(
-                "SELECT from_node_uuid FROM energydb.edge WHERE uuid = %s",
-                (edge_uuid,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
-            return NodeScope(self._client, node_uuid=row[0], txn=self._txn)
+            from_uuid, _ = self._endpoints(conn)
+        return NodeScope(self._client, node_uuid=from_uuid, txn=self._txn)
 
     def to_node(self) -> NodeScope:
         with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            row = conn.execute(
-                "SELECT to_node_uuid FROM energydb.edge WHERE uuid = %s",
-                (edge_uuid,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
-            return NodeScope(self._client, node_uuid=row[0], txn=self._txn)
+            _, to_uuid = self._endpoints(conn)
+        return NodeScope(self._client, node_uuid=to_uuid, txn=self._txn)
 
-    # CRUD -------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # CRUD
+    # ------------------------------------------------------------------
 
     def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if before is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
+        captured: list[UUID] = []
+
+        def _do(conn, edge_uuid: UUID) -> None:
+            captured.append(edge_uuid)
             conn.execute(
                 "UPDATE energydb.edge SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, edge_uuid),
             )
-            after = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if self._txn is not None:
-                self._txn._record_edge(before, after)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
-            conn.commit()
-        return None
+
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            self._client._series_registry.evict_edge(str(captured[0]))
+        return result
 
     def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
         """Patch the edge's JSONB ``data`` column.
@@ -787,27 +1019,15 @@ class EdgeScope:
         ``replace_data=True`` to fully replace the row's ``data``. Renames
         go through :meth:`rename`; endpoint changes through :meth:`move_to`.
         """
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
         op = "data = %s" if replace_data else "data = data || %s"
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if before is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
+
+        def _do(conn, edge_uuid: UUID) -> None:
             conn.execute(
                 f"UPDATE energydb.edge SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), edge_uuid),
             )
-            after = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if self._txn is not None:
-                self._txn._record_edge(before, after)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
-            conn.commit()
-        return None
+
+        return self._apply_mutation(_do, dry_run=dry_run)
 
     def move_to(
         self,
@@ -822,201 +1042,62 @@ class EdgeScope:
         ``(edge_type, from_node_uuid, to_node_uuid)`` unique constraint
         surfaces collisions with an existing edge as a Postgres error.
         """
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
+
+        captured: list[UUID] = []
+
+        def _do(conn, edge_uuid: UUID) -> None:
+            captured.append(edge_uuid)
             new_from_uuid = _resolve_endpoint(conn, from_node)
             new_to_uuid = _resolve_endpoint(conn, to_node)
             if new_from_uuid == new_to_uuid:
                 raise ValueError("Edge endpoints must be distinct nodes.")
-            edge_uuid = self._resolve_edge_uuid(conn)
-            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if before is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
             conn.execute(
                 "UPDATE energydb.edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_from_uuid, new_to_uuid, edge_uuid),
             )
-            after = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if self._txn is not None:
-                self._txn._record_edge(before, after)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
-            conn.commit()
-        return None
+
+        result = self._apply_mutation(_do, dry_run=dry_run)
+        if not dry_run and captured:
+            self._client._series_registry.evict_edge(str(captured[0]))
+        return result
 
     def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
-        if dry_run and self._txn is not None:
-            _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            before = _fetch_edges_by_uuids(conn, [edge_uuid]).get(edge_uuid)
-            if before is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
+        captured: list[UUID] = []
+
+        def _do(conn, edge_uuid: UUID) -> None:
+            captured.append(edge_uuid)
             conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (edge_uuid,))
-            if self._txn is not None:
-                self._txn._record_edge(before, None)
-                return None
-            if dry_run:
-                conn.rollback()
-                return TreeDiff(edge_changes=[EdgeChange(old=before, new=None)])
-            conn.commit()
-        return None
 
-    # series -----------------------------------------------------------
+        result = self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        if not dry_run and captured:
+            registry = self._client._series_registry
+            registry.evict_owner(str(captured[0]))
+            registry.evict_edge(str(captured[0]))
+        return result
 
-    def register_series(
-        self,
-        ts_or_name: TimeSeries | str | None = None,
-        *,
-        name: str | None = None,
-        canonical_unit: str | None = None,
-        data_type: str | None = None,
-        timeseries_type: str | None = None,
-        retention: str | None = None,
-        description: str | None = None,
-    ) -> int:
-        if isinstance(ts_or_name, TimeSeries):
-            ts = ts_or_name
-            name = name or ts.name
-            canonical_unit = canonical_unit or ts.unit
-            if data_type is None and ts.data_type is not None:
-                data_type = str(ts.data_type).lower()
-            if timeseries_type is None:
-                timeseries_type = _timeseries_type_from_ts(ts)
-            description = description or ts.description
-        elif isinstance(ts_or_name, str):
-            name = ts_or_name
+    # ------------------------------------------------------------------
+    # Manifest builder for the shared _BaseScope read/read_relative
+    # ------------------------------------------------------------------
 
-        if name is None:
-            raise ValueError("name is required")
-        if data_type is None:
-            raise ValueError("data_type is required")
-        if canonical_unit is None:
-            raise ValueError("canonical_unit is required")
-        if timeseries_type is None:
-            raise ValueError("timeseries_type is required (FLAT | OVERLAPPING)")
-
-        data_type_str = str(data_type).lower()
-
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            sid = series_mod.register_series(
-                conn,
-                node_uuid=None,
-                edge_uuid=edge_uuid,
-                data_type=data_type_str,
-                name=name,
-                canonical_unit=canonical_unit,
-                timeseries_type=timeseries_type,
-                retention=retention,
-                description=description,
-            )
-            if self._txn is None:
-                conn.commit()
-        return sid
-
-    def write(
-        self,
-        df: pl.DataFrame | pd.DataFrame,
-        *,
-        data_type: str,
-        name: str,
-        unit: str | None = None,
-        knowledge_time: datetime | None = None,
-        run_id: int | None = None,
-        workflow_id: str | None = None,
-        model_name: str | None = None,
-        run_start_time: datetime | None = None,
-        run_finish_time: datetime | None = None,
-        run_params: dict | None = None,
-    ) -> int:
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-        manifest = _attach_routing(
-            to_polars(df),
-            owner_col="edge_uuid",
-            owner_val=edge_uuid,
-            data_type=data_type,
-            name=name,
-            unit=unit,
-        )
-        return self._client.write(
-            manifest,
-            knowledge_time=knowledge_time,
-            run_id=run_id,
-            workflow_id=workflow_id,
-            model_name=model_name,
-            run_start_time=run_start_time,
-            run_finish_time=run_finish_time,
-            run_params=run_params,
-        )
-
-    def read(
+    def _build_resolved_meta(
         self,
         *,
-        data_type: str | None = None,
-        name: str | None = None,
-        unit: str | None = None,
-        start_valid: datetime | None = None,
-        end_valid: datetime | None = None,
-        start_known: datetime | None = None,
-        end_known: datetime | None = None,
-        include_updates: bool = False,
-        include_knowledge_time: bool = False,
-        output: OutputType = "pandas",
-    ) -> pl.DataFrame | pd.DataFrame:
+        data_type: str | None,
+        name: str | None,
+    ) -> pl.DataFrame | None:
+        """Resolve this edge to per-series read meta. ``None`` if no series match."""
         with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None
-            meta = series_mod.resolve_for_read(
-                conn,
-                edge_uuids=[edge_uuid],
-                data_type=data_type_str,
-                name=name,
-            )
+            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                meta = series_mod.resolve_for_read(
+                    conn,
+                    owner_col="edge_uuid",
+                    owner_uuids=[edge_uuid],
+                    data_type=data_type_str,
+                    name=name,
+                )
         if meta.is_empty():
-            return to_output(pl.DataFrame(), output)
-        manifest = meta.select(["edge_uuid", "data_type", "name"]).unique()
-        return self._client.read(
-            manifest,
-            unit=unit,
-            start_valid=start_valid,
-            end_valid=end_valid,
-            start_known=start_known,
-            end_known=end_known,
-            include_updates=include_updates,
-            include_knowledge_time=include_knowledge_time,
-            output=output,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Manifest builder shared between NodeScope.write and EdgeScope.write
-# ---------------------------------------------------------------------------
-
-
-def _attach_routing(
-    df: pl.DataFrame,
-    *,
-    owner_col: str,
-    owner_val: UUID,
-    data_type: str,
-    name: str,
-    unit: str | None,
-) -> pl.DataFrame:
-    """Attach the routing columns required by the manifest pipeline.
-
-    ``owner_col`` is one of ``"node_uuid"`` / ``"edge_uuid"``. UUIDs are
-    serialized as strings on the manifest so polars-side joins work cleanly.
-    """
-    cols = [
-        pl.lit(str(owner_val), dtype=pl.Utf8).alias(owner_col),
-        pl.lit(str(data_type).lower(), dtype=pl.Utf8).alias("data_type"),
-        pl.lit(name, dtype=pl.Utf8).alias("name"),
-    ]
-    if unit is not None:
-        cols.append(pl.lit(unit, dtype=pl.Utf8).alias("unit"))
-    return df.with_columns(cols)
+            return None
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            return meta.drop("node_uuid")

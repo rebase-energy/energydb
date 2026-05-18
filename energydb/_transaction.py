@@ -29,10 +29,11 @@ class Transaction:
     """Context manager wrapping a single pool connection for atomic batches.
 
     Mid-transaction reads see the transaction's own uncommitted writes
-    (single physical connection). Time-series I/O — ``scope.write(df, ...)``
-    and ``scope.read(...)`` — uses :class:`Client` directly and does
-    **not** participate in the transaction; it executes immediately
-    against the pool.
+    (single physical connection). Time-series I/O —
+    ``scope.write(df, ...)`` / ``scope.read(...)`` — does not participate
+    in the PG transaction and is **rejected with a RuntimeError** on a
+    txn-bound scope: call :meth:`Client.write` / :meth:`Client.read`
+    directly outside the transaction instead.
     """
 
     def __init__(self, client: Client):
@@ -105,6 +106,7 @@ class Transaction:
             edm_obj,
             parent_uuid=parent_uuid,
             dry_run=False,
+            registry=self._client._series_registry,
         )
         self._node_changes.extend(diff.node_changes)
         self._edge_changes.extend(diff.edge_changes)
