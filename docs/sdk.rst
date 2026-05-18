@@ -115,10 +115,10 @@ next section.
 Building with ``register_tree``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The single entry point for structure persistence — every node, edge, and
+The single entry point for **creating** structure — every node, edge, and
 series declaration — is :meth:`~energydb.Client.register_tree`. It is
-declarative, idempotent, and atomic: build the entire portfolio top-down as
-one nested expression in Python, then persist it in one call.
+declarative and atomic: build the entire portfolio top-down as one nested
+expression in Python, then persist it in one call.
 
 .. code-block:: python
 
@@ -150,68 +150,61 @@ one nested expression in Python, then persist it in one call.
 
 Every ``Element`` got its ``id`` (UUID7) at construction; ``register_tree``
 writes those UUIDs straight into the row primary keys in PostgreSQL.
-Re-running with the same tree is a no-op — the underlying upsert
-(``ON CONFLICT (uuid)``) skips updates whose payload is unchanged.
 
 .. note::
 
-   ``register_tree`` is **structure-only**. If any node/edge in the tree
-   carries non-empty inline ``TimeSeries.df`` data, the call raises
-   ``ValueError`` — write data separately via :meth:`~energydb.Client.write`
-   or the scope helpers (see below).
+   ``register_tree`` is **create-only and structure-only**.
 
-Modes
-^^^^^
+   * Any UUID in the payload that already exists in the DB raises
+     ``ValueError`` — modify existing rows through scope mutators
+     (:meth:`NodeScope.rename`, ``.update``, ``.delete``, ``.move_to``,
+     ``.add``) instead, optionally batched in a :meth:`Client.transaction`.
+   * Names must be non-empty and must not contain ``/`` (the path
+     separator). Violations raise ``ValueError`` before any SQL runs and
+     are also rejected by PostgreSQL ``CHECK`` constraints.
+   * If any node/edge in the tree carries non-empty inline
+     ``TimeSeries.df`` data, the call raises ``ValueError`` — write data
+     separately via :meth:`~energydb.Client.write` or the scope helpers
+     (see below).
 
-.. list-table::
-   :header-rows: 1
-   :widths: 24 76
+Grafting onto an existing tree
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-   * - Mode
-     - Behavior for rows under the subtree root not in the target tree
-   * - ``"additive"`` (default)
-     - Left untouched. Re-running with a smaller tree never deletes anything.
-   * - ``"replace_subtree"``
-     - Candidates for deletion. Pass ``allow_delete=True`` to apply the
-       deletes; otherwise raises with the orphan list.
+Pass ``under=`` to attach the new tree's root under an existing parent.
+The parent path (or uuid) must resolve to an existing node:
 
 .. code-block:: python
 
-   client.register_tree(portfolio)                                      # additive
-   client.register_tree(portfolio, mode="additive")                     # explicit
-   client.register_tree(portfolio, mode="replace_subtree", allow_delete=True)
+   # Add a new site under an existing portfolio.
+   client.register_tree(
+       edb.Site(name="Offshore-2", lat=55.5, lon=3.5, members=[t03]),
+       under=("my-portfolio",),
+   )
 
 Dry run
 ^^^^^^^
 
-Pass ``dry_run=True`` to any :meth:`~energydb.Client.register_tree` call to
-preview the diff before applying. The call returns a
-:class:`~energydb.TreeDiff` and rolls back — no DB state changes.
+Pass ``dry_run=True`` to preview the diff before applying. The call
+returns a :class:`~energydb.TreeDiff` and rolls back — no DB state
+changes.
 
 .. code-block:: python
 
-   diff = client.register_tree(
-       portfolio, mode="replace_subtree", allow_delete=True, dry_run=True,
-   )
+   diff = client.register_tree(portfolio, dry_run=True)
    diff.render()
 
    # Looks good — apply.
-   client.register_tree(portfolio, mode="replace_subtree", allow_delete=True)
+   root_uuid = client.register_tree(portfolio)
 
-The diff carries flat ``node_changes`` / ``edge_changes`` lists and binned
-views (``node_inserts``, ``node_renames``, ``node_moves``,
-``node_data_edits``, ``node_deletes``, ``edge_inserts`` / ``edge_updates``
-/ ``edge_deletes``).
+The diff carries flat ``node_changes`` / ``edge_changes`` lists and
+binned views (``node_inserts``, ``edge_inserts``).
 
 ``TreeDiff.render()`` renders a tree-shaped textual preview::
 
-   Portfolio 'P'
-   ├── ~ Site 'NewName'                            [rename 'OldName' → 'NewName']
-   │   ├── + WindTurbine 'T03'                     [insert]
-   │   ├──   WindTurbine 'T01'
-   │   ├── ~ WindTurbine 'T02'                     [capacity: 3.5 → 4.0]
-   │   └── - Battery 'B1'                          [delete]
-   └── → Site 'Other'                              [moved (parent <a> → <b>)]
+   Portfolio 'my-portfolio'
+   ├── + Site 'Offshore-1'                         [insert]
+   │   ├── + WindTurbine 'T01'                     [insert]
+   │   └── + WindTurbine 'T02'                     [insert]
    edges:
      + Line 'Cable-1' <a-uuid> → <b-uuid>          [insert]
 
@@ -443,15 +436,25 @@ subtree. Pass ``data_type=`` and ``name=`` to narrow:
        data_type="actual", name="power",
    )
 
-The read returns a polars DataFrame by default; pass ``output="pandas"`` for
-pandas. Columns include the standard timedb output (``series_id``,
-``valid_time``, ``value``, plus optional ``knowledge_time`` /
-``change_time`` flags) joined with the energydb-side hierarchy info:
-``path`` (List[str]), ``node`` (display name), ``node_type``, ``node_uuid``,
-``data_type``, ``name``.
+The read returns a polars DataFrame by default; pass ``backend="pandas"`` for
+pandas. Default columns are ``path`` (``Utf8``, joined with ``/``),
+``data_type``, ``name``, ``valid_time``, ``value``. ``knowledge_time`` and
+``change_time`` appear when the corresponding ``include_*`` kwargs are
+set. Internal identifiers (``series_id``, ``node_uuid``, ``edge_uuid``)
+are never exposed on the result.
 
-For edge reads, the hierarchy columns are: ``edge_uuid``, ``edge`` (name),
-``edge_type``, ``from_node`` (path), ``to_node`` (path).
+For edge reads, the hierarchy columns are ``from_path``, ``to_path`` (both
+``Utf8``, joined with ``/``) and ``edge_type``.
+
+.. note::
+
+   **Scope auto-strip.** When a scope ``.read()`` resolves to a single
+   series (e.g. fully qualified path + ``data_type=`` + ``name=``) and
+   ``output="frame"``, the path/data_type/name columns are stripped —
+   you only get the data columns (``valid_time``, ``value``, plus opt-in
+   ``knowledge_time`` / ``change_time``). The caller already knows the
+   identity through the scope expression; re-broadcasting it on every row
+   is pure noise.
 
 Time-range filters mirror TimeDB:
 
@@ -487,8 +490,11 @@ the data columns. The routing column is autodetected from the column names
 
 - ``node_uuid`` — programmatic routing by UUID
 - ``edge_uuid`` — programmatic routing for edge-attached series
-- ``path`` — human-readable, ``List(Utf8)`` (preserves names with ``/``,
-  ``.``, spaces)
+- ``path`` — human-readable, ``Utf8`` joined with ``/``
+  (e.g. ``"my-portfolio/Offshore-1/T01"``). ``/`` is reserved as the
+  separator; names containing ``/`` are rejected at registration. The
+  manifest must use ``Utf8`` — ``List(Utf8)`` from earlier API versions
+  is rejected with an explicit migration message.
 
 write() — long-format multi-series ingestion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -502,7 +508,7 @@ write() — long-format multi-series ingestion
    hours = [base + timedelta(hours=h) for h in range(24)]
 
    manifest = pl.DataFrame({
-       "path":       [["my-portfolio", "Offshore-1", "T01"]] * 24,
+       "path":       ["my-portfolio/Offshore-1/T01"] * 24,
        "data_type":  ["actual"] * 24,
        "name":       ["power"] * 24,
        "valid_time": hours,
@@ -559,8 +565,8 @@ The read manifest is the same shape, minus the data columns:
 .. code-block:: python
 
    manifest = pl.DataFrame([
-       {"path": ("my-portfolio", "Offshore-1", "T01"), "data_type": "actual", "name": "power"},
-       {"path": ("my-portfolio", "Offshore-1", "T02"), "data_type": "actual", "name": "power"},
+       {"path": "my-portfolio/Offshore-1/T01", "data_type": "actual", "name": "power"},
+       {"path": "my-portfolio/Offshore-1/T02", "data_type": "actual", "name": "power"},
    ])
    df = client.read(
        manifest,
@@ -568,7 +574,7 @@ The read manifest is the same shape, minus the data columns:
        end_valid=datetime(2026, 2, 1, tzinfo=UTC),
    )
 
-Returns a polars DataFrame by default; pass ``output="pandas"`` for pandas.
+Returns a polars DataFrame by default; pass ``backend="pandas"`` for pandas.
 
 Optional kwargs:
 
@@ -578,14 +584,111 @@ Optional kwargs:
 - ``include_updates`` — expose correction chain
 - ``include_knowledge_time`` — return one row per (knowledge_time, valid_time)
 
-The result columns mirror the scope read: timedb output joined with the
-hierarchy columns (``path`` / ``node`` / ``node_type`` / ``node_uuid`` for
-node manifests, ``edge_uuid`` / ``edge`` / ``edge_type`` / ``from_node`` /
-``to_node`` for edge manifests).
+The result columns mirror the scope read: ``path``, ``data_type``,
+``name``, ``valid_time``, ``value`` for node manifests; ``from_path``,
+``to_path``, ``edge_type``, ``data_type``, ``name``, ``valid_time``,
+``value`` for edge manifests. ``path`` / ``from_path`` / ``to_path`` are
+``Utf8`` joined with ``/``. Internal identifiers (``series_id``,
+``node_uuid``, ``edge_uuid``) are never on the result.
 
 Per-window relative reads use :meth:`Client.read_relative
 <energydb.Client.read_relative>`, with the same parameters as TimeDB's
 :meth:`~timedb.TimeDBClient.read_relative`.
+
+Output modes
+~~~~~~~~~~~~
+
+Both :meth:`Client.read <energydb.Client.read>` and the scope reads accept
+an ``output=`` kwarg that controls return shape:
+
+- ``output="frame"`` (default) — one DataFrame with the identity columns
+  broadcast on every row. Good for ETL and ad-hoc analysis where you want
+  to ``group_by(path)`` or filter further downstream.
+- ``output="by_path"`` — a ``dict`` keyed by ``(path, data_type, name)``
+  (or ``(from_path, to_path, edge_type, data_type, name)`` for edge
+  reads), one DataFrame per series. Sub-frames carry only the data
+  columns (``valid_time``, ``value``, plus opt-in ``knowledge_time`` /
+  ``change_time``). Each sub-frame is sorted by ``valid_time`` ascending.
+
+Use ``by_path`` when downstream code naturally operates per-series — model
+training, plotting, per-asset writes back. Series that resolve but have
+no rows in ClickHouse still appear as keys with an empty sub-frame, so
+callers can index by key without ``KeyError``.
+
+.. code-block:: python
+
+   by_series = client.read(manifest, output="by_path")
+   for key, sub in by_series.items():
+       path, data_type, name = key
+       train_one_model(path, sub)
+
+The ``backend=`` kwarg is orthogonal: ``backend="polars"`` (default)
+returns polars frames in both modes; ``backend="pandas"`` converts every
+frame at the boundary.
+
+
+Atomic batches with ``transaction()``
+-------------------------------------
+
+For a sequence of mutations that must apply (or roll back) as a unit, open
+a :meth:`Client.transaction`. Mutations executed through the txn's scope
+factories share one borrowed pool connection and stay uncommitted until
+:meth:`Transaction.commit` is called explicitly. Exiting the
+``with``-block without committing raises and rolls back.
+
+.. code-block:: python
+
+   with client.transaction() as txn:
+       txn.get_node("my-portfolio", "Offshore-1", "T01").update({"hub_height": 95})
+       txn.get_node("my-portfolio", "Offshore-1", "T02").rename("T02b")
+       txn.get_node("my-portfolio", "Rooftop-1", "B01").move_to(
+           ("my-portfolio", "Offshore-1")
+       )
+       txn.preview().render()  # aggregate diff of everything queued so far
+       txn.commit()
+
+The transaction supports every scope mutator (``rename``, ``update``,
+``move_to``, ``delete``, ``add``, ``register_series``) plus
+:meth:`Transaction.register_tree` for create-only inserts. Mid-transaction
+reads on the same connection see the transaction's own uncommitted writes.
+
+.. warning::
+
+   **Time-series I/O does not participate in the PG transaction.**
+   ``scope.write(df, ...)``, ``scope.read(...)``, and
+   ``scope.read_relative(...)`` on a txn-bound scope raise
+   ``RuntimeError`` — the ClickHouse writes and the ``energydb.runs``
+   inserts go through their own connection and would not roll back with
+   the PG transaction. Call :meth:`Client.write` / :meth:`Client.read`
+   directly outside the ``with``-block when you need to mix structure
+   mutations and time-series I/O.
+
+
+Resolve cache
+-------------
+
+Every :class:`Client` keeps an in-process cache (the *series registry*)
+of resolved series, node, and edge metadata. The cache is read-through
+on the resolve hot path and write-through on every local mutation —
+``register_tree``, ``register_series``, ``rename``, ``move_to``,
+``delete``, etc. all keep it consistent transparently. There is nothing
+to invalidate by hand under normal use.
+
+The one case the cache cannot observe is **another process** mutating
+schema state this client has already cached — registering a new series,
+deleting a node, or flipping a series's ``timeseries_type``. Reads from
+the cached client will continue to serve stale metadata until you call:
+
+.. code-block:: python
+
+   client.invalidate_series_cache()                 # clear everything
+   client.invalidate_series_cache(owner_uuid=...)   # evict one owner only
+
+A focused eviction by ``owner_uuid`` is cheaper than a full clear when
+you know exactly which node/edge changed.
+
+Use :meth:`Client.resolve_cache_stats` to see hit/miss counters and the
+current cache size if you are tuning read latency.
 
 
 Run History
@@ -619,10 +722,10 @@ Common errors and how to handle them:
    from energydb import IncompatibleUnitError
 
    try:
-       client.register_tree(portfolio, mode="replace_subtree")
+       client.register_tree(portfolio)
    except ValueError as e:
-       if "would delete" in str(e):
-           # Orphans detected — pass allow_delete=True to confirm.
+       if "contains '/'" in str(e) or "must be non-empty" in str(e):
+           # Illegal node/edge/series name.
            ...
        else:
            raise
@@ -642,9 +745,14 @@ Common errors and how to handle them:
 
 Key exceptions:
 
-- ``ValueError`` — orphan detection in ``replace_subtree``, missing routing
+- ``ValueError`` — empty or ``/``-containing names, missing routing
   columns, unresolved series, missing ``knowledge_time`` for OVERLAPPING,
-  illegal type changes, cycle-creating ``move_to``
+  illegal type changes, cycle-creating ``move_to``, ``List(Utf8)``
+  manifest paths (use ``Utf8`` joined with ``/``), uuid-already-exists on
+  ``register_tree``
+- ``RuntimeError`` — time-series ``read`` / ``write`` /
+  ``read_relative`` on a txn-bound scope (call them outside the
+  ``with``-block)
 - :class:`~energydb.IncompatibleUnitError` — unit conversion failed due to
   dimensionality mismatch
 
@@ -668,21 +776,34 @@ Best Practices
    ``rename``, ``update``, ``move_to``, and ``delete`` silent ``UPDATE``\ s —
    no delete-then-insert dance, no full tree round-trip.
 
-4. **Use ``dry_run=True`` before destructive ``replace_subtree``.** Inspect
-   the :class:`~energydb.TreeDiff` (or call ``.render()``) and confirm before
-   passing ``allow_delete=True``.
+4. **Batch related mutations in a transaction.** Use
+   :meth:`Client.transaction` so a sequence of ``rename`` / ``update`` /
+   ``move_to`` / ``delete`` / ``add`` / ``register_tree`` calls either
+   all apply together or all roll back. Time-series I/O does not
+   participate — call :meth:`Client.write` / :meth:`Client.read`
+   outside the ``with``-block.
 
 5. **Pick a routing column per pipeline.** Mixing ``path`` and ``node_uuid``
    in the same manifest raises. Use ``path`` for human-readable ETL,
-   ``node_uuid`` / ``edge_uuid`` once you have the ids.
+   ``node_uuid`` / ``edge_uuid`` once you have the ids. ``path`` values
+   are ``Utf8`` joined with ``/`` (e.g. ``"my-portfolio/Offshore-1/T01"``).
 
-6. **Tag writes with ``workflow_id`` / ``model_name``.** Provenance lives in
+6. **Use ``output="by_path"`` when downstream code is per-series.**
+   Training one model per asset, plotting per-series, or computing
+   per-series statistics is cleaner against the keyed dict than against
+   one long-format frame.
+
+7. **Tag writes with ``workflow_id`` / ``model_name``.** Provenance lives in
    ``energydb.runs`` and is recoverable via
    :meth:`~energydb.Client.read_runs_for_series`.
 
-7. **Use ``where(type=...)`` for type-filtered subtree reads.** A single
+8. **Use ``where(type=...)`` for type-filtered subtree reads.** A single
    fluent call replaces N targeted reads — the manifest pipeline batches
    resolution and the join in one round-trip.
+
+9. **Call ``invalidate_series_cache()`` only after a cross-process
+   schema change.** In-process registrations and deletions are tracked
+   automatically.
 
 
 Complete Example
@@ -734,8 +855,8 @@ A complete workflow from setup to analysis:
 
    # 4. Bulk write — actual power for both turbines via a manifest.
    long_df = pl.DataFrame({
-       "path":       [["my-portfolio", "Offshore-1", "T01"]] * 24
-                   + [["my-portfolio", "Offshore-1", "T02"]] * 24,
+       "path":       ["my-portfolio/Offshore-1/T01"] * 24
+                   + ["my-portfolio/Offshore-1/T02"] * 24,
        "data_type":  ["actual"] * 48,
        "name":       ["power"] * 48,
        "valid_time": list(hours) * 2,
@@ -751,12 +872,21 @@ A complete workflow from setup to analysis:
    )
    print(result.head())
 
-   # 6. Surgical edits — rename a site, update a turbine, remove another.
-   client.get_node("my-portfolio", "Offshore-1").rename("Offshore-Renamed")
-   client.get_node("my-portfolio", "Offshore-Renamed", "T01").update(
-       data={"capacity": 4.0},
+   # 5b. Same read, partitioned per-series for downstream loops.
+   by_series = client.get_node("my-portfolio").read(
+       data_type="actual", name="power", output="by_path",
    )
-   client.get_node("my-portfolio", "Offshore-Renamed", "T02").delete()
+   for (path, dt, name), sub in by_series.items():
+       print(f"{path}: {len(sub)} rows")
+
+   # 6. Surgical edits — batched in a transaction for atomicity.
+   with client.transaction() as txn:
+       txn.get_node("my-portfolio", "Offshore-1").rename("Offshore-Renamed")
+       txn.get_node("my-portfolio", "Offshore-Renamed", "T01").update(
+           {"capacity": 4.0},
+       )
+       txn.get_node("my-portfolio", "Offshore-Renamed", "T02").delete()
+       txn.commit()
 
    # 7. Cleanup.
    client.delete()

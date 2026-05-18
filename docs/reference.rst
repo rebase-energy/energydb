@@ -38,6 +38,19 @@ Path / filter accumulation does not hit the database; terminal operations
    :show-inheritance:
 
 
+Transactions
+------------
+
+``client.transaction()`` returns a :class:`Transaction` context manager
+that batches structure mutations into one atomic commit. Time-series
+``read`` / ``write`` / ``read_relative`` on a txn-bound scope raise
+``RuntimeError`` — they do not participate in the PG transaction.
+
+.. autoclass:: energydb.Transaction
+   :members:
+   :show-inheritance:
+
+
 Diff Types
 ----------
 

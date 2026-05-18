@@ -47,16 +47,17 @@ Available Notebooks
 Notebook Descriptions
 ---------------------
 
-**Quickstart**: Walks through the full energydb workflow in nine sections —
-schema setup with ``Client.create()``, declaring a Portfolio of wind
-turbines / a PV system / a battery, persisting structure with
-``register_tree``, writing data through ``NodeScope.write``, reading across
-the hierarchy with subtree / type-filter / single-asset scopes, reconstructing
-the tree as an EnergyDataModel object, modifying and writing back with
-``replace_subtree`` and ``allow_delete``, manifest-based bulk reads, edges
-with their own series, and cleanup. The notebook at
-``examples/quickstart.ipynb`` is the source of truth and is auto-copied into
-``docs/notebooks/`` at build time.
+**Quickstart**: Walks through the full energydb workflow — schema setup
+with ``Client.create()``, declaring a Portfolio of wind turbines / a PV
+system / a battery, persisting structure with ``register_tree``, writing
+data through ``NodeScope.write``, reading across the hierarchy with
+subtree / type-filter / single-asset scopes, reconstructing the tree as
+an EnergyDataModel object, surgical edits via scope mutators (``rename``,
+``update``, ``delete``, ``add``) and batched atomically with
+``Client.transaction()``, manifest-based bulk reads in both ``frame`` and
+``by_path`` output modes, edges with their own series, and cleanup. The
+notebook at ``examples/quickstart.ipynb`` is the source of truth and is
+auto-copied into ``docs/notebooks/`` at build time.
 
 The notebook is also runnable in Google Colab — the first cell installs
 PostgreSQL and ClickHouse inside the Colab VM via ``examples/colab_setup.py``
