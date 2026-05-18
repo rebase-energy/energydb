@@ -47,6 +47,7 @@ ARCHITECTURE.md
 .claude/
 
 benchmarks/
+benchmark_argmax_vs_limit1by/
 
 # Local engineering notes (perf scratch, etc.)
 notes/
