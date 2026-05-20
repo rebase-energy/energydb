@@ -44,6 +44,16 @@ class Transaction:
         self._node_changes: list[NodeChange] = []
         self._edge_changes: list[EdgeChange] = []
 
+    def __repr__(self) -> str:
+        """Plain-text repr — no I/O. Shows state + pending-change counts."""
+        if self._committed:
+            state = "committed"
+        elif self._conn is not None:
+            state = "open"
+        else:
+            state = "unopened"
+        return f"Transaction({state}, {len(self._node_changes)} node + {len(self._edge_changes)} edge changes pending)"
+
     def __enter__(self) -> Transaction:
         self._pool_cm = self._client._pool.connection()
         self._conn = self._pool_cm.__enter__()
@@ -77,8 +87,8 @@ class Transaction:
 
     def get_edge(
         self,
-        from_path: Path | list[str] | None = None,
-        to_path: Path | list[str] | None = None,
+        from_path: Path | list[str] | str | None = None,
+        to_path: Path | list[str] | str | None = None,
         *,
         type: str | None = None,
         uuid: UUID | None = None,
@@ -90,7 +100,7 @@ class Transaction:
         self,
         edm_obj,
         *,
-        under: Path | list[str] | None = None,
+        under: Path | list[str] | str | None = None,
     ) -> UUID:
         """Create a new tree (or subtree) inside this transaction.
 

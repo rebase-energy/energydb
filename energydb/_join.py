@@ -19,10 +19,60 @@ series by ``(path, data_type, name)`` (or edge equivalent).
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import polars as pl
 
 from energydb._resolve_cache import NodeMeta, SeriesRegistry
 from energydb.paths import fetch_edge_hierarchy_bulk, fetch_node_hierarchy_bulk
+
+
+class SeriesKey(NamedTuple):
+    """Typed key for node-routed ``output="by_path"`` result dicts.
+
+    Tuple-compatible: existing positional access
+    (``result[("P/T01", "actual", "power")]``) keeps working. New code can
+    use attribute access (``key.path``, ``key.data_type``, ``key.name``).
+    """
+
+    path: str
+    data_type: str
+    name: str
+
+
+class EdgeSeriesKey(NamedTuple):
+    """Typed key for edge-routed ``output="by_path"`` result dicts.
+
+    Tuple-compatible. Holds the 5-element identity of an edge-attached
+    series — both endpoint paths, the edge type, and the series's own
+    ``(data_type, name)`` pair.
+    """
+
+    from_path: str
+    to_path: str
+    edge_type: str
+    data_type: str
+    name: str
+
+
+def find(result: dict, **filters):
+    """Partial-match filter over a by_path result dict.
+
+    ``filters`` are attribute-name → value pairs matched against
+    :class:`SeriesKey` / :class:`EdgeSeriesKey` fields. Returns a list of
+    ``(key, df)`` tuples in the result's iteration order.
+
+    ``edb.find(result, name="power")`` returns all series named ``"power"``
+    regardless of path / data_type. Unknown attribute names match nothing.
+    """
+    out = []
+    for key, df in result.items():
+        if all(getattr(key, k, _MISSING) == v for k, v in filters.items()):
+            out.append((key, df))
+    return out
+
+
+_MISSING = object()
 
 
 def attach_node_hierarchy(
@@ -127,13 +177,17 @@ def partition_node_by_path(
     meta: pl.DataFrame,
     *,
     registry: SeriesRegistry | None = None,
-) -> dict[tuple[str, str, str], pl.DataFrame]:
-    """Partition a node-routed CH result into ``{(path, data_type, name): df}``.
+) -> dict[SeriesKey, pl.DataFrame]:
+    """Partition a node-routed CH result into ``{SeriesKey: df}``.
 
     Skips the per-row broadcast that ``attach_node_hierarchy`` does. Each
     sub-frame carries only the CH data columns (``valid_time``, ``value``,
     plus opt-in time/audit columns) — ``series_id`` is dropped, and
     ``path`` / ``data_type`` / ``name`` live in the key, not the row.
+
+    Keys are :class:`SeriesKey` NamedTuples — tuple-compatible for
+    backwards-compat positional access, plus attribute access
+    (``key.path``, ``key.data_type``, ``key.name``).
 
     Series that appear in the manifest but for which CH returned no rows
     get an empty sub-frame with the documented schema — callers can index
@@ -145,12 +199,12 @@ def partition_node_by_path(
     node_uuid_strs = [u for u in meta["node_uuid"].to_list() if u is not None]
     node_meta_map = _resolve_node_metas(pool, node_uuid_strs, registry)
 
-    sid_to_key: dict[int, tuple[str, str, str]] = {}
+    sid_to_key: dict[int, SeriesKey] = {}
     for row in meta.iter_rows(named=True):
         nm = node_meta_map.get(row["node_uuid"])
         if nm is None:
             continue
-        sid_to_key[row["series_id"]] = (nm.joined_path, row["data_type"], row["name"])
+        sid_to_key[row["series_id"]] = SeriesKey(nm.joined_path, row["data_type"], row["name"])
 
     return _build_partition(result, sid_to_key)
 
@@ -161,12 +215,12 @@ def partition_edge_by_path(
     meta: pl.DataFrame,
     *,
     registry: SeriesRegistry | None = None,
-) -> dict[tuple[str, str, str, str, str], pl.DataFrame]:
-    """Partition an edge-routed CH result into
-    ``{(from_path, to_path, edge_type, data_type, name): df}``.
+) -> dict[EdgeSeriesKey, pl.DataFrame]:
+    """Partition an edge-routed CH result into ``{EdgeSeriesKey: df}``.
 
     Same shape as :func:`partition_node_by_path` for the data side; the key
-    is extended with the edge endpoint paths and ``edge_type``.
+    is :class:`EdgeSeriesKey`, extended with the edge endpoint paths and
+    ``edge_type``. Tuple-compatible for backwards-compat positional access.
     """
     if meta.is_empty():
         return {}
@@ -180,12 +234,12 @@ def partition_edge_by_path(
         nm = node_meta_map.get(uid)
         return nm.joined_path if nm is not None else ""
 
-    sid_to_key: dict[int, tuple[str, str, str, str, str]] = {}
+    sid_to_key: dict[int, EdgeSeriesKey] = {}
     for row in meta.iter_rows(named=True):
         em = edge_meta_map.get(row["edge_uuid"])
         if em is None:
             continue
-        sid_to_key[row["series_id"]] = (
+        sid_to_key[row["series_id"]] = EdgeSeriesKey(
             _joined(em.from_node_uuid),
             _joined(em.to_node_uuid),
             em.edge_type,
@@ -196,20 +250,24 @@ def partition_edge_by_path(
     return _build_partition(result, sid_to_key)
 
 
-def _build_partition(
+def _build_partition[KeyT: tuple](
     result: pl.DataFrame,
-    sid_to_key: dict[int, tuple],
-) -> dict[tuple, pl.DataFrame]:
+    sid_to_key: dict[int, KeyT],
+) -> dict[KeyT, pl.DataFrame]:
     """Common partition assembly for ``partition_*_by_path``.
 
     Splits ``result`` by ``series_id`` (dropping that column from the
     sub-frames) and re-keys by the caller-supplied identity tuple. Series
     in ``sid_to_key`` that have no rows in ``result`` get an empty
     sub-frame with the CH-side data schema (minus ``series_id``).
+
+    Generic over the key type — ``KeyT`` is bound to ``tuple`` so both
+    :class:`SeriesKey` and :class:`EdgeSeriesKey` (NamedTuples) are
+    accepted and the return type carries through.
     """
     data_schema = {c: dtype for c, dtype in result.schema.items() if c != "series_id"}
 
-    out: dict[tuple, pl.DataFrame] = {}
+    out: dict[KeyT, pl.DataFrame] = {}
     if not result.is_empty():
         parts = result.partition_by("series_id", as_dict=True, include_key=False)
         # parts is keyed by tuple of partition values, here (series_id,).

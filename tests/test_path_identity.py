@@ -232,3 +232,98 @@ def test_same_name_different_type_rejected_under_one_parent(client):
     # so ON CONFLICT (uuid) doesn't fire; the unique key collision surfaces).
     with pytest.raises(psycopg.errors.UniqueViolation):
         client.register_tree(edb.battery.Battery(name="X", storage_capacity=10), under=("P",))
+
+
+# ---------------------------------------------------------------------------
+# Canonical `/`-joined string path form
+# ---------------------------------------------------------------------------
+
+
+def test_slash_string_resolves_same_as_variadic(client):
+    """``get_node("P/Site/T01")`` ≡ ``get_node("P","Site","T01")`` ≡ tuple form."""
+    tree = edb.Portfolio(
+        name="P",
+        members=[edb.Site(name="Site", members=[edb.wind.WindTurbine(name="T01", capacity=3.5)])],
+    )
+    client.register_tree(tree)
+
+    via_string = client.get_node("P/Site/T01").get()
+    via_variadic = client.get_node("P", "Site", "T01").get()
+    via_tuple = client.get_node(("P", "Site", "T01")).get()
+    assert via_string.id == via_variadic.id == via_tuple.id
+
+
+def test_slash_string_mixed_with_variadic(client):
+    """``get_node("P/Site", "T01")`` flattens consistently."""
+    client.register_tree(
+        edb.Portfolio(
+            name="P",
+            members=[edb.Site(name="Site", members=[edb.wind.WindTurbine(name="T01", capacity=3.5)])],
+        )
+    )
+    assert client.get_node("P/Site", "T01").get().name == "T01"
+
+
+def test_slash_string_in_tuple_also_splits(client):
+    """String elements inside a tuple are split on ``/`` for consistency."""
+    client.register_tree(
+        edb.Portfolio(
+            name="P",
+            members=[edb.Site(name="Site", members=[edb.wind.WindTurbine(name="T01", capacity=3.5)])],
+        )
+    )
+    assert client.get_node(("P/Site", "T01")).get().name == "T01"
+
+
+def test_slash_string_register_tree_under(client):
+    """``register_tree(..., under="P/Site")`` accepts the canonical form."""
+    client.register_tree(edb.Portfolio(name="P", members=[edb.Site(name="Site")]))
+    client.register_tree(
+        edb.wind.WindTurbine(name="T01", capacity=3.5),
+        under="P/Site",
+    )
+    assert client.get_node("P/Site/T01").get().capacity == 3.5
+
+
+def test_slash_string_query_nodes_within(client):
+    """``query_nodes(within="P/Site")`` resolves the subtree by string path."""
+    client.register_tree(
+        edb.Portfolio(
+            name="P",
+            members=[edb.Site(name="Site", members=[edb.wind.WindTurbine(name="T01", capacity=3.5)])],
+        )
+    )
+    nodes = client.query_nodes(within="P/Site")
+    names = {n.name for n in nodes}
+    assert "Site" in names and "T01" in names
+
+
+def test_slash_string_get_edge(client):
+    """``get_edge("P/BusA", "P/BusB", type=...)`` accepts string endpoints."""
+    bus_a = edb.grid.JunctionPoint(name="BusA")
+    bus_b = edb.grid.JunctionPoint(name="BusB")
+    client.register_tree(edb.Portfolio(name="P", members=[bus_a, bus_b]))
+    line = edb.grid.Line(name="Cable", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    edge_uuid = client.create_edge(line)
+    assert client.get_edge("P/BusA", "P/BusB", type="Line").get().id == edge_uuid
+
+
+def test_slash_string_move_to_target(client):
+    """``move_to("P/NewSite")`` accepts the canonical string form."""
+    turbine = edb.wind.WindTurbine(name="T01", capacity=3.5)
+    client.register_tree(
+        edb.Portfolio(
+            name="P",
+            members=[edb.Site(name="OldSite", members=[turbine]), edb.Site(name="NewSite")],
+        )
+    )
+    client.get_node("P/OldSite/T01").move_to("P/NewSite")
+    assert client.get_node("P/NewSite/T01").get().id == turbine.id
+
+
+@pytest.mark.parametrize("bad_path", ["", "/P", "P/", "P//Site"])
+def test_malformed_slash_string_raises(client, bad_path):
+    """Empty, leading, trailing, or doubled ``/`` raises with a clear message."""
+    client.register_tree(edb.Portfolio(name="P"))
+    with pytest.raises(ValueError):
+        client.get_node(bad_path)

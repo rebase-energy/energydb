@@ -41,6 +41,7 @@ from timedb import TimeDBClient, profiling
 from energydb import runs as runs_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import read_manifest, read_relative_manifest, write_manifest
+from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, register_tree_under
 from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import TreeDiff
@@ -94,6 +95,24 @@ class Client:
         )
         self.td = TimeDBClient(ch_url=ch_url)
         self._series_registry = SeriesRegistry()
+
+    def __repr__(self) -> str:
+        """Repr with credentials stripped from the DSN.
+
+        Shows scheme + host(:port) + db; the userinfo segment (user:pass) is
+        replaced with ``***``. Pure formatting — no I/O.
+        """
+        dsn = self._dsn
+        if "://" in dsn:
+            scheme, rest = dsn.split("://", 1)
+            if "@" in rest:
+                _userinfo, hostpart = rest.split("@", 1)
+                safe = f"{scheme}://***@{hostpart}"
+            else:
+                safe = dsn
+        else:
+            safe = dsn
+        return f"Client(pg={safe!r})"
 
     # ------------------------------------------------------------------
     # Schema management
@@ -157,9 +176,14 @@ class Client:
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`NodeScope` for a node or subtree.
 
-        ``client.get_node("A", "B", "C")``           — variadic path
-        ``client.get_node(("A", "B", "C"))``         — tuple/list path
+        ``client.get_node("P/Site/T01")``            — canonical ``/``-joined string
+        ``client.get_node("P", "Site", "T01")``      — variadic — equivalent
+        ``client.get_node(("P", "Site", "T01"))``    — tuple/list path
         ``client.get_node(uuid=...)``                — absolute by uuid
+
+        ``/`` is reserved as the path separator; names containing ``/``
+        are rejected at registration time. Empty segments (leading,
+        trailing, or doubled ``/``) raise ``ValueError``.
 
         Terminate the chain with ``.get()`` to fetch the EDM object,
         ``.read()`` for time-series data, ``.where(...)`` to filter a
@@ -175,15 +199,17 @@ class Client:
 
     def get_edge(
         self,
-        from_path: Path | list[str] | None = None,
-        to_path: Path | list[str] | None = None,
+        from_path: Path | list[str] | str | None = None,
+        to_path: Path | list[str] | str | None = None,
         *,
         type: str | None = None,
         uuid: UUID | None = None,
     ) -> EdgeScope:
         """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type)``.
 
-        Terminate with ``.get()`` to fetch the EDM edge eagerly.
+        ``from_path`` / ``to_path`` accept the canonical ``/``-joined string
+        form (``"P/Site/T01"``) or a tuple/list of segments. Terminate with
+        ``.get()`` to fetch the EDM edge eagerly.
         """
         if uuid is not None:
             if from_path is not None or to_path is not None or type is not None:
@@ -193,8 +219,8 @@ class Client:
             raise ValueError("Provide uuid= or (from_path, to_path, type=).")
         return EdgeScope(
             self,
-            from_path=tuple(from_path),
-            to_path=tuple(to_path),
+            from_path=_coerce_path((), kwarg=from_path),
+            to_path=_coerce_path((), kwarg=to_path),
             edge_type=type,
         )
 
@@ -228,7 +254,7 @@ class Client:
         self,
         edm_obj,
         *,
-        under: Path | list[str] | None = None,
+        under: Path | list[str] | str | None = None,
         dry_run: bool = False,
     ) -> UUID | TreeDiff:
         """Persist an EDM tree's structure: nodes, edges, series declarations.
@@ -283,8 +309,8 @@ class Client:
     ) -> list:
         """Return matching nodes as a flat list of EDM objects.
 
-        ``within`` accepts a path (tuple/list), a single name (str), or a
-        :class:`UUID`.
+        ``within`` accepts a ``/``-joined string (``"P/Site"``), a path
+        tuple/list of segments, or a :class:`UUID`.
         """
         where_filters: dict[str, Any] = dict(property_filters)
         if type is not None:
@@ -336,8 +362,9 @@ class Client:
     ) -> list:
         """Return matching edges as a flat list of EDM objects.
 
-        ``within`` (path tuple/list, a single name as str, or a :class:`UUID`)
-        restricts to edges where either endpoint is in that subtree.
+        ``within`` (``/``-joined string ``"P/Site"``, path tuple/list of
+        segments, or a :class:`UUID`) restricts to edges where either
+        endpoint is in that subtree.
         """
         where_filters: dict[str, Any] = dict(property_filters)
         if type is not None:
@@ -480,10 +507,11 @@ class Client:
         """Bulk-write timeseries data via a routing manifest.
 
         ``df`` is a pandas or polars DataFrame carrying one routing column
-        (``node_uuid``, ``edge_uuid``, or ``path`` as ``List(Utf8)``), plus
-        ``data_type``, ``name``, and the timedb data columns (``valid_time``,
-        ``value``, optional ``knowledge_time``). Optional ``unit`` column
-        triggers per-row unit conversion to each series's canonical unit.
+        (``node_uuid``, ``edge_uuid``, or ``path`` as ``Utf8`` joined with
+        ``/``, e.g. ``"my-portfolio/Offshore-1/T01"``), plus ``data_type``,
+        ``name``, and the timedb data columns (``valid_time``, ``value``,
+        optional ``knowledge_time``). Optional ``unit`` column triggers
+        per-row unit conversion to each series's canonical unit.
 
         Series must already be registered (typically via
         :meth:`register_tree`). Returns the ``run_id`` used.
@@ -517,7 +545,14 @@ class Client:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
-    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+    ):
         """Bulk read via manifest. Detects edge vs node routing automatically.
 
         Accepts pandas or polars on input. Output shape:
@@ -530,12 +565,15 @@ class Client:
           Optional columns appear when ``include_knowledge_time`` /
           ``include_updates`` are set.
         * ``output="by_path"``: a ``dict`` keyed by
-          ``(path, data_type, name)`` (or the edge equivalent) with
-          per-series DataFrames carrying only the data columns
-          (``valid_time``, ``value``, plus opt-in time/audit columns).
-          Each sub-frame is sorted by ``valid_time`` ascending; secondary
-          sort keys are ``knowledge_time`` and/or ``change_time`` when
-          requested.
+          :class:`SeriesKey` (node-routed: ``path``, ``data_type``, ``name``)
+          or :class:`EdgeSeriesKey` (edge-routed: ``from_path``, ``to_path``,
+          ``edge_type``, ``data_type``, ``name``) with per-series DataFrames
+          carrying only the data columns (``valid_time``, ``value``, plus
+          opt-in time/audit columns). Keys are NamedTuples — positional
+          access (``result[(path, dt, name)]``) and attribute access
+          (``key.path``) both work. Each sub-frame is sorted by
+          ``valid_time`` ascending; secondary sort keys are
+          ``knowledge_time`` and/or ``change_time`` when requested.
 
         ``backend="polars"`` (default) returns polars frames;
         ``backend="pandas"`` converts at the boundary. Internal
@@ -569,7 +607,14 @@ class Client:
         output: Output = "frame",
         backend: Backend = "polars",
         **td_kwargs,
-    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+    ):
         """Bulk relative read via manifest.
 
         See :meth:`read` for the ``output`` / ``backend`` contract.

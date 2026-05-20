@@ -13,6 +13,8 @@ from typing import Literal, cast
 import pandas as pd
 import polars as pl
 
+from energydb._join import EdgeSeriesKey, SeriesKey
+
 Backend = Literal["polars", "pandas"]
 Output = Literal["frame", "by_path"]
 
@@ -25,14 +27,22 @@ def to_polars(df: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
 
 
 def to_backend(
-    result: pl.DataFrame | dict[tuple, pl.DataFrame],
+    result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame],
     backend: Backend,
-) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+) -> (
+    pl.DataFrame
+    | pd.DataFrame
+    | dict[SeriesKey, pl.DataFrame]
+    | dict[SeriesKey, pd.DataFrame]
+    | dict[EdgeSeriesKey, pl.DataFrame]
+    | dict[EdgeSeriesKey, pd.DataFrame]
+):
     """Convert an internal polars result to the user-requested backend.
 
     Handles both the long-format ``pl.DataFrame`` and the per-series
-    ``dict[tuple, pl.DataFrame]`` shape. When ``backend="pandas"`` and the
-    input is a dict, each value is converted in turn.
+    ``dict[SeriesKey | EdgeSeriesKey, pl.DataFrame]`` shape. When
+    ``backend="pandas"`` and the input is a dict, each value is converted
+    in turn.
     """
     if backend == "polars":
         return result
@@ -40,7 +50,13 @@ def to_backend(
         if isinstance(result, dict):
             # ty narrows the dict's value type to ``object`` after the isinstance,
             # so cast explicitly back to ``pl.DataFrame`` — no runtime cost.
-            d = cast(dict[tuple, pl.DataFrame], result)
-            return {k: v.to_pandas() for k, v in d.items()}
+            d = cast(dict[SeriesKey | EdgeSeriesKey, pl.DataFrame], result)
+            # dict invariance: the runtime dict carries a single key type per call
+            # (driven by the routing column), but statically the union has to be
+            # collapsed before assigning into the narrower return type.
+            return cast(
+                dict[SeriesKey, pd.DataFrame] | dict[EdgeSeriesKey, pd.DataFrame],
+                {k: v.to_pandas() for k, v in d.items()},
+            )
         return result.to_pandas()
     raise ValueError(f"backend must be 'polars' or 'pandas', got {backend!r}")

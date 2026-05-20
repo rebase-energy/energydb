@@ -269,3 +269,61 @@ def test_scope_single_series_with_by_path_returns_dict(client):
     assert ("P/T1", "actual", "power") in out
     sub = out[("P/T1", "actual", "power")]
     assert set(sub.columns) == {"valid_time", "value"}
+
+
+# ---------------------------------------------------------------------------
+# SeriesKey / EdgeSeriesKey NamedTuple result keys
+# ---------------------------------------------------------------------------
+
+
+def test_by_path_keys_are_series_key(client):
+    """``output='by_path'`` keys are :class:`SeriesKey` instances.
+
+    They are still tuple-equal to ``(path, data_type, name)``, so old
+    positional access keeps working. New code can use attribute access.
+    """
+    out = client.read(_manifest("P/T1", "P/T2"), output="by_path")
+    keys = list(out.keys())
+    assert all(isinstance(k, edb.SeriesKey) for k in keys)
+    # Backwards-compat: positional access still works (NamedTuple == tuple).
+    assert out[("P/T1", "actual", "power")]["value"].to_list() == [1.0, 2.0]
+    # Attribute access — the whole point.
+    one = [k for k in keys if k.path == "P/T1"][0]
+    assert one.path == "P/T1"
+    assert one.data_type == "actual"
+    assert one.name == "power"
+
+
+def test_by_path_series_key_constructor_matches_dict_key(client):
+    """``edb.SeriesKey("P/T1","actual","power")`` indexes the dict directly."""
+    out = client.read(_manifest("P/T1"), output="by_path")
+    key = edb.SeriesKey(path="P/T1", data_type="actual", name="power")
+    assert key in out
+    assert out[key]["value"].to_list() == [1.0, 2.0]
+
+
+def test_find_filters_by_name(client):
+    """``edb.find(result, name="power")`` returns matching (key, df) pairs."""
+    out = client.read(_manifest("P/T1", "P/T2"), output="by_path")
+    matches = edb.find(out, name="power")
+    assert len(matches) == 2
+    assert {k.path for k, _ in matches} == {"P/T1", "P/T2"}
+
+
+def test_find_filters_by_path(client):
+    out = client.read(_manifest("P/T1", "P/T2"), output="by_path")
+    matches = edb.find(out, path="P/T1")
+    assert len(matches) == 1
+    assert matches[0][0].path == "P/T1"
+
+
+def test_find_empty_match(client):
+    """Filter that matches nothing returns []."""
+    out = client.read(_manifest("P/T1"), output="by_path")
+    assert edb.find(out, name="does-not-exist") == []
+
+
+def test_find_unknown_attribute_matches_nothing(client):
+    """Unknown filter attribute matches nothing (defensive)."""
+    out = client.read(_manifest("P/T1"), output="by_path")
+    assert edb.find(out, nonexistent_attr="x") == []

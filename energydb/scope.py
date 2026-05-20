@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 import pandas as pd
@@ -32,6 +32,7 @@ from timedb import profiling
 from energydb import series as series_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import read_relative_resolved, read_resolved
+from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
@@ -74,27 +75,73 @@ def _ts_io_unsupported_in_txn(op: str) -> None:
     )
 
 
-def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Path:
-    """Accept variadic names, a single tuple/list, or a kwarg form.
+def _split_path_string(s: str) -> Path:
+    """Split a ``/``-separated path string into segments; validate non-empty.
 
-    ``_coerce_path(("A", "B", "C"))``    → ``("A", "B", "C")``
-    ``_coerce_path((("A", "B"),))``      → ``("A", "B")``
-    ``_coerce_path(([..."A","B"],))``    → ``("A", "B")``
+    ``"P/Site/T01"`` → ``("P", "Site", "T01")``. Leading, trailing, or
+    consecutive ``/`` (which would produce an empty segment) are rejected
+    with a message naming the offending input. ``/`` itself is forbidden
+    inside node/edge/series names by a PG CHECK constraint, so splitting
+    is unambiguous.
+    """
+    if not s:
+        raise ValueError("Path string must be non-empty; got ''.")
+    segments = s.split("/")
+    if any(seg == "" for seg in segments):
+        raise ValueError(
+            f"Path {s!r} has an empty segment (leading/trailing/double '/'). "
+            f"Pass non-empty names separated by single '/'."
+        )
+    return tuple(segments)
+
+
+def _flatten_segments(items) -> Path:
+    """Flatten an iterable of segments, splitting any ``/``-containing strings.
+
+    Non-string items raise. Used by :func:`_coerce_path` to handle both
+    variadic forms (``("a", "b/c")``) and explicit tuple/list arguments
+    (``("a", "b/c")`` as one positional). String elements are always split
+    on ``/`` for consistency — if the user passed structured data with a
+    string segment carrying a separator, that's still a path expression.
+    """
+    out: list[str] = []
+    for it in items:
+        if not isinstance(it, str):
+            raise TypeError(f"Path segment must be str, got {type(it).__name__}")
+        out.extend(_split_path_string(it))
+    return tuple(out)
+
+
+def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Path:
+    """Accept variadic names, a single tuple/list, a ``/``-joined string,
+    or a kwarg form. Strings are always ``/``-split into segments.
+
+    ``_coerce_path(("P/Site/T01",))``     → ``("P", "Site", "T01")``  *(canonical)*
+    ``_coerce_path(("P", "Site", "T01"))``→ ``("P", "Site", "T01")``  *(variadic)*
+    ``_coerce_path((("P","Site","T01"),))`` → ``("P", "Site", "T01")``
+    ``_coerce_path(("P/Site", "T01"))``   → ``("P", "Site", "T01")``  *(mixed)*
+    ``_coerce_path((), kwarg="P/Site")``  → ``("P", "Site")``
+    ``_coerce_path((), kwarg=("P","Site"))`` → ``("P", "Site")``
     """
     if kwarg is not None:
         if isinstance(kwarg, str):
-            return (kwarg,)
-        return tuple(kwarg)
+            return _split_path_string(kwarg)
+        return _flatten_segments(kwarg)
     if len(args) == 1 and isinstance(args[0], (tuple, list)):
-        return tuple(args[0])
-    return tuple(args)
+        return _flatten_segments(args[0])
+    return _flatten_segments(args)
 
 
-def _resolve_endpoint(conn, target: NodeScope | Path | list[str]) -> UUID:
-    """Resolve a node endpoint reference to a UUID against ``conn``."""
+def _resolve_endpoint(conn, target: NodeScope | Path | list[str] | str) -> UUID:
+    """Resolve a node endpoint reference to a UUID against ``conn``.
+
+    Accepts a :class:`NodeScope`, a ``/``-joined string (``"P/Site/T01"``),
+    a tuple/list of segments, or a single name. Strings are split on ``/``;
+    see :func:`_coerce_path` for full semantics.
+    """
     if isinstance(target, NodeScope):
         return target._resolve_node_uuid(conn)
-    path = tuple(target)
+    path = _coerce_path((), kwarg=target)
     if not path:
         raise ValueError("Endpoint path cannot be empty.")
     return resolve_node_uuid(conn, path)
@@ -404,7 +451,14 @@ class _BaseScope:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
-    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+    ):
         """Read time-series data for this scope.
 
         For :class:`NodeScope` the manifest spans the resolved subtree;
@@ -415,26 +469,25 @@ class _BaseScope:
             _ts_io_unsupported_in_txn("read")
         meta = self._build_resolved_meta(data_type=data_type, name=name)
         if meta is None:
-            empty: pl.DataFrame | dict[tuple, pl.DataFrame] = {} if output == "by_path" else pl.DataFrame()
+            empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
+                {} if output == "by_path" else pl.DataFrame()
+            )
             return to_backend(empty, backend)
         # Take the polars result first so the auto-strip is a single dtype op;
         # convert to the requested backend at the boundary.
-        result = cast(
-            "pl.DataFrame | dict[tuple, pl.DataFrame]",
-            read_resolved(
-                self._pool,
-                self._td,
-                meta,
-                unit=unit,
-                start_valid=start_valid,
-                end_valid=end_valid,
-                start_known=start_known,
-                end_known=end_known,
-                include_updates=include_updates,
-                include_knowledge_time=include_knowledge_time,
-                output=output,
-                registry=self._client._series_registry,
-            ),
+        result = read_resolved(
+            self._pool,
+            self._td,
+            meta,
+            unit=unit,
+            start_valid=start_valid,
+            end_valid=end_valid,
+            start_known=start_known,
+            end_known=end_known,
+            include_updates=include_updates,
+            include_knowledge_time=include_knowledge_time,
+            output=output,
+            registry=self._client._series_registry,
         )
         if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
             result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
@@ -449,7 +502,14 @@ class _BaseScope:
         output: Output = "frame",
         backend: Backend = "polars",
         **td_read_kwargs,
-    ) -> pl.DataFrame | pd.DataFrame | dict[tuple, pl.DataFrame] | dict[tuple, pd.DataFrame]:
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+    ):
         """Relative-window read for this scope.
 
         ``**td_read_kwargs`` are forwarded to
@@ -460,19 +520,18 @@ class _BaseScope:
             _ts_io_unsupported_in_txn("read_relative")
         meta = self._build_resolved_meta(data_type=data_type, name=name)
         if meta is None:
-            empty: pl.DataFrame | dict[tuple, pl.DataFrame] = {} if output == "by_path" else pl.DataFrame()
+            empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
+                {} if output == "by_path" else pl.DataFrame()
+            )
             return to_backend(empty, backend)
-        result = cast(
-            "pl.DataFrame | dict[tuple, pl.DataFrame]",
-            read_relative_resolved(
-                self._pool,
-                self._td,
-                meta,
-                unit=unit,
-                output=output,
-                registry=self._client._series_registry,
-                **td_read_kwargs,
-            ),
+        result = read_relative_resolved(
+            self._pool,
+            self._td,
+            meta,
+            unit=unit,
+            output=output,
+            registry=self._client._series_registry,
+            **td_read_kwargs,
         )
         if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
             result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
@@ -519,6 +578,37 @@ class NodeScope(_BaseScope):
             txn=txn,
         )
 
+    def __repr__(self) -> str:
+        """Plain-text repr — no I/O. Shows accumulated path, uuid, filters, txn binding."""
+        parts: list[str] = []
+        if self._path:
+            parts.append(f"path={'/'.join(self._path)!r}")
+        if self._node_uuid is not None:
+            parts.append(f"uuid={self._node_uuid}")
+        if self._where_filters:
+            parts.append(f"where={self._where_filters!r}")
+        if self._txn is not None:
+            parts.append("txn=True")
+        return f"NodeScope({', '.join(parts) or '<unresolved>'})"
+
+    def _repr_html_(self) -> str:
+        """Rich Jupyter repr — no I/O. Renders the scope's accumulated state."""
+        addr = "/".join(self._path) if self._path else (str(self._node_uuid) if self._node_uuid else "<unresolved>")
+        filters_html = f"<br/><small>where: <code>{self._where_filters!r}</code></small>" if self._where_filters else ""
+        txn_html = "<br/><small style='color:#888'>(bound to transaction)</small>" if self._txn else ""
+        uuid_html = (
+            f"<br/><small style='color:#888'>uuid: <code>{self._node_uuid}</code></small>"
+            if self._path and self._node_uuid is not None
+            else ""
+        )
+        return (
+            "<div style='border:1px solid #ddd;padding:8px;border-radius:4px;font-family:monospace'>"
+            "<b>NodeScope</b><br/>"
+            f"<code>{addr}</code>"
+            f"{uuid_html}{filters_html}{txn_html}"
+            "</div>"
+        )
+
     # ------------------------------------------------------------------
     # Subclass contract for _BaseScope._apply_mutation
     # ------------------------------------------------------------------
@@ -544,11 +634,13 @@ class NodeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
-        """Lazy navigation. Accepts variadic names, a tuple/list, or ``uuid=``.
+        """Lazy navigation. Accepts a ``/``-joined string, variadic names,
+        a tuple/list, or ``uuid=``.
 
-        ``scope.get_node("A", "B")``    — append two segments
-        ``scope.get_node(("A", "B"))``  — same, tuple form
-        ``scope.get_node(uuid=...)``    — replace scope with absolute uuid
+        ``scope.get_node("Site/T01")``     — canonical ``/``-joined string
+        ``scope.get_node("Site", "T01")``  — variadic — equivalent
+        ``scope.get_node(("Site","T01"))`` — tuple form
+        ``scope.get_node(uuid=...)``       — replace scope with absolute uuid
         """
         if uuid is not None:
             if names_or_path:
@@ -742,13 +834,14 @@ class NodeScope(_BaseScope):
             registry.evict_node_subtree(str(captured[0]))
         return result
 
-    def move_to(self, target: NodeScope | Path | list[str], *, dry_run: bool = False) -> TreeDiff | None:
+    def move_to(self, target: NodeScope | Path | list[str] | str, *, dry_run: bool = False) -> TreeDiff | None:
         """Re-parent this node to ``target``.
 
-        ``target`` is a :class:`NodeScope` or a path tuple/list. The node's
-        ``uuid`` (and its series) stays attached. The
-        ``(parent_uuid, name)`` unique constraint surfaces destination-name
-        collisions as a Postgres error.
+        ``target`` is a :class:`NodeScope`, a ``/``-joined string
+        (``"P/Site"``), or a tuple/list of segments. The node's ``uuid``
+        (and its series) stays attached. The ``(parent_uuid, name)``
+        unique constraint surfaces destination-name collisions as a
+        Postgres error.
 
         Rejects re-parenting into self or any descendant — that would create
         a cycle in the parent chain.
@@ -757,7 +850,7 @@ class NodeScope(_BaseScope):
             target_path = target._path
             target_node_uuid = target._node_uuid
         else:
-            target_path = tuple(target)
+            target_path = _coerce_path((), kwarg=target)
             target_node_uuid = None
 
         captured: list[UUID] = []
@@ -916,6 +1009,20 @@ class EdgeScope(_BaseScope):
             edge_type=self._edge_type,
             txn=txn,
         )
+
+    def __repr__(self) -> str:
+        """Plain-text repr — no I/O."""
+        if self._edge_uuid is not None and self._from_path is None:
+            base = f"EdgeScope(uuid={self._edge_uuid}"
+        else:
+            base = (
+                f"EdgeScope(from={'/'.join(self._from_path or ())!r}, "
+                f"to={'/'.join(self._to_path or ())!r}, "
+                f"type={self._edge_type!r}"
+            )
+        if self._txn is not None:
+            base += ", txn=True"
+        return base + ")"
 
     # ------------------------------------------------------------------
     # Subclass contract for _BaseScope._apply_mutation

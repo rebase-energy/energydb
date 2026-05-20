@@ -65,6 +65,7 @@ from timedatamodel import (  # noqa: E402
     TimeSeriesType,
 )
 
+from energydb._join import EdgeSeriesKey, SeriesKey, find  # noqa: E402
 from energydb._transaction import Transaction  # noqa: E402
 from energydb.client import Client  # noqa: E402
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff  # noqa: E402
@@ -78,6 +79,10 @@ __all__ = [
     "NodeScope",
     "EdgeScope",
     "Transaction",
+    # By-path result keys
+    "SeriesKey",
+    "EdgeSeriesKey",
+    "find",
     # Diff
     "TreeDiff",
     "NodeChange",

@@ -18,6 +18,8 @@ from timedb import profiling
 
 from energydb import runs as runs_mod
 from energydb._join import (
+    EdgeSeriesKey,
+    SeriesKey,
     attach_edge_hierarchy,
     attach_node_hierarchy,
     partition_edge_by_path,
@@ -117,7 +119,7 @@ def _execute_read(
     unit: str | None,
     output: str,
     registry: SeriesRegistry | None,
-) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Execute a read given fully-resolved per-series ``meta``.
 
     ``meta`` must carry ``series_id``, ``retention``, ``canonical_unit``,
@@ -163,7 +165,7 @@ def _read_pipeline(
     unit: str | None,
     output: str = "frame",
     registry: SeriesRegistry | None = None,
-) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Manifest-driven read: resolve then execute. Used by ``Client.read`` and
     ``Client.read_relative`` (which both accept a routing manifest).
 
@@ -192,7 +194,7 @@ def read_resolved(
     include_knowledge_time: bool = False,
     output: str = "frame",
     registry: SeriesRegistry | None = None,
-) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Read entry-point for callers who already have per-series meta.
 
     Skips :func:`resolve_manifest` entirely — scope reads compute ``meta``
@@ -224,7 +226,7 @@ def read_relative_resolved(
     output: str = "frame",
     registry: SeriesRegistry | None = None,
     **td_kwargs,
-) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Like :func:`read_resolved` but routes through ``td.read_relative``."""
 
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
@@ -262,7 +264,7 @@ def read_manifest(
     include_knowledge_time: bool = False,
     output: str = "frame",
     registry: SeriesRegistry | None = None,
-) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Bulk read via manifest. Detects edge vs node routing automatically.
 
     ``output="frame"`` returns a single long DataFrame; ``output="by_path"``
@@ -294,7 +296,7 @@ def read_relative_manifest(
     output: str = "frame",
     registry: SeriesRegistry | None = None,
     **td_kwargs,
-) -> pl.DataFrame | dict[tuple, pl.DataFrame]:
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Bulk relative read via manifest.
 
     ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
