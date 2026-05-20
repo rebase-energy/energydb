@@ -96,7 +96,7 @@ re-exported from ``energydb`` for convenience:
    from energydb import DataType, TimeSeries, TimeSeriesType
 
 A metadata-only ``TimeSeries`` (constructed with ``df=None``) declares a
-series's identity (``name``, ``unit``, ``data_type``) and its bitemporal
+series's identity (``name``, ``unit``, ``data_type``) and its temporal
 shape (``timeseries_type``: ``FLAT`` or ``OVERLAPPING``). Attach such
 declarations to any ``Element`` via the ``timeseries=[...]`` constructor
 kwarg; ``register_tree`` persists them alongside the structure.

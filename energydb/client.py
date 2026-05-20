@@ -13,8 +13,8 @@ UUID identity model:
 
 API split:
 
-* ``register_tree`` — structure (nodes, edges, series declarations). Idempotent
-  upsert; raises on inline timeseries data.
+* ``register_tree`` — structure (nodes, edges, series declarations). Create-only;
+  raises if any UUID in the payload already exists, or on inline timeseries data.
 * ``write`` / ``read`` — bulk timeseries data via manifest DataFrames.
 * ``get_node`` / ``get_edge`` — fluent scope entry points. Reads like
   English: ``client.get_node("p").where(type="WindTurbine").read()``.

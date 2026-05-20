@@ -17,11 +17,7 @@ def _run(cmd):
 
 
 print("1/4  Installing energydb …")
-# Pinned to a commit that has the new mutator API (positional `update(data)`,
-# `add()`, `dry_run=`, `transaction()`). PyPI 0.5.0 still ships the pre-0.4.0 API;
-# revert to `pip install -q energydb` once a fixed wheel is published.
-_ENERGYDB_REV = "3242669615b39d8833f94367419e1a443e55b176"
-_run(f'"{sys.executable}" -m pip install -q git+https://github.com/rebase-energy/energydb.git@{_ENERGYDB_REV}')
+_run(f'"{sys.executable}" -m pip install -q energydb')
 
 print("2/4  Configuring and starting PostgreSQL …")
 _run("apt-get -qq update")

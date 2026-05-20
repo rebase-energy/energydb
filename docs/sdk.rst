@@ -18,7 +18,7 @@ schema:
   Python; that same UUID is the row primary key in Postgres.
 - **Edges** — typed cross-tree links (Line, Link, Pipe, Interconnection)
   between two nodes, also UUID-keyed.
-- **Series** — bitemporal series owned by exactly one node *or* edge. The
+- **Series** — time series owned by exactly one node *or* edge. The
   catalog row lives in PostgreSQL; the values themselves live in TimeDB's
   ClickHouse ``series_values`` table.
 

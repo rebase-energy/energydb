@@ -33,19 +33,6 @@ energydb requires:
 See :doc:`development` for a one-command Docker stack that boots both.
 
 
-Dependencies
-------------
-
-energydb's runtime stack is intentionally small and pulls TimeDB transitively:
-
-- ``timedb>=0.2.0`` — bitemporal time-series storage on ClickHouse
-- ``energydatamodel>=0.1.0`` — Python data model for energy assets
-- ``psycopg[binary]>=3.1`` / ``psycopg_pool>=3.1`` — PostgreSQL adapter
-- ``sqlalchemy>=2.0`` — declarative ORM (single source of truth for schema)
-- ``polars>=1.0`` — primary DataFrame interface for the manifest pipeline
-- ``pint>=0.23`` — unit conversion at write/read time
-
-
 Connecting
 ----------
 

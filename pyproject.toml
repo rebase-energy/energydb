@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "energydb"
 version = "0.6.0"
-description = "Energy database: hierarchy + series metadata on Postgres, bitemporal I/O via timedb"
+description = "Energy database: hierarchy + series metadata on Postgres, 3-dimensional time-series I/O via timedb"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -28,9 +28,6 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["energydb"]
-
-[tool.setuptools.package-data]
-energydb = ["sql/*.sql"]
 
 [project.optional-dependencies]
 docs = [
