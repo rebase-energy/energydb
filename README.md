@@ -38,6 +38,12 @@ Most time-series systems are agnostic about what their series represent — they
 
 ---
 
+<div align="center">
+  <p></p>  <img src="docs/energydb-snippet.gif" alt="TimeDB demo" width="700"/>
+</div>
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Installation
