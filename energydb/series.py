@@ -147,28 +147,71 @@ def resolve_for_read(
 ) -> pl.DataFrame:
     """Bulk resolve series rows for a read.
 
-    Returns Polars DataFrame with columns series_id, canonical_unit,
-    timeseries_type, retention, node_uuid, edge_uuid, data_type, name.
-    UUIDs are returned as ``Utf8`` so they join cleanly against the
-    string-form ids the manifest pipeline carries. Empty df if nothing
-    matches.
+    Single PG round-trip: joins through the owner row(s) to also fetch the
+    materialized hierarchy path(s) — so the post-read attach step needs no
+    further PG calls. For ``owner_col="node_uuid"`` the result carries a
+    ``path`` column; for ``owner_col="edge_uuid"`` it carries
+    ``edge_type``, ``from_path`` and ``to_path``. UUIDs are returned as
+    ``Utf8`` so they join cleanly against the string-form ids the manifest
+    pipeline carries. Empty df if nothing matches.
     """
-    conditions = [f"{owner_col} = ANY(%s)"]
+    conditions = [f"s.{owner_col} = ANY(%s)"]
     params: list[Any] = [owner_uuids]
 
     if data_type:
-        conditions.append("data_type = %s")
+        conditions.append("s.data_type = %s")
         params.append(data_type)
     if name:
-        conditions.append("name = %s")
+        conditions.append("s.name = %s")
         params.append(name)
 
+    if owner_col == "node_uuid":
+        select_extra = ", n.path AS path"
+        join_sql = "JOIN energydb.node n ON n.uuid = s.node_uuid"
+    else:
+        select_extra = ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path"
+        join_sql = (
+            "JOIN energydb.edge e   ON e.uuid = s.edge_uuid "
+            "JOIN energydb.node fn  ON fn.uuid = e.from_node_uuid "
+            "JOIN energydb.node tn  ON tn.uuid = e.to_node_uuid"
+        )
+
     sql = (
-        "SELECT series_id, canonical_unit, timeseries_type, retention, "
-        "node_uuid, edge_uuid, data_type, name "
-        "FROM energydb.series WHERE " + " AND ".join(conditions)
+        "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
+        "s.node_uuid, s.edge_uuid, s.data_type, s.name" + select_extra + " "
+        "FROM energydb.series s " + join_sql + " "
+        "WHERE " + " AND ".join(conditions)
     )
     rows = conn.execute(sql, params).fetchall()
+
+    if owner_col == "node_uuid":
+        return pl.DataFrame(
+            [
+                {
+                    "series_id": r[0],
+                    "canonical_unit": r[1],
+                    "timeseries_type": r[2],
+                    "retention": r[3],
+                    "node_uuid": str(r[4]) if r[4] is not None else None,
+                    "edge_uuid": str(r[5]) if r[5] is not None else None,
+                    "data_type": r[6],
+                    "name": r[7],
+                    "path": r[8],
+                }
+                for r in rows
+            ],
+            schema={
+                "series_id": pl.Int64,
+                "canonical_unit": pl.Utf8,
+                "timeseries_type": pl.Utf8,
+                "retention": pl.Utf8,
+                "node_uuid": pl.Utf8,
+                "edge_uuid": pl.Utf8,
+                "data_type": pl.Utf8,
+                "name": pl.Utf8,
+                "path": pl.Utf8,
+            },
+        )
 
     return pl.DataFrame(
         [
@@ -181,6 +224,9 @@ def resolve_for_read(
                 "edge_uuid": str(r[5]) if r[5] is not None else None,
                 "data_type": r[6],
                 "name": r[7],
+                "edge_type": r[8],
+                "from_path": r[9],
+                "to_path": r[10],
             }
             for r in rows
         ],
@@ -193,5 +239,8 @@ def resolve_for_read(
             "edge_uuid": pl.Utf8,
             "data_type": pl.Utf8,
             "name": pl.Utf8,
+            "edge_type": pl.Utf8,
+            "from_path": pl.Utf8,
+            "to_path": pl.Utf8,
         },
     )

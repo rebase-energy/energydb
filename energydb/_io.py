@@ -232,15 +232,23 @@ def read_relative_resolved(
 def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
     """Project the per-series meta columns the read pipeline needs.
 
-    Returns ``(series_id, data_type, name, canonical_unit, retention,
-    node_uuid|edge_uuid)`` deduplicated by series. Used to derive the CH
-    fetch params and to power the path-attachment step.
+    Returns the per-series identity slice deduplicated by ``series_id``.
+    Includes the hierarchy paths attached by :func:`resolve_manifest` so
+    the post-read attach step needs no extra PG round-trip.
+
+    * Node-routed: ``(series_id, data_type, name, canonical_unit,
+      retention, node_uuid, path)``.
+    * Edge-routed: ``(series_id, data_type, name, canonical_unit,
+      retention, edge_uuid, edge_type, from_path, to_path)``.
     """
     cols = ["series_id", "data_type", "name", "canonical_unit", "retention"]
-    cols.append("edge_uuid" if is_edge else "node_uuid")
-    if not is_edge and "node_uuid" not in resolved.columns:
-        # path-routed manifest: node_uuid is attached during resolve_manifest.
-        raise RuntimeError("resolve_manifest did not attach node_uuid for a node-routed manifest")
+    if is_edge:
+        cols += ["edge_uuid", "edge_type", "from_path", "to_path"]
+    else:
+        cols += ["node_uuid", "path"]
+        if "node_uuid" not in resolved.columns:
+            # path-routed manifest: node_uuid is attached during resolve_manifest.
+            raise RuntimeError("resolve_manifest did not attach node_uuid for a node-routed manifest")
     return resolved.select(cols).unique()
 
 

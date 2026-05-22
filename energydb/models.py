@@ -37,12 +37,14 @@ class Node(Base):
         sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
         nullable=True,
     )
+    path = sa.Column(sa.Text, nullable=False)
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
         sa.UniqueConstraint("parent_uuid", "name", name="node_child_uniq"),
+        sa.UniqueConstraint("path", name="node_path_uniq"),
         sa.Index(
             "ix_node_root_uniq",
             "name",
@@ -51,7 +53,13 @@ class Node(Base):
         ),
         sa.Index("ix_node_parent_uuid", "parent_uuid"),
         sa.Index("ix_node_data_gin", "data", postgresql_using="gin"),
+        sa.Index(
+            "ix_node_path_prefix",
+            "path",
+            postgresql_ops={"path": "text_pattern_ops"},
+        ),
         sa.CheckConstraint("name !~ '/' AND length(name) > 0", name="node_name_valid"),
+        sa.CheckConstraint("length(path) > 0", name="node_path_nonempty"),
         {"schema": "energydb"},
     )
 

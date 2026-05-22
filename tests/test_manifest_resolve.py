@@ -34,6 +34,7 @@ def test_node_manifest_resolve_does_not_leak_internal_join_columns():
             "MW",  # canonical_unit
             "FLAT",  # timeseries_type
             "forever",  # retention
+            "Europe/Sweden",  # owner path (JOIN n.path)
         ),
     ]
     conn = _mock_conn_with_series(rows)
@@ -53,6 +54,8 @@ def test_node_manifest_resolve_does_not_leak_internal_join_columns():
     assert "series_id" in resolved.columns
     assert "canonical_unit" in resolved.columns
     assert "retention" in resolved.columns
+    # path now rides along on the resolve so the post-read attach is PG-free.
+    assert "path" in resolved.columns
     # timeseries_type now lives in the summary, not per-row.
     assert "timeseries_type" not in resolved.columns
     assert summary.has_overlapping is False
@@ -69,6 +72,9 @@ def test_edge_manifest_resolve_does_not_leak_internal_join_columns():
             "MW",
             "FLAT",
             "forever",
+            "Cable",  # edge_type
+            "Europe/Sweden/A",  # from_path
+            "Europe/Sweden/B",  # to_path
         ),
     ]
     conn = _mock_conn_with_series(rows)
@@ -88,6 +94,10 @@ def test_edge_manifest_resolve_does_not_leak_internal_join_columns():
     assert "series_id" in resolved.columns
     assert "canonical_unit" in resolved.columns
     assert "retention" in resolved.columns
+    # Endpoint paths + edge_type ride along on the resolve.
+    assert "edge_type" in resolved.columns
+    assert "from_path" in resolved.columns
+    assert "to_path" in resolved.columns
     assert "timeseries_type" not in resolved.columns
     assert summary.has_overlapping is False
 
@@ -96,7 +106,7 @@ def test_overlapping_surfaces_in_summary():
     """Set-level OVERLAPPING signal lives on the summary, not per-row."""
     node_uuid = uuid4()
     rows = [
-        (node_uuid, "forecast", "v1", 99, "MW", "OVERLAPPING", "medium"),
+        (node_uuid, "forecast", "v1", 99, "MW", "OVERLAPPING", "medium", "P/Site"),
     ]
     conn = _mock_conn_with_series(rows)
 

@@ -15,6 +15,7 @@ class TestNodeModel:
             "node_type",
             "name",
             "parent_uuid",
+            "path",
             "data",
             "created_at",
             "updated_at",

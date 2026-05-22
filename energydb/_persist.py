@@ -54,9 +54,24 @@ def create_node(
     uuid_val: UUID = row_data["uuid"]
     validate_name(row_data["name"], kind="node")
 
+    # Materialize ``path`` from the parent. For ``register_tree``'s DFS walk
+    # we could thread the parent's path through the recursion to skip this
+    # SELECT; deferred — the extra round-trip is cheap and the call sites
+    # would need a wider signature.
+    if parent_uuid is None:
+        path = row_data["name"]
+    else:
+        parent_row = conn.execute(
+            "SELECT path FROM energydb.node WHERE uuid = %s",
+            (parent_uuid,),
+        ).fetchone()
+        if parent_row is None:
+            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
+        path = f"{parent_row[0]}/{row_data['name']}"
+
     conn.execute(
-        "INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, data) VALUES (%s, %s, %s, %s, %s)",
-        (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, row_data["data"]),
+        "INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+        (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, path, row_data["data"]),
     )
 
     _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)

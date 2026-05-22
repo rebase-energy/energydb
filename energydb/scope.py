@@ -694,23 +694,17 @@ class NodeScope(_BaseScope):
             if not self._where_filters:
                 return resolve_subtree_uuids(conn, root_uuid)
 
-            # Subtree + filters in one round-trip: the recursive CTE materializes
-            # the candidate set, the outer SELECT applies the predicates.
+            # Materialized-path prefix scan + filters in one round-trip.
             filter_conds, filter_params = build_filter_conditions(
                 self._where_filters, type_col="node_type", table_alias="n"
             )
             extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
             sql = f"""
-                WITH RECURSIVE subtree AS (
-                    SELECT uuid FROM energydb.node WHERE uuid = %s
-                    UNION ALL
-                    SELECT n.uuid FROM energydb.node n
-                    JOIN subtree s ON n.parent_uuid = s.uuid
-                ) CYCLE uuid SET _is_cycle USING _cycle_path
                 SELECT n.uuid
-                FROM energydb.node n
-                JOIN subtree s ON n.uuid = s.uuid
-                WHERE NOT s._is_cycle{extra}
+                FROM energydb.node n, energydb.node r
+                WHERE r.uuid = %s
+                  AND (n.path = r.path OR n.path LIKE r.path || '/%%')
+                  {extra}
             """
             rows = conn.execute(sql, (root_uuid, *filter_params)).fetchall()
             return [r[0] for r in rows]
@@ -750,26 +744,23 @@ class NodeScope(_BaseScope):
 
     def descendants(self, *, type: str | None = None) -> list[dict]:
         """Every node in the subtree rooted at this node, excluding the node
-        itself (recursive). Optional type filter."""
+        itself (recursive). Optional type filter.
+
+        Materialized-path prefix scan against ``ix_node_path_prefix`` —
+        one indexed lookup, no recursive CTE.
+        """
         with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             rows = conn.execute(
                 """
-                WITH RECURSIVE subtree AS (
-                    SELECT uuid FROM energydb.node WHERE uuid = %s
-                    UNION ALL
-                    SELECT n.uuid FROM energydb.node n
-                    JOIN subtree s ON n.parent_uuid = s.uuid
-                ) CYCLE uuid SET _is_cycle USING _cycle_path
                 SELECT n.uuid, n.node_type, n.name, n.data
-                FROM energydb.node n
-                JOIN subtree s ON n.uuid = s.uuid
-                WHERE NOT s._is_cycle
-                  AND n.uuid != %s
+                FROM energydb.node n, energydb.node r
+                WHERE r.uuid = %s
+                  AND n.path LIKE r.path || '/%%'
                   AND (%s::text IS NULL OR n.node_type = %s::text)
                 ORDER BY n.name
                 """,
-                (node_uuid, node_uuid, type, type),
+                (node_uuid, type, type),
             ).fetchall()
             return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
 
@@ -785,9 +776,33 @@ class NodeScope(_BaseScope):
 
     def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
         def _do(conn, node_uuid: UUID) -> None:
+            # One SELECT to grab the node's current path and its parent's path,
+            # then a single UPDATE rewrites ``path`` for self + every descendant
+            # via the ``ix_node_path_prefix`` index. ``name`` is only changed on
+            # the renamed row itself.
+            row = conn.execute(
+                """
+                SELECT n.path AS old_path, p.path AS parent_path
+                FROM energydb.node n
+                LEFT JOIN energydb.node p ON p.uuid = n.parent_uuid
+                WHERE n.uuid = %s
+                """,
+                (node_uuid,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
+            old_path, parent_path = row
+            new_path = f"{parent_path}/{new_name}" if parent_path else new_name
+
             conn.execute(
-                "UPDATE energydb.node SET name = %s, updated_at = now() WHERE uuid = %s",
-                (new_name, node_uuid),
+                """
+                UPDATE energydb.node
+                SET path = %s || substring(path FROM length(%s) + 1),
+                    name = CASE WHEN path = %s THEN %s ELSE name END,
+                    updated_at = now()
+                WHERE path = %s OR path LIKE %s || '/%%'
+                """,
+                (new_path, old_path, old_path, new_name, old_path, old_path),
             )
 
         return self._apply_mutation(_do, dry_run=dry_run)
@@ -846,28 +861,51 @@ class NodeScope(_BaseScope):
             if new_parent_uuid == node_uuid:
                 raise ValueError("Cannot move a node into itself.")
 
-            # Walk up from new_parent_uuid; if node_uuid appears on the chain
-            # the move would create a cycle. EXISTS short-circuits as soon as
-            # the row is found rather than streaming the whole chain back.
+            # Cycle iff the prospective new parent is at or under the moving
+            # node's own path — one indexed materialized-path check.
             cycle_row = conn.execute(
                 """
-                WITH RECURSIVE chain AS (
-                    SELECT uuid, parent_uuid
-                    FROM energydb.node WHERE uuid = %s
-                    UNION ALL
-                    SELECT n.uuid, n.parent_uuid
-                    FROM energydb.node n JOIN chain c ON n.uuid = c.parent_uuid
-                ) CYCLE uuid SET _is_cycle USING _cycle_path
-                SELECT EXISTS (SELECT 1 FROM chain WHERE NOT _is_cycle AND uuid = %s)
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM energydb.node subj, energydb.node cand
+                    WHERE subj.uuid = %s
+                      AND cand.uuid = %s
+                      AND (cand.path = subj.path OR cand.path LIKE subj.path || '/%%')
+                )
                 """,
-                (new_parent_uuid, node_uuid),
+                (node_uuid, new_parent_uuid),
             ).fetchone()
             if cycle_row and cycle_row[0]:
                 raise ValueError("Cannot move a node into its own subtree (would create a cycle).")
 
-            conn.execute(
-                "UPDATE energydb.node SET parent_uuid = %s, updated_at = now() WHERE uuid = %s",
+            # Fetch old path, the new parent's path, and the moving node's own
+            # name. ``LEFT JOIN`` against the new parent so a move-to-root
+            # (``new_parent_uuid IS NULL``) returns ``new_parent_path = None``.
+            row = conn.execute(
+                """
+                SELECT n.path AS old_path,
+                       parent.path AS new_parent_path,
+                       n.name AS own_name
+                FROM energydb.node n
+                LEFT JOIN energydb.node parent ON parent.uuid = %s
+                WHERE n.uuid = %s
+                """,
                 (new_parent_uuid, node_uuid),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
+            old_path, new_parent_path, own_name = row
+            new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
+
+            conn.execute(
+                """
+                UPDATE energydb.node
+                SET parent_uuid = CASE WHEN uuid = %s THEN %s ELSE parent_uuid END,
+                    path = %s || substring(path FROM length(%s) + 1),
+                    updated_at = now()
+                WHERE path = %s OR path LIKE %s || '/%%'
+                """,
+                (node_uuid, new_parent_uuid, new_path, old_path, old_path, old_path),
             )
 
         return self._apply_mutation(_do, dry_run=dry_run)

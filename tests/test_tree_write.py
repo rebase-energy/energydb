@@ -190,13 +190,14 @@ class TestRegisterTree:
         parent_uuid = uuid4()
 
         # Different SQL queries fire during register_tree_under:
-        #   1. resolve_node_uuid("Region/Site")           → returns 1-col row
-        #   2. _fetch_nodes_by_uuids([turbine.id])         → returns 5-col rows
+        #   1. resolve_node_uuid("Region/Site") (path = %s)   → returns 1-col row
+        #   2. _fetch_nodes_by_uuids([turbine.id])             → returns []
         # Use side_effect to dispatch based on the SQL substring.
         def execute_side_effect(sql, *args, **kwargs):
             res = MagicMock()
-            if "WITH RECURSIVE walk" in sql:
-                res.fetchall.return_value = [(parent_uuid,)]
+            if "WHERE path = %s" in sql:
+                # resolve_node_uuid materialized-path lookup uses fetchone.
+                res.fetchone.return_value = (parent_uuid,)
             elif "FROM energydb.node WHERE uuid = ANY" in sql:
                 # New target node — not yet in DB.
                 res.fetchall.return_value = []

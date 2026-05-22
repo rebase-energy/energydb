@@ -411,15 +411,10 @@ class Client:
 
             rows = conn.execute(
                 """
-                WITH RECURSIVE subtree AS (
-                    SELECT uuid, node_type, name, data, parent_uuid
-                    FROM energydb.node WHERE uuid = %s
-                    UNION ALL
-                    SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid
-                    FROM energydb.node n JOIN subtree s ON n.parent_uuid = s.uuid
-                ) CYCLE uuid SET _is_cycle USING _cycle_path
-                SELECT uuid, node_type, name, data, parent_uuid FROM subtree
-                WHERE NOT _is_cycle
+                SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid
+                FROM energydb.node n, energydb.node r
+                WHERE r.uuid = %s
+                  AND (n.path = r.path OR n.path LIKE r.path || '/%%')
                 """,
                 (root_uuid,),
             ).fetchall()

@@ -154,18 +154,21 @@ def _raw_dsn() -> str:
 
 
 def test_pg_check_rejects_slash_in_node_name(client):
+    # ``path`` is NOT NULL with its own non-empty CHECK and a UNIQUE
+    # constraint; pass a unique sentinel so the row only fails the
+    # ``node_name_valid`` CHECK we're actually testing.
     with psycopg.connect(_raw_dsn()) as conn, pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(
-            "INSERT INTO energydb.node (uuid, node_type, name, data) VALUES (%s, %s, %s, %s)",
-            (uuid4(), "Site", "a/b", "{}"),
+            "INSERT INTO energydb.node (uuid, node_type, name, path, data) VALUES (%s, %s, %s, %s, %s)",
+            (uuid4(), "Site", "a/b", f"__t_slash_{uuid4()}__", "{}"),
         )
 
 
 def test_pg_check_rejects_empty_node_name(client):
     with psycopg.connect(_raw_dsn()) as conn, pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(
-            "INSERT INTO energydb.node (uuid, node_type, name, data) VALUES (%s, %s, %s, %s)",
-            (uuid4(), "Site", "", "{}"),
+            "INSERT INTO energydb.node (uuid, node_type, name, path, data) VALUES (%s, %s, %s, %s, %s)",
+            (uuid4(), "Site", "", f"__t_empty_{uuid4()}__", "{}"),
         )
 
 
