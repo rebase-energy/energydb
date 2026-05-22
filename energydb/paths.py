@@ -19,8 +19,6 @@ from uuid import UUID
 
 import polars as pl
 
-from energydb._resolve_cache import EdgeMeta, NodeMeta, SeriesMeta, SeriesRegistry
-
 
 class ResolveSummary(NamedTuple):
     """Set-level signals derived during :func:`resolve_manifest`.
@@ -235,17 +233,12 @@ def resolve_path(conn, node_uuid: UUID) -> Path:
     return tuple(r[0] for r in rows)
 
 
-def fetch_node_hierarchy_bulk(
-    conn,
-    node_uuid_strs: list[str],
-) -> dict[str, tuple[NodeMeta, str | None]]:
-    """Bulk: ``uuid → (NodeMeta, parent_uuid_str | None)`` in one round-trip.
+def fetch_node_hierarchy_bulk(conn, node_uuid_strs: list[str]) -> dict[str, str]:
+    """Bulk: ``uuid → joined_path`` for many nodes in one round-trip.
 
-    Returns ``name``, ``node_type``, ``parent_uuid`` and the root→leaf
-    ``path`` for each requested uuid. Used as the cold-miss fetch behind
-    :func:`energydb._join.attach_node_hierarchy` (and the by_path
-    partition); one recursive CTE walks the parent chain and the leaf
-    metadata in a single round-trip.
+    One recursive CTE walks each target's parent chain; the result is
+    ``/``-joined at the Python side. Used by the read-pipeline hierarchy
+    attach (:func:`energydb._join.attach_node_hierarchy` and friends).
 
     Input uuids are passed as strings (the form the manifest carries) and
     cast to ``uuid[]`` on the PG side.
@@ -255,58 +248,40 @@ def fetch_node_hierarchy_bulk(
     rows = conn.execute(
         """
         WITH RECURSIVE ancestors AS (
-            SELECT uuid AS target_uuid, uuid, name, node_type, parent_uuid, 0 AS depth
+            SELECT uuid AS target_uuid, uuid, name, parent_uuid, 0 AS depth
             FROM energydb.node WHERE uuid = ANY(%s::uuid[])
             UNION ALL
-            SELECT a.target_uuid, n.uuid, n.name, n.node_type, n.parent_uuid, a.depth + 1
+            SELECT a.target_uuid, n.uuid, n.name, n.parent_uuid, a.depth + 1
             FROM energydb.node n
             JOIN ancestors a ON n.uuid = a.parent_uuid
         ) CYCLE uuid SET _is_cycle USING _cycle_path
-        SELECT target_uuid, name, node_type, parent_uuid, depth FROM ancestors
+        SELECT target_uuid, name, depth FROM ancestors
         WHERE NOT _is_cycle
         ORDER BY target_uuid, depth DESC
         """,
         (node_uuid_strs,),
     ).fetchall()
 
-    # depth=0 is the requested node itself; higher depths are ancestors,
-    # iterated DESC so the leaf row arrives last with the correct
-    # parent_uuid for the requested uuid.
+    # depth iterated DESC so root segments arrive first, leaf last.
     parts: dict[str, list[str]] = {}
-    leaves: dict[str, tuple[str, str, str | None]] = {}
-    for target_uuid, name, node_type, parent_uuid, depth in rows:
-        key = str(target_uuid)
-        parts.setdefault(key, []).append(name)
-        if depth == 0:
-            leaves[key] = (name, node_type, str(parent_uuid) if parent_uuid is not None else None)
-
-    out: dict[str, tuple[NodeMeta, str | None]] = {}
-    for uid, (name, node_type, parent_uuid) in leaves.items():
-        out[uid] = (NodeMeta.from_path(tuple(parts[uid]), name=name, node_type=node_type), parent_uuid)
-    return out
+    for target_uuid, name, _depth in rows:
+        parts.setdefault(str(target_uuid), []).append(name)
+    return {uid: "/".join(segments) for uid, segments in parts.items()}
 
 
-def fetch_edge_hierarchy_bulk(conn, edge_uuid_strs: list[str]) -> dict[str, EdgeMeta]:
-    """Bulk: ``uuid → EdgeMeta`` for many edges in one round-trip.
+def fetch_edge_hierarchy_bulk(conn, edge_uuid_strs: list[str]) -> dict[str, tuple[str, str, str]]:
+    """Bulk: ``uuid → (edge_type, from_node_uuid_str, to_node_uuid_str)``.
 
-    Endpoint *paths* aren't fetched here — the caller resolves them via the
-    node cache on ``from_node_uuid`` / ``to_node_uuid``.
+    Endpoint *paths* aren't fetched here — the caller resolves them by
+    chaining through :func:`fetch_node_hierarchy_bulk` on the endpoint uuids.
     """
     if not edge_uuid_strs:
         return {}
     rows = conn.execute(
-        "SELECT uuid, name, edge_type, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = ANY(%s::uuid[])",
+        "SELECT uuid, edge_type, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = ANY(%s::uuid[])",
         (edge_uuid_strs,),
     ).fetchall()
-    return {
-        str(uuid_): EdgeMeta(
-            name=name,
-            edge_type=edge_type,
-            from_node_uuid=str(from_uuid),
-            to_node_uuid=str(to_uuid),
-        )
-        for uuid_, name, edge_type, from_uuid, to_uuid in rows
-    }
+    return {str(uuid_): (edge_type, str(from_uuid), str(to_uuid)) for uuid_, edge_type, from_uuid, to_uuid in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -337,12 +312,7 @@ _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 
 
-def resolve_manifest(
-    conn,
-    manifest: pl.DataFrame,
-    *,
-    registry: SeriesRegistry | None = None,
-) -> tuple[pl.DataFrame, ResolveSummary]:
+def resolve_manifest(conn, manifest: pl.DataFrame) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
     Detects routing mode from the columns present:
@@ -355,11 +325,8 @@ def resolve_manifest(
     The manifest must also carry ``data_type`` and ``name`` columns. Returns
     the original frame plus per-row ``series_id``, ``retention``, and
     ``canonical_unit``, alongside a :class:`ResolveSummary` carrying
-    set-level signals (``has_overlapping``, ``unique_series_ids``) that
-    callers used to derive themselves from the resolved frame.
-
-    When ``registry`` is provided, cached entries are served without a PG
-    round-trip and freshly-fetched entries are inserted into the cache.
+    set-level signals (``has_overlapping``) that callers used to derive
+    themselves from the resolved frame.
     """
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
     if len(present_routes) == 0:
@@ -375,28 +342,18 @@ def resolve_manifest(
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     if route == "edge_uuid":
-        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", registry=registry)
+        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid")
     if route == "path":
-        manifest = _attach_node_uuid_from_path(conn, manifest, registry=registry)
-    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", registry=registry)
+        manifest = _attach_node_uuid_from_path(conn, manifest)
+    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid")
 
 
-def _attach_node_uuid_from_path(
-    conn,
-    manifest: pl.DataFrame,
-    *,
-    registry: SeriesRegistry | None = None,
-) -> pl.DataFrame:
+def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     """Resolve every ``path`` (Utf8, joined with ``/``) to a ``node_uuid`` and attach it.
 
     The manifest ``path`` column must be ``Utf8`` — strings like ``"a/b/c"``.
     List-shaped paths from earlier API versions are rejected explicitly so
     callers see a clear migration message rather than an opaque type error.
-
-    When ``registry`` is provided, the reverse ``joined_path → node_uuid``
-    index serves warm hits without a PG round-trip; only the misses go through
-    ``resolve_paths_to_uuids``. Misses are written back into the reverse
-    index so the next call is hot.
     """
     dtype = manifest["path"].dtype
     if dtype == pl.List(pl.Utf8):
@@ -412,26 +369,11 @@ def _attach_node_uuid_from_path(
     if not unique_paths_str:
         return manifest.with_columns(pl.lit(None, dtype=pl.Utf8).cast(pl.Utf8).alias("node_uuid"))
 
-    if registry is not None:
-        path_to_uuid_str, misses = registry.lookup_paths(unique_paths_str)
-    else:
-        path_to_uuid_str, misses = {}, unique_paths_str
-
-    if misses:
-        miss_tuples = [tuple(p.split("/")) for p in misses]
-        pg_map = resolve_paths_to_uuids(conn, miss_tuples)
-        # NOTE: we deliberately do *not* call registry.insert_node here.
-        # NodeMeta carries (path, name, node_type, joined_path) — we only have
-        # the path → uuid binding at this layer. The forward NodeMeta entry
-        # gets filled in by attach_node_hierarchy on the next read path. The
-        # reverse-index entry below is enough to short-circuit subsequent
-        # path-routed writes without that forward entry.
-        for path_tuple, node_uuid in pg_map.items():
-            joined = "/".join(path_tuple)
-            uuid_str = str(node_uuid)
-            path_to_uuid_str[joined] = uuid_str
-            if registry is not None:
-                registry._path_to_node_uuid[joined] = uuid_str
+    miss_tuples = [tuple(p.split("/")) for p in unique_paths_str]
+    pg_map = resolve_paths_to_uuids(conn, miss_tuples)
+    path_to_uuid_str: dict[str, str] = {
+        "/".join(path_tuple): str(node_uuid) for path_tuple, node_uuid in pg_map.items()
+    }
 
     node_uuids = [path_to_uuid_str[p] if p is not None else None for p in path_strs]
     return manifest.with_columns(pl.Series("node_uuid", node_uuids, dtype=pl.Utf8))
@@ -455,7 +397,6 @@ def _resolve_manifest_by_owner(
     manifest: pl.DataFrame,
     *,
     owner_col: str,
-    registry: SeriesRegistry | None = None,
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
     against the series table.
@@ -469,13 +410,10 @@ def _resolve_manifest_by_owner(
     2. ``manifest['_triple_k'].unique()`` — single-column dedupe, ~2× cheaper
        than the equivalent 4-column ``unique(subset=['_triple_k'])`` because
        it doesn't carry the string columns through the dedupe.
-    3. Probe the hash memo on the registry. Memo-hits give back metadata
-       directly without re-materializing ``(owner, dt, name)`` triples.
-    4. For memo-misses, do the slow 4-column filtered unique to recover the
-       triples, then probe the triple cache, then PG-fetch any remaining
-       misses. Populate the memo so the next resolve is fully on the warm
-       path.
-    5. Attach ``series_id`` + ``retention`` + ``canonical_unit`` via a single
+    3. Materialize the unique triples via a 4-column filtered unique, then
+       bulk-fetch every series owned by the affected owners in one indexed
+       scan on ``ix_series_{owner_col}``.
+    4. Attach ``series_id`` + ``retention`` + ``canonical_unit`` via a single
        left-join over a small ``_triple_k``-keyed lookup frame — faster than
        N independent ``replace_strict`` calls because polars hash-joins
        once and copies all N values in a single pass.
@@ -500,94 +438,48 @@ def _resolve_manifest_by_owner(
     # 1. Pre-hash the triple on the per-row manifest.
     manifest = manifest.with_columns(manifest.select([owner_col, "data_type", "name"]).hash_rows().alias("_triple_k"))
 
-    # 2. Unique hashes only — single-column dedupe.
-    unique_hashes: list[int] = manifest["_triple_k"].unique().to_list()
+    # 2. Recover the unique (owner, data_type, name) triples for this manifest.
+    triples_df = manifest.select([owner_col, "data_type", "name", "_triple_k"]).unique(subset=["_triple_k"])
+    miss_keys = triples_df["_triple_k"].to_list()
+    miss_owners = triples_df[owner_col].to_list()
+    miss_dts = triples_df["data_type"].to_list()
+    miss_names = triples_df["name"].to_list()
+    miss_triples: list[tuple[str, str, str]] = list(zip(miss_owners, miss_dts, miss_names, strict=True))
 
-    # 3. Probe hash memo.
-    if registry is not None:
-        memo_hits, memo_miss_hashes = registry.lookup_hashes(unique_hashes)
-    else:
-        memo_hits, memo_miss_hashes = {}, list(unique_hashes)
+    # 3. Bulk-fetch every series owned by the affected owners — one indexed
+    # scan on ``ix_series_{owner_col}`` rather than per-triple lookups.
+    unique_owners = list({t[0] for t in miss_triples})
+    rows = conn.execute(
+        f"""
+        SELECT s.{owner_col}, s.data_type, s.name, s.series_id,
+               s.canonical_unit, s.timeseries_type, s.retention
+        FROM energydb.series s
+        WHERE s.{owner_col} = ANY(%s::uuid[])
+        """,
+        (unique_owners,),
+    ).fetchall()
+    # Meta tuple layout: (series_id, canonical_unit, timeseries_type, retention).
+    triple_to_meta: dict[tuple[str, str, str], tuple[int, str, str, str]] = {}
+    for owner, dt, name, sid, unit, ts_type, retention in rows:
+        triple_to_meta[(str(owner), dt, name)] = (sid, unit, ts_type, retention)
 
-    hash_to_meta: dict[int, SeriesMeta] = dict(memo_hits)
+    for owner, dt, name in miss_triples:
+        if (owner, dt, name) not in triple_to_meta:
+            raise ValueError(f"Series not registered for {owner_col}={owner!r}, data_type={dt!r}, name={name!r}.")
 
-    # 4. Cold path: materialize triples for memo-miss hashes, probe the
-    # triple cache, PG-fetch remainder, populate memo.
-    if memo_miss_hashes:
-        miss_set = set(memo_miss_hashes)
-        miss_triples_df = (
-            manifest.filter(pl.col("_triple_k").is_in(list(miss_set)))
-            .select([owner_col, "data_type", "name", "_triple_k"])
-            .unique(subset=["_triple_k"])
-        )
-        miss_keys = miss_triples_df["_triple_k"].to_list()
-        miss_owners = miss_triples_df[owner_col].to_list()
-        miss_dts = miss_triples_df["data_type"].to_list()
-        miss_names = miss_triples_df["name"].to_list()
-        miss_triples: list[tuple[str, str, str]] = list(zip(miss_owners, miss_dts, miss_names, strict=True))
+    hash_to_meta: dict[int, tuple[int, str, str, str]] = {
+        hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+    }
 
-        if registry is not None:
-            triple_hits, triple_misses = registry.lookup_triples(miss_triples)
-        else:
-            triple_hits, triple_misses = {}, miss_triples
-
-        if triple_misses:
-            # Bulk-fetch every series owned by the affected owners — one
-            # indexed scan on ``ix_series_{owner_col}`` rather than the
-            # ``unnest(...) JOIN series`` per-triple lookup we did before.
-            # Measured 2.7–3.3× faster on cold-resolve (e.g. 30K triples:
-            # 276 ms → 103 ms). The query may return series we didn't ask
-            # for (other ``(data_type, name)`` rows on the same owner),
-            # but those go straight into the registry — pure free pre-warm
-            # for future resolves.
-            unique_owners = list({t[0] for t in triple_misses})
-            rows = conn.execute(
-                f"""
-                SELECT s.{owner_col}, s.data_type, s.name, s.series_id,
-                       s.canonical_unit, s.timeseries_type, s.retention
-                FROM energydb.series s
-                WHERE s.{owner_col} = ANY(%s::uuid[])
-                """,
-                (unique_owners,),
-            ).fetchall()
-            for owner, dt, name, sid, unit, ts_type, retention in rows:
-                owner_str = str(owner)
-                meta = SeriesMeta(
-                    series_id=sid,
-                    canonical_unit=unit,
-                    timeseries_type=ts_type,
-                    retention=retention,
-                )
-                # Only the missing triples need to land in triple_hits for
-                # the caller's per-row attach; extras still go to the
-                # registry so the next resolve hits warm.
-                triple_hits[(owner_str, dt, name)] = meta
-                if registry is not None:
-                    registry.insert(owner_str, dt, name, meta)
-
-        # First unresolved triple — fail loudly with the historical message.
-        for owner, dt, name in miss_triples:
-            if (owner, dt, name) not in triple_hits:
-                raise ValueError(f"Series not registered for {owner_col}={owner!r}, data_type={dt!r}, name={name!r}.")
-
-        # Populate the hash memo and the local hash → meta map.
-        memo_entries: list[tuple[int, tuple[str, str, str], SeriesMeta]] = []
-        for hash_val, triple in zip(miss_keys, miss_triples, strict=True):
-            meta = triple_hits[triple]
-            hash_to_meta[hash_val] = meta
-            memo_entries.append((hash_val, triple, meta))
-        if registry is not None:
-            registry.populate_memo(memo_entries)
-
-    # 5. Build the per-hash lookup frame and attach via a single left-join.
+    # 4. Build the per-hash lookup frame and attach via a single left-join.
     ks: list[int] = list(hash_to_meta.keys())
-    metas: list[SeriesMeta] = list(hash_to_meta.values())
+    metas: list[tuple[int, str, str, str]] = list(hash_to_meta.values())
     lookup_df = pl.DataFrame(
         {
             "_triple_k": ks,
-            "series_id": [m.series_id for m in metas],
-            "retention": [m.retention for m in metas],
-            "canonical_unit": [m.canonical_unit for m in metas],
+            "series_id": [m[0] for m in metas],
+            "retention": [m[3] for m in metas],
+            "canonical_unit": [m[1] for m in metas],
         },
         schema={
             "_triple_k": pl.UInt64,
@@ -599,7 +491,7 @@ def _resolve_manifest_by_owner(
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
 
     summary = ResolveSummary(
-        has_overlapping=any(m.timeseries_type == "OVERLAPPING" for m in hash_to_meta.values()),
+        has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()),
     )
     return resolved, summary
 

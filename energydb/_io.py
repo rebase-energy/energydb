@@ -26,7 +26,6 @@ from energydb._join import (
     partition_node_by_path,
 )
 from energydb._persist import apply_manifest_unit_conversion
-from energydb._resolve_cache import SeriesRegistry
 from energydb.paths import resolve_manifest
 from energydb.units import compute_unit_factor
 
@@ -58,7 +57,6 @@ def write_manifest(
     run_start_time: datetime | None = None,
     run_finish_time: datetime | None = None,
     run_params: dict | None = None,
-    registry: SeriesRegistry | None = None,
 ) -> int:
     """Resolve a manifest's routing → series_id and bulk-write.
 
@@ -71,7 +69,7 @@ def write_manifest(
 
     with pool.connection() as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            resolved, summary = resolve_manifest(conn, df, registry=registry)
+            resolved, summary = resolve_manifest(conn, df)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
         if summary.has_overlapping and knowledge_time is None and "knowledge_time" not in resolved.columns:
@@ -118,14 +116,13 @@ def _execute_read(
     *,
     unit: str | None,
     output: str,
-    registry: SeriesRegistry | None,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Execute a read given fully-resolved per-series ``meta``.
 
     ``meta`` must carry ``series_id``, ``retention``, ``canonical_unit``,
     ``data_type``, ``name``, plus exactly one of ``node_uuid`` / ``edge_uuid``
-    — one row per series. No PG round-trip happens here unless the hierarchy
-    attach hits a cache miss; the pool is borrowed lazily by the join layer.
+    — one row per series. The hierarchy-attach step borrows a PG connection
+    from the pool to fetch joined paths.
     """
     if output not in {"frame", "by_path"}:
         raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")
@@ -142,8 +139,8 @@ def _execute_read(
     if output == "by_path":
         with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
             if is_edge:
-                return partition_edge_by_path(pool, result, meta, registry=registry)
-            return partition_node_by_path(pool, result, meta, registry=registry)
+                return partition_edge_by_path(pool, result, meta)
+            return partition_node_by_path(pool, result, meta)
 
     if result.is_empty():
         # CH returned no rows — drop the internal series_id and bail. The
@@ -153,8 +150,8 @@ def _execute_read(
 
     with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
         if is_edge:
-            return attach_edge_hierarchy(pool, result, meta, registry=registry)
-        return attach_node_hierarchy(pool, result, meta, registry=registry)
+            return attach_edge_hierarchy(pool, result, meta)
+        return attach_node_hierarchy(pool, result, meta)
 
 
 def _read_pipeline(
@@ -164,7 +161,6 @@ def _read_pipeline(
     *,
     unit: str | None,
     output: str = "frame",
-    registry: SeriesRegistry | None = None,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Manifest-driven read: resolve then execute. Used by ``Client.read`` and
     ``Client.read_relative`` (which both accept a routing manifest).
@@ -174,10 +170,10 @@ def _read_pipeline(
     """
     is_edge = "edge_uuid" in manifest.columns
     with pool.connection() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
-        resolved, _summary = resolve_manifest(conn, manifest, registry=registry)
+        resolved, _summary = resolve_manifest(conn, manifest)
     with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
         meta = _meta_from_resolved(resolved, is_edge=is_edge)
-    return _execute_read(pool, meta, td_call, unit=unit, output=output, registry=registry)
+    return _execute_read(pool, meta, td_call, unit=unit, output=output)
 
 
 def read_resolved(
@@ -193,7 +189,6 @@ def read_resolved(
     include_updates: bool = False,
     include_knowledge_time: bool = False,
     output: str = "frame",
-    registry: SeriesRegistry | None = None,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Read entry-point for callers who already have per-series meta.
 
@@ -214,7 +209,7 @@ def read_resolved(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return _execute_read(pool, meta, _call, unit=unit, output=output, registry=registry)
+    return _execute_read(pool, meta, _call, unit=unit, output=output)
 
 
 def read_relative_resolved(
@@ -224,7 +219,6 @@ def read_relative_resolved(
     *,
     unit: str | None = None,
     output: str = "frame",
-    registry: SeriesRegistry | None = None,
     **td_kwargs,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Like :func:`read_resolved` but routes through ``td.read_relative``."""
@@ -232,7 +226,7 @@ def read_relative_resolved(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return _execute_read(pool, meta, _call, unit=unit, output=output, registry=registry)
+    return _execute_read(pool, meta, _call, unit=unit, output=output)
 
 
 def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
@@ -263,7 +257,6 @@ def read_manifest(
     include_updates: bool = False,
     include_knowledge_time: bool = False,
     output: str = "frame",
-    registry: SeriesRegistry | None = None,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Bulk read via manifest. Detects edge vs node routing automatically.
 
@@ -284,7 +277,7 @@ def read_manifest(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return _read_pipeline(pool, manifest, _call, unit=unit, output=output, registry=registry)
+    return _read_pipeline(pool, manifest, _call, unit=unit, output=output)
 
 
 def read_relative_manifest(
@@ -294,7 +287,6 @@ def read_relative_manifest(
     *,
     unit: str | None = None,
     output: str = "frame",
-    registry: SeriesRegistry | None = None,
     **td_kwargs,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Bulk relative read via manifest.
@@ -307,7 +299,7 @@ def read_relative_manifest(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return _read_pipeline(pool, manifest, _call, unit=unit, output=output, registry=registry)
+    return _read_pipeline(pool, manifest, _call, unit=unit, output=output)
 
 
 def apply_per_series_unit(

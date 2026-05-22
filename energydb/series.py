@@ -22,8 +22,6 @@ from uuid import UUID
 import polars as pl
 from timedb import RETENTION_TIERS
 
-from energydb._resolve_cache import SeriesMeta, SeriesRegistry
-
 OwnerCol = Literal["node_uuid", "edge_uuid"]
 
 _VALID_TIMESERIES_TYPES = {"FLAT", "OVERLAPPING"}
@@ -81,7 +79,6 @@ def register_series(
     timeseries_type: str,
     retention: str | None = None,
     description: str | None = None,
-    registry: SeriesRegistry | None = None,
 ) -> int:
     """Insert a new series row owned by ``owner_uuid``; return its series_id.
 
@@ -92,10 +89,6 @@ def register_series(
 
     If ``retention`` is omitted, it is derived from ``timeseries_type``:
     FLAT (actuals) → ``"forever"``, OVERLAPPING (forecasts) → ``"medium"``.
-
-    When ``registry`` is provided, the resolved metadata is inserted into
-    the cache (write-through). On a conflict-with-existing-row the cached
-    entry reflects the row already in the DB, not the rejected new args.
     """
     _validate_timeseries_type(timeseries_type)
     validate_name(name, kind="series")
@@ -121,31 +114,18 @@ def register_series(
     ).fetchone()
 
     if row is not None:
-        sid = row[0]
-        if registry is not None:
-            registry.insert(
-                str(owner_uuid),
-                data_type,
-                name,
-                SeriesMeta(
-                    series_id=sid,
-                    canonical_unit=canonical_unit,
-                    timeseries_type=timeseries_type,
-                    retention=retention,
-                ),
-            )
-        return sid
+        return row[0]
 
     # Conflict: fetch the existing row and verify the immutable fields agree.
     existing = conn.execute(
-        f"SELECT series_id, canonical_unit, retention, timeseries_type "
+        f"SELECT series_id, canonical_unit, retention "
         f"FROM energydb.series "
         f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
         (owner_uuid, data_type, name),
     ).fetchone()
     if existing is None:
         raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
-    existing_sid, existing_unit, existing_retention, existing_ts_type = existing
+    existing_sid, existing_unit, existing_retention = existing
     if existing_unit != canonical_unit or existing_retention != retention:
         raise ValueError(
             f"Series ({owner_col}={owner_uuid}, data_type={data_type!r}, name={name!r}) "
@@ -153,18 +133,6 @@ def register_series(
             f"retention={existing_retention!r}; cannot re-register with "
             f"canonical_unit={canonical_unit!r}, retention={retention!r}. "
             f"These fields are immutable — register a new series instead."
-        )
-    if registry is not None:
-        registry.insert(
-            str(owner_uuid),
-            data_type,
-            name,
-            SeriesMeta(
-                series_id=existing_sid,
-                canonical_unit=existing_unit,
-                timeseries_type=existing_ts_type,
-                retention=existing_retention,
-            ),
         )
     return existing_sid
 

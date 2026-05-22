@@ -1,9 +1,9 @@
 """Post-read hierarchy attachment: stamp ``path`` (and edge endpoints) onto a
 timedb read result.
 
-Polars-native; on a warm :class:`SeriesRegistry` no PG round-trips are needed
-at all. Cold misses go through one combined recursive CTE per cache (node
-or edge) and are written back through the registry.
+Polars-native. Every call borrows one PG connection and runs one combined
+recursive CTE (per node-uuid set, per edge-uuid set) to fetch the joined
+paths.
 
 Output column contract:
 
@@ -23,7 +23,6 @@ from typing import NamedTuple
 
 import polars as pl
 
-from energydb._resolve_cache import NodeMeta, SeriesRegistry
 from energydb.paths import fetch_edge_hierarchy_bulk, fetch_node_hierarchy_bulk
 
 
@@ -75,20 +74,13 @@ def find(result: dict, **filters):
 _MISSING = object()
 
 
-def attach_node_hierarchy(
-    pool,
-    result: pl.DataFrame,
-    meta: pl.DataFrame,
-    *,
-    registry: SeriesRegistry | None = None,
-) -> pl.DataFrame:
+def attach_node_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
     """Attach ``path`` (Utf8) to a node-routed read result.
 
     *meta* carries ``(series_id, node_uuid, data_type, name)`` from the
     resolved manifest. ``data_type`` and ``name`` are preserved on every
-    row; ``path`` is broadcast from the warm-cache ``NodeMeta.joined_path``.
-    ``series_id`` is dropped from the public result. A PG conn is borrowed
-    from ``pool`` only on a cache miss.
+    row; ``path`` is broadcast from the bulk-fetched node hierarchy.
+    ``series_id`` is dropped from the public result.
     """
     if result.is_empty() or meta.is_empty():
         return result
@@ -97,14 +89,13 @@ def attach_node_hierarchy(
     if not node_uuid_strs:
         return result
 
-    node_meta = _resolve_node_metas(pool, node_uuid_strs, registry)
+    with pool.connection() as conn:
+        node_path_map = fetch_node_hierarchy_bulk(conn, node_uuid_strs)
 
     sid_to_path = (
         meta.select(["series_id", "node_uuid", "data_type", "name"])
         .with_columns(
-            pl.col("node_uuid")
-            .replace_strict({u: m.joined_path for u, m in node_meta.items()}, default=None)
-            .alias("path"),
+            pl.col("node_uuid").replace_strict(node_path_map, default=None).alias("path"),
         )
         .select(["series_id", "path", "data_type", "name"])
         .unique(subset=["series_id"])
@@ -112,20 +103,14 @@ def attach_node_hierarchy(
     return result.join(sid_to_path, on="series_id", how="left").drop("series_id")
 
 
-def attach_edge_hierarchy(
-    pool,
-    result: pl.DataFrame,
-    meta: pl.DataFrame,
-    *,
-    registry: SeriesRegistry | None = None,
-) -> pl.DataFrame:
+def attach_edge_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
     """Attach ``from_path``, ``to_path``, ``edge_type`` to an edge-routed result.
 
-    Endpoint paths come from the node cache via the edge's endpoint uuids.
-    ``data_type`` / ``name`` are preserved from the manifest. ``series_id``,
-    ``edge_uuid``, and the edge's own ``name`` (intentionally distinct from
-    series ``name``) are dropped from the public result. PG conn is
-    borrowed from ``pool`` only on a cache miss.
+    Endpoint paths come from the bulk node-hierarchy fetch on the edge's
+    endpoint uuids. ``data_type`` / ``name`` are preserved from the
+    manifest. ``series_id``, ``edge_uuid``, and the edge's own ``name``
+    (intentionally distinct from series ``name``) are dropped from the
+    public result.
     """
     if result.is_empty() or meta.is_empty():
         return result
@@ -134,20 +119,17 @@ def attach_edge_hierarchy(
     if not edge_uuid_strs:
         return result
 
-    edge_meta = _resolve_edge_metas(pool, edge_uuid_strs, registry)
-    endpoints = {m.from_node_uuid for m in edge_meta.values()} | {m.to_node_uuid for m in edge_meta.values()}
-    node_meta = _resolve_node_metas(pool, sorted(endpoints), registry)
-
-    def _joined(uid: str) -> str | None:
-        nm = node_meta.get(uid)
-        return nm.joined_path if nm is not None else None
+    with pool.connection() as conn:
+        edge_meta = fetch_edge_hierarchy_bulk(conn, edge_uuid_strs)
+        endpoints = sorted({m[1] for m in edge_meta.values()} | {m[2] for m in edge_meta.values()})
+        node_path_map = fetch_node_hierarchy_bulk(conn, endpoints)
 
     edge_lookup = pl.DataFrame(
         {
             "edge_uuid": list(edge_meta.keys()),
-            "from_path": [_joined(m.from_node_uuid) for m in edge_meta.values()],
-            "to_path": [_joined(m.to_node_uuid) for m in edge_meta.values()],
-            "edge_type": [m.edge_type for m in edge_meta.values()],
+            "from_path": [node_path_map.get(m[1]) for m in edge_meta.values()],
+            "to_path": [node_path_map.get(m[2]) for m in edge_meta.values()],
+            "edge_type": [m[0] for m in edge_meta.values()],
         },
         schema={
             "edge_uuid": pl.Utf8,
@@ -171,13 +153,7 @@ def attach_edge_hierarchy(
 # ---------------------------------------------------------------------------
 
 
-def partition_node_by_path(
-    pool,
-    result: pl.DataFrame,
-    meta: pl.DataFrame,
-    *,
-    registry: SeriesRegistry | None = None,
-) -> dict[SeriesKey, pl.DataFrame]:
+def partition_node_by_path(pool, result: pl.DataFrame, meta: pl.DataFrame) -> dict[SeriesKey, pl.DataFrame]:
     """Partition a node-routed CH result into ``{SeriesKey: df}``.
 
     Skips the per-row broadcast that ``attach_node_hierarchy`` does. Each
@@ -197,25 +173,20 @@ def partition_node_by_path(
         return {}
 
     node_uuid_strs = [u for u in meta["node_uuid"].to_list() if u is not None]
-    node_meta_map = _resolve_node_metas(pool, node_uuid_strs, registry)
+    with pool.connection() as conn:
+        node_path_map = fetch_node_hierarchy_bulk(conn, node_uuid_strs)
 
     sid_to_key: dict[int, SeriesKey] = {}
     for row in meta.iter_rows(named=True):
-        nm = node_meta_map.get(row["node_uuid"])
-        if nm is None:
+        joined = node_path_map.get(row["node_uuid"])
+        if joined is None:
             continue
-        sid_to_key[row["series_id"]] = SeriesKey(nm.joined_path, row["data_type"], row["name"])
+        sid_to_key[row["series_id"]] = SeriesKey(joined, row["data_type"], row["name"])
 
     return _build_partition(result, sid_to_key)
 
 
-def partition_edge_by_path(
-    pool,
-    result: pl.DataFrame,
-    meta: pl.DataFrame,
-    *,
-    registry: SeriesRegistry | None = None,
-) -> dict[EdgeSeriesKey, pl.DataFrame]:
+def partition_edge_by_path(pool, result: pl.DataFrame, meta: pl.DataFrame) -> dict[EdgeSeriesKey, pl.DataFrame]:
     """Partition an edge-routed CH result into ``{EdgeSeriesKey: df}``.
 
     Same shape as :func:`partition_node_by_path` for the data side; the key
@@ -226,23 +197,21 @@ def partition_edge_by_path(
         return {}
 
     edge_uuid_strs = [u for u in meta["edge_uuid"].to_list() if u is not None]
-    edge_meta_map = _resolve_edge_metas(pool, edge_uuid_strs, registry)
-    endpoints = {m.from_node_uuid for m in edge_meta_map.values()} | {m.to_node_uuid for m in edge_meta_map.values()}
-    node_meta_map = _resolve_node_metas(pool, sorted(endpoints), registry)
-
-    def _joined(uid: str) -> str:
-        nm = node_meta_map.get(uid)
-        return nm.joined_path if nm is not None else ""
+    with pool.connection() as conn:
+        edge_meta = fetch_edge_hierarchy_bulk(conn, edge_uuid_strs)
+        endpoints = sorted({m[1] for m in edge_meta.values()} | {m[2] for m in edge_meta.values()})
+        node_path_map = fetch_node_hierarchy_bulk(conn, endpoints)
 
     sid_to_key: dict[int, EdgeSeriesKey] = {}
     for row in meta.iter_rows(named=True):
-        em = edge_meta_map.get(row["edge_uuid"])
+        em = edge_meta.get(row["edge_uuid"])
         if em is None:
             continue
+        edge_type, from_uuid, to_uuid = em
         sid_to_key[row["series_id"]] = EdgeSeriesKey(
-            _joined(em.from_node_uuid),
-            _joined(em.to_node_uuid),
-            em.edge_type,
+            node_path_map.get(from_uuid, ""),
+            node_path_map.get(to_uuid, ""),
+            edge_type,
             row["data_type"],
             row["name"],
         )
@@ -282,58 +251,3 @@ def _build_partition[KeyT: tuple](
         if key not in out:
             out[key] = pl.DataFrame(schema=data_schema)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Internal: cache-aware bulk fetches
-# ---------------------------------------------------------------------------
-
-
-def _resolve_node_metas(
-    pool,
-    node_uuid_strs: list[str],
-    registry: SeriesRegistry | None,
-) -> dict[str, NodeMeta]:
-    """Return ``uuid → NodeMeta`` for the given uuids, populating the cache.
-
-    A PG connection is borrowed from ``pool`` only when there is at least
-    one cache miss — fully warm reads do zero PG work.
-    """
-    if registry is None:
-        with pool.connection() as conn:
-            fetched = fetch_node_hierarchy_bulk(conn, node_uuid_strs)
-        return {uid: meta for uid, (meta, _parent) in fetched.items()}
-
-    hits, misses = registry.lookup_nodes(node_uuid_strs)
-    if not misses:
-        return hits
-    with pool.connection() as conn:
-        fetched = fetch_node_hierarchy_bulk(conn, misses)
-    for uid, (meta, parent_uuid) in fetched.items():
-        registry.insert_node(uid, meta, parent_uuid)
-        hits[uid] = meta
-    return hits
-
-
-def _resolve_edge_metas(
-    pool,
-    edge_uuid_strs: list[str],
-    registry: SeriesRegistry | None,
-):
-    """Return ``uuid → EdgeMeta`` for the given uuids, populating the cache.
-
-    Borrows a PG conn only on a cache miss.
-    """
-    if registry is None:
-        with pool.connection() as conn:
-            return fetch_edge_hierarchy_bulk(conn, edge_uuid_strs)
-
-    hits, misses = registry.lookup_edges(edge_uuid_strs)
-    if not misses:
-        return hits
-    with pool.connection() as conn:
-        fetched = fetch_edge_hierarchy_bulk(conn, misses)
-    for uid, meta in fetched.items():
-        registry.insert_edge(uid, meta)
-        hits[uid] = meta
-    return hits

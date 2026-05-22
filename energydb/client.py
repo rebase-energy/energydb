@@ -43,7 +43,6 @@ from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import read_manifest, read_relative_manifest, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, register_tree_under
-from energydb._resolve_cache import SeriesRegistry
 from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
@@ -71,6 +70,7 @@ class Client:
         pg_conninfo: str | None = None,
         ch_url: str | None = None,
     ):
+        """Construct a client."""
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
             raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
@@ -94,7 +94,6 @@ class Client:
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
-        self._series_registry = SeriesRegistry()
 
     def __repr__(self) -> str:
         """Repr with credentials stripped from the DSN.
@@ -142,32 +141,6 @@ class Client:
 
     def close(self) -> None:
         self._pool.close()
-
-    # ------------------------------------------------------------------
-    # Resolve cache
-    # ------------------------------------------------------------------
-
-    def invalidate_series_cache(self, owner_uuid: UUID | None = None) -> None:
-        """Drop cached series metadata.
-
-        With no argument, clears every entry. With an ``owner_uuid``, evicts
-        only entries owned by that node or edge.
-
-        The cache is normally maintained automatically — in-process
-        registrations and node/edge deletions update it transparently.
-        Call this only to recover from a cross-process modification that
-        invalidated state held in this client (another process registered,
-        deleted, or flipped ``timeseries_type`` on a series this client had
-        cached).
-        """
-        if owner_uuid is None:
-            self._series_registry.clear()
-        else:
-            self._series_registry.evict_owner(str(owner_uuid))
-
-    def resolve_cache_stats(self) -> dict[str, int]:
-        """Return cumulative resolve cache hits/misses and current size."""
-        return self._series_registry.stats()
 
     # ------------------------------------------------------------------
     # Fluent entry — scopes for navigation & single-element ops
@@ -290,7 +263,6 @@ class Client:
                 edm_obj,
                 parent_uuid=parent_uuid,
                 dry_run=dry_run,
-                registry=None if dry_run else self._series_registry,
             )
             if dry_run:
                 conn.rollback()
@@ -349,7 +321,7 @@ class Client:
         index in one pass.
         """
         with self._pool.connection() as conn:
-            edge_uuid = create_edge(conn, edm_obj, tree_root=None, registry=self._series_registry)
+            edge_uuid = create_edge(conn, edm_obj, tree_root=None)
             conn.commit()
         return edge_uuid
 
@@ -529,7 +501,6 @@ class Client:
             run_start_time=run_start_time,
             run_finish_time=run_finish_time,
             run_params=run_params,
-            registry=self._series_registry,
         )
 
     def read(
@@ -594,7 +565,6 @@ class Client:
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
             output=output,
-            registry=self._series_registry,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             return to_backend(result, backend)
@@ -629,7 +599,6 @@ class Client:
             manifest,
             unit=unit,
             output=output,
-            registry=self._series_registry,
             **td_kwargs,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):

@@ -116,7 +116,6 @@ class Transaction:
             edm_obj,
             parent_uuid=parent_uuid,
             dry_run=False,
-            registry=self._client._series_registry,
         )
         self._node_changes.extend(diff.node_changes)
         self._edge_changes.extend(diff.edge_changes)
