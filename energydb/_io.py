@@ -69,7 +69,9 @@ def write_manifest(
 
     with pool.connection() as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            resolved, summary = resolve_manifest(conn, df)
+            # Writes drop path / edge meta before the CH insert anyway, so
+            # skip the hierarchy JOIN — saves ~20ms PG-side at scale=200.
+            resolved, summary = resolve_manifest(conn, df, attach_path=False)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
         if summary.has_overlapping and knowledge_time is None and "knowledge_time" not in resolved.columns:

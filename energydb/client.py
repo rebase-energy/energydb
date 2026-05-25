@@ -84,6 +84,11 @@ class Client:
 
         def _configure(conn):
             conn.execute(_SEARCH_PATH)
+            # ``prepare_threshold=1`` makes psycopg cache a server-side
+            # prepared statement after the first execution of each SQL text.
+            # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
+            # (PG parse+plan stage skipped on subsequent calls).
+            conn.prepare_threshold = 1
             conn.commit()
 
         self._pool = ConnectionPool(

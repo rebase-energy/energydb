@@ -222,7 +222,7 @@ _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 
 
-def resolve_manifest(conn, manifest: pl.DataFrame) -> tuple[pl.DataFrame, ResolveSummary]:
+def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
     Detects routing mode from the columns present:
@@ -237,6 +237,13 @@ def resolve_manifest(conn, manifest: pl.DataFrame) -> tuple[pl.DataFrame, Resolv
     ``canonical_unit``, alongside a :class:`ResolveSummary` carrying
     set-level signals (``has_overlapping``) that callers used to derive
     themselves from the resolved frame.
+
+    ``attach_path=True`` (default, for read pipelines) also surfaces the
+    DB-derived hierarchy paths on the resolved frame (``path`` for nodes;
+    ``edge_type`` / ``from_path`` / ``to_path`` for edges) so post-read
+    attach steps don't need another PG round-trip. ``attach_path=False``
+    skips that JOIN entirely — write pipelines drop those columns before
+    the CH insert and don't need them.
     """
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
     if len(present_routes) == 0:
@@ -252,10 +259,10 @@ def resolve_manifest(conn, manifest: pl.DataFrame) -> tuple[pl.DataFrame, Resolv
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     if route == "edge_uuid":
-        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid")
+        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
     if route == "path":
         manifest = _attach_node_uuid_from_path(conn, manifest)
-    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid")
+    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
 
 
 def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
@@ -302,17 +309,19 @@ def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
     return manifest.with_columns(pl.Series(col, values, dtype=pl.Utf8))
 
 
-_OWNER_PATH_JOIN = {
-    "node_uuid": (
-        "LEFT JOIN energydb.node n ON n.uuid = s.node_uuid",
-        ", n.path AS owner_path",
-    ),
-    "edge_uuid": (
-        "LEFT JOIN energydb.edge e   ON e.uuid = s.edge_uuid "
-        "LEFT JOIN energydb.node fn  ON fn.uuid = e.from_node_uuid "
-        "LEFT JOIN energydb.node tn  ON tn.uuid = e.to_node_uuid",
+# SQL fragments per (owner_col, attach_path) combination. Splitting the
+# JOIN-to-owner-row from the core series scan lets writes opt out of the
+# hierarchy attach entirely — saves ~20ms PG-side at scale=200.
+_OWNER_PATH_SELECT = {
+    ("node_uuid", True): (", n.path AS path", " LEFT JOIN energydb.node n ON n.uuid = s.node_uuid"),
+    ("node_uuid", False): ("", ""),
+    ("edge_uuid", True): (
         ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path",
+        " LEFT JOIN energydb.edge e  ON e.uuid = s.edge_uuid"
+        " LEFT JOIN energydb.node fn ON fn.uuid = e.from_node_uuid"
+        " LEFT JOIN energydb.node tn ON tn.uuid = e.to_node_uuid",
     ),
+    ("edge_uuid", False): ("", ""),
 }
 
 
@@ -321,31 +330,41 @@ def _resolve_manifest_by_owner(
     manifest: pl.DataFrame,
     *,
     owner_col: str,
+    attach_path: bool,
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
     against the series table.
 
     Workflow:
 
-    1. Build a single ``_triple_k = hash_rows(owner, dt, name)`` column on
-       the manifest. ``hash_rows`` walks the three Arrow buffers once
-       without materializing a concatenated string — much cheaper than a
-       multi-key composite join over Utf8 columns.
-    2. ``manifest['_triple_k'].unique()`` — single-column dedupe, ~2× cheaper
-       than the equivalent 4-column ``unique(subset=['_triple_k'])`` because
-       it doesn't carry the string columns through the dedupe.
-    3. Materialize the unique triples via a 4-column filtered unique, then
-       bulk-fetch every series owned by the affected owners in one indexed
-       scan on ``ix_series_{owner_col}`` — joining through to the owner
-       row(s) so the hierarchy path(s) ride along on the same round-trip.
-    4. Attach ``series_id`` + ``retention`` + ``canonical_unit`` (+ owner
-       path / edge endpoint paths) via a single left-join over a small
-       ``_triple_k``-keyed lookup frame.
+    1. Pre-hash the (owner, data_type, name) triple per manifest row via
+       ``hash_rows`` — walks the three Arrow buffers once without
+       materializing a concatenated string. Much cheaper than a multi-key
+       composite join over Utf8 columns once the manifest is large.
+    2. Dedupe via single-column unique on ``_triple_k``.
+    3. One PG round-trip on ``ix_series_{owner_col}`` filtering by
+       ``= ANY(unique_owners)``. We measured this beats ``UNNEST``-driven
+       triple JOINs at every scale that matters: at 36k unique triples PG
+       picks a Hash Join + Seq Scan plan for UNNEST (~300ms) vs an Index
+       Scan for ``= ANY()`` (~80ms). Owner uuid comes back as text
+       (``::text`` cast) so psycopg skips the UUID-object parse step
+       (~15ms cheaper at scale=200).
+    4. Attach ``series_id`` + ``retention`` + ``canonical_unit`` via a
+       single left-join over a ``_triple_k``-keyed lookup frame.
+
+    ``attach_path`` controls the hierarchy attach side:
+    * True (read pipelines): JOIN through ``node`` / ``edge`` and surface
+      ``path`` (node) or ``edge_type``/``from_path``/``to_path`` (edge) on
+      the resolved frame. Downstream attach steps consume these without
+      another PG hop.
+    * False (write pipelines): skip the JOIN entirely — writes drop path
+      before the CH insert anyway.
 
     ``timeseries_type`` is *not* attached per-row; the OVERLAPPING check
     moves up into :class:`ResolveSummary`.
     """
     manifest = _coerce_uuid_col(manifest, owner_col)
+    is_edge = owner_col == "edge_uuid"
 
     # Empty-or-all-null check first so the message matches the historical
     # contract; per-row null check second.
@@ -371,13 +390,13 @@ def _resolve_manifest_by_owner(
     miss_triples: list[tuple[str, str, str]] = list(zip(miss_owners, miss_dts, miss_names, strict=True))
 
     # 3. Bulk-fetch every series owned by the affected owners — one indexed
-    # scan on ``ix_series_{owner_col}`` joined to the owner row(s) so the
-    # hierarchy path(s) ride along on the same round-trip.
+    # scan on ``ix_series_{owner_col}``. ``::text`` cast skips psycopg's
+    # per-row UUID-object parse.
     unique_owners = list({t[0] for t in miss_triples})
-    join_sql, extra_cols = _OWNER_PATH_JOIN[owner_col]
+    extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
     rows = conn.execute(
         f"""
-        SELECT s.{owner_col}, s.data_type, s.name, s.series_id,
+        SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
         FROM energydb.series s
         {join_sql}
@@ -385,15 +404,15 @@ def _resolve_manifest_by_owner(
         """,
         (unique_owners,),
     ).fetchall()
-    is_edge = owner_col == "edge_uuid"
     # Meta tuple layout:
-    #   node:  (series_id, canonical_unit, timeseries_type, retention, path)
-    #   edge:  (series_id, canonical_unit, timeseries_type, retention,
-    #          edge_type, from_path, to_path)
+    #   attach_path=False:  (series_id, canonical_unit, timeseries_type, retention)
+    #   node + attach_path: (series_id, canonical_unit, timeseries_type, retention, path)
+    #   edge + attach_path: (series_id, canonical_unit, timeseries_type, retention,
+    #                        edge_type, from_path, to_path)
     triple_to_meta: dict[tuple[str, str, str], tuple] = {}
     for row in rows:
         owner, dt, name, sid, unit, ts_type, retention, *paths = row
-        triple_to_meta[(str(owner), dt, name)] = (sid, unit, ts_type, retention, *paths)
+        triple_to_meta[(owner, dt, name)] = (sid, unit, ts_type, retention, *paths)
 
     for owner, dt, name in miss_triples:
         if (owner, dt, name) not in triple_to_meta:
@@ -418,21 +437,21 @@ def _resolve_manifest_by_owner(
         "retention": pl.Utf8,
         "canonical_unit": pl.Utf8,
     }
-    if is_edge:
-        lookup_data["edge_type"] = [m[4] for m in metas]
-        lookup_data["from_path"] = [m[5] for m in metas]
-        lookup_data["to_path"] = [m[6] for m in metas]
-        lookup_schema["edge_type"] = pl.Utf8
-        lookup_schema["from_path"] = pl.Utf8
-        lookup_schema["to_path"] = pl.Utf8
-    else:
-        lookup_data["path"] = [m[4] for m in metas]
-        lookup_schema["path"] = pl.Utf8
+    if attach_path:
+        if is_edge:
+            lookup_data["edge_type"] = [m[4] for m in metas]
+            lookup_data["from_path"] = [m[5] for m in metas]
+            lookup_data["to_path"] = [m[6] for m in metas]
+            lookup_schema["edge_type"] = pl.Utf8
+            lookup_schema["from_path"] = pl.Utf8
+            lookup_schema["to_path"] = pl.Utf8
+        else:
+            lookup_data["path"] = [m[4] for m in metas]
+            lookup_schema["path"] = pl.Utf8
 
     lookup_df = pl.DataFrame(lookup_data, schema=lookup_schema)
-    # Drop the manifest's user-supplied path before joining so we end up
-    # with one canonical ``path`` column (the DB-derived one). Same for
-    # edge endpoint paths if the user happened to attach them.
+    # Drop the manifest's user-supplied path/edge-meta cols before joining so
+    # we end up with one canonical set of DB-derived values.
     overlap = [c for c in lookup_df.columns if c != "_triple_k" and c in manifest.columns]
     if overlap:
         manifest = manifest.drop(overlap)

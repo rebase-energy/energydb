@@ -25,16 +25,19 @@ def _mock_conn_with_series(rows: list[tuple]) -> MagicMock:
 
 def test_node_manifest_resolve_does_not_leak_internal_join_columns():
     node_uuid = uuid4()
+    # PG returns owner uuid as ``::text`` after the SQL cast — mock with str.
+    # Column order: owner::text, data_type, name, series_id, canonical_unit,
+    #               timeseries_type, retention, [path when attach_path=True].
     rows = [
         (
-            node_uuid,  # node_uuid
+            str(node_uuid),  # node_uuid::text
             "actual",  # data_type
             "power",  # name
             42,  # series_id
             "MW",  # canonical_unit
             "FLAT",  # timeseries_type
             "forever",  # retention
-            "Europe/Sweden",  # owner path (JOIN n.path)
+            "Europe/Sweden",  # path (attached via JOIN node)
         ),
     ]
     conn = _mock_conn_with_series(rows)
@@ -65,7 +68,7 @@ def test_edge_manifest_resolve_does_not_leak_internal_join_columns():
     edge_uuid = uuid4()
     rows = [
         (
-            edge_uuid,
+            str(edge_uuid),  # edge_uuid::text
             "actual",
             "power",
             7,
@@ -106,7 +109,7 @@ def test_overlapping_surfaces_in_summary():
     """Set-level OVERLAPPING signal lives on the summary, not per-row."""
     node_uuid = uuid4()
     rows = [
-        (node_uuid, "forecast", "v1", 99, "MW", "OVERLAPPING", "medium", "P/Site"),
+        (str(node_uuid), "forecast", "v1", 99, "MW", "OVERLAPPING", "medium", "P/Site"),
     ]
     conn = _mock_conn_with_series(rows)
 

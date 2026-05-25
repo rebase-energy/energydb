@@ -176,9 +176,12 @@ def resolve_for_read(
             "JOIN energydb.node tn  ON tn.uuid = e.to_node_uuid"
         )
 
+    # ``::text`` casts on the uuid columns: PG returns strings directly,
+    # skipping psycopg's per-row UUID-object parse — ~15ms cheaper at
+    # scale=200 on the 7-col SELECT compared to letting psycopg parse.
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
-        "s.node_uuid, s.edge_uuid, s.data_type, s.name" + select_extra + " "
+        "s.node_uuid::text, s.edge_uuid::text, s.data_type, s.name" + select_extra + " "
         "FROM energydb.series s " + join_sql + " "
         "WHERE " + " AND ".join(conditions)
     )
@@ -192,8 +195,8 @@ def resolve_for_read(
                     "canonical_unit": r[1],
                     "timeseries_type": r[2],
                     "retention": r[3],
-                    "node_uuid": str(r[4]) if r[4] is not None else None,
-                    "edge_uuid": str(r[5]) if r[5] is not None else None,
+                    "node_uuid": r[4],
+                    "edge_uuid": r[5],
                     "data_type": r[6],
                     "name": r[7],
                     "path": r[8],
@@ -220,8 +223,8 @@ def resolve_for_read(
                 "canonical_unit": r[1],
                 "timeseries_type": r[2],
                 "retention": r[3],
-                "node_uuid": str(r[4]) if r[4] is not None else None,
-                "edge_uuid": str(r[5]) if r[5] is not None else None,
+                "node_uuid": r[4],
+                "edge_uuid": r[5],
                 "data_type": r[6],
                 "name": r[7],
                 "edge_type": r[8],
