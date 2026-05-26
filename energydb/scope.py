@@ -37,6 +37,7 @@ from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, regi
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import (
     Path,
+    _like_escape,
     build_filter_conditions,
     resolve_edge_uuid,
     resolve_node_uuid,
@@ -694,19 +695,25 @@ class NodeScope(_BaseScope):
             if not self._where_filters:
                 return resolve_subtree_uuids(conn, root_uuid)
 
-            # Materialized-path prefix scan + filters in one round-trip.
-            filter_conds, filter_params = build_filter_conditions(
-                self._where_filters, type_col="node_type", table_alias="n"
-            )
+            # Two-step: fetch root path, then LIKE with escaped prefix as
+            # bind param so PG can Index Scan via ``ix_node_path_prefix``.
+            # Drop the ``n`` alias since the JOIN is gone — the filter
+            # predicates now run directly on ``node``.
+            filter_conds, filter_params = build_filter_conditions(self._where_filters, type_col="node_type")
             extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
-            sql = f"""
-                SELECT n.uuid
-                FROM energydb.node n, energydb.node r
-                WHERE r.uuid = %s
-                  AND (n.path = r.path OR n.path LIKE r.path || '/%%')
+            root_path_row = conn.execute(
+                "SELECT path FROM energydb.node WHERE uuid = %s",
+                (root_uuid,),
+            ).fetchone()
+            if root_path_row is None:
+                return []
+            root_path = root_path_row[0]
+            sql = rf"""
+                SELECT uuid FROM energydb.node
+                WHERE (path = %s OR path LIKE %s || '/%%' ESCAPE '\')
                   {extra}
             """
-            rows = conn.execute(sql, (root_uuid, *filter_params)).fetchall()
+            rows = conn.execute(sql, (root_path, _like_escape(root_path), *filter_params)).fetchall()
             return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
@@ -751,16 +758,23 @@ class NodeScope(_BaseScope):
         """
         with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
+            # Two-step: fetch root path, then LIKE with escaped prefix as
+            # bind param so PG Index Scans on ``ix_node_path_prefix``.
+            root_path_row = conn.execute(
+                "SELECT path FROM energydb.node WHERE uuid = %s",
+                (node_uuid,),
+            ).fetchone()
+            if root_path_row is None:
+                return []
+            root_path = root_path_row[0]
             rows = conn.execute(
-                """
-                SELECT n.uuid, n.node_type, n.name, n.data
-                FROM energydb.node n, energydb.node r
-                WHERE r.uuid = %s
-                  AND n.path LIKE r.path || '/%%'
-                  AND (%s::text IS NULL OR n.node_type = %s::text)
-                ORDER BY n.name
+                r"""
+                SELECT uuid, node_type, name, data FROM energydb.node
+                WHERE path LIKE %s || '/%%' ESCAPE '\'
+                  AND (%s::text IS NULL OR node_type = %s::text)
+                ORDER BY name
                 """,
-                (node_uuid, type, type),
+                (_like_escape(root_path), type, type),
             ).fetchall()
             return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
 
@@ -795,14 +809,14 @@ class NodeScope(_BaseScope):
             new_path = f"{parent_path}/{new_name}" if parent_path else new_name
 
             conn.execute(
-                """
+                r"""
                 UPDATE energydb.node
                 SET path = %s || substring(path FROM length(%s) + 1),
                     name = CASE WHEN path = %s THEN %s ELSE name END,
                     updated_at = now()
-                WHERE path = %s OR path LIKE %s || '/%%'
+                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
-                (new_path, old_path, old_path, new_name, old_path, old_path),
+                (new_path, old_path, old_path, new_name, old_path, _like_escape(old_path)),
             )
 
         return self._apply_mutation(_do, dry_run=dry_run)
@@ -864,13 +878,14 @@ class NodeScope(_BaseScope):
             # Cycle iff the prospective new parent is at or under the moving
             # node's own path — one indexed materialized-path check.
             cycle_row = conn.execute(
-                """
+                r"""
                 SELECT EXISTS (
                     SELECT 1
                     FROM energydb.node subj, energydb.node cand
                     WHERE subj.uuid = %s
                       AND cand.uuid = %s
-                      AND (cand.path = subj.path OR cand.path LIKE subj.path || '/%%')
+                      AND (cand.path = subj.path
+                           OR cand.path LIKE energydb._like_esc(subj.path) || '/%%' ESCAPE '\')
                 )
                 """,
                 (node_uuid, new_parent_uuid),
@@ -898,14 +913,14 @@ class NodeScope(_BaseScope):
             new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
 
             conn.execute(
-                """
+                r"""
                 UPDATE energydb.node
                 SET parent_uuid = CASE WHEN uuid = %s THEN %s ELSE parent_uuid END,
                     path = %s || substring(path FROM length(%s) + 1),
                     updated_at = now()
-                WHERE path = %s OR path LIKE %s || '/%%'
+                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
-                (node_uuid, new_parent_uuid, new_path, old_path, old_path, old_path),
+                (node_uuid, new_parent_uuid, new_path, old_path, old_path, _like_escape(old_path)),
             )
 
         return self._apply_mutation(_do, dry_run=dry_run)

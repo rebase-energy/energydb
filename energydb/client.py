@@ -47,6 +47,7 @@ from energydb.diff import TreeDiff
 from energydb.models import Base
 from energydb.paths import (
     Path,
+    _like_escape,
     build_filter_conditions,
     resolve_node_uuid,
     resolve_subtree_uuids,
@@ -414,14 +415,23 @@ class Client:
             else:
                 raise ValueError("Provide a path or uuid=.")
 
-            rows = conn.execute(
-                """
-                SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid
-                FROM energydb.node n, energydb.node r
-                WHERE r.uuid = %s
-                  AND (n.path = r.path OR n.path LIKE r.path || '/%%')
-                """,
+            # Two-step: fetch the root's path, then LIKE with the escaped
+            # prefix as a bind param so PG picks Index Scan on
+            # ``ix_node_path_prefix``. A column-source LIKE would Seq Scan.
+            root_path_row = conn.execute(
+                "SELECT path FROM energydb.node WHERE uuid = %s",
                 (root_uuid,),
+            ).fetchone()
+            if root_path_row is None:
+                raise ValueError(f"Node not found: uuid={root_uuid}")
+            root_path = root_path_row[0]
+            rows = conn.execute(
+                r"""
+                SELECT uuid, node_type, name, data, parent_uuid
+                FROM energydb.node
+                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
+                """,
+                (root_path, _like_escape(root_path)),
             ).fetchall()
 
             nodes: dict[UUID, Any] = {}

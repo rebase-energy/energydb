@@ -123,8 +123,9 @@ def _execute_read(
 
     ``meta`` must carry ``series_id``, ``retention``, ``canonical_unit``,
     ``data_type``, ``name``, plus exactly one of ``node_uuid`` / ``edge_uuid``
-    — one row per series. The hierarchy-attach step borrows a PG connection
-    from the pool to fetch joined paths.
+    — one row per series. The hierarchy-attach step is purely polars-side:
+    paths already ride on ``meta`` from :func:`resolve_manifest`
+    (``attach_path=True``), so no second PG round-trip is needed.
     """
     if output not in {"frame", "by_path"}:
         raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")

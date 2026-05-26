@@ -215,3 +215,26 @@ event.listen(
     "after_create",
     _SERIES_GUARD_TRIGGER,
 )
+
+# LIKE-escape helper. The materialized ``node.path`` column is used as a
+# literal prefix in ``LIKE`` patterns for subtree queries. Names may legally
+# contain ``_`` (and, less commonly, ``%`` / ``\``) which would be interpreted
+# as LIKE metacharacters — escape them at the SQL boundary instead of forcing
+# every read site to do a per-row regex. ``CREATE OR REPLACE`` is idempotent.
+_LIKE_ESC_FN = sa.DDL(
+    r"""
+    CREATE OR REPLACE FUNCTION energydb._like_esc(text)
+    RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS $$
+        SELECT replace(replace(replace($1, E'\\', E'\\\\'),
+                               '%%', E'\\%%'),
+                       '_',  E'\\_')
+    $$;
+    """
+)
+
+event.listen(
+    Base.metadata,
+    "after_create",
+    _LIKE_ESC_FN.execute_if(dialect="postgresql"),
+)
