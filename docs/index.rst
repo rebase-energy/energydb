@@ -17,7 +17,7 @@ EnergyDB is a database for energy portfolios. It stores three things together in
 
 Structure lives in PostgreSQL, values live in ClickHouse, and stable UUID identity lets Python objects round-trip to the database without losing any structural state.
 
-It extends `TimeDB <https://github.com/rebase-energy/timedb>`_ with persistent storage for `EnergyDataModel <https://github.com/rebase-energy/EnergyDataModel>`_ hierarchies.
+It extends `TimeDB <https://github.com/rebase-energy/timedb>`_ with persistent storage for `EnergyDataModel <https://github.com/rebase-energy/energydatamodel>`_ hierarchies.
 
 
 Why EnergyDB?

@@ -8,7 +8,7 @@ Other breaks: DB column `energydb.edge.label` renamed to `name` (EDM already use
 
 EnergyDB is an open-source library for persisting full energy portfolios — assets, grid topology, and bitemporal time series — in one connected database backed by PostgreSQL and ClickHouse.
 
-It extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies, links every node and edge to its time series with stable UUID identity, and lets you round-trip a portfolio between Python and Postgres without losing any structural state.
+It extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/energydatamodel) hierarchies, links every node and edge to its time series with stable UUID identity, and lets you round-trip a portfolio between Python and Postgres without losing any structural state.
 
 ## 🏗️ The Connected Portfolio Model
 

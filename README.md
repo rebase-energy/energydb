@@ -22,7 +22,7 @@ EnergyDB is a database for energy portfolios. It stores three things together in
 
 Structure lives in PostgreSQL, values live in ClickHouse, and stable UUID identity lets Python objects round-trip to the database without losing any structural state.
 
-EnergyDB extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) hierarchies.
+EnergyDB extends [TimeDB](https://github.com/rebase-energy/timedb) with persistent storage for [EnergyDataModel](https://github.com/rebase-energy/energydatamodel) hierarchies.
 
 ---
 
@@ -117,8 +117,8 @@ Want to try EnergyDB without a local setup? Open our Quickstart in Colab — the
 | Project | Description |
 | :------ | :---------- |
 | [TimeDB](https://github.com/rebase-energy/timedb) | 3-dimensional time-series storage on ClickHouse with auditability and overlapping-forecast support |
-| [TimeDataModel](https://github.com/rebase-energy/TimeDataModel) | Pythonic data model for time series |
-| [EnergyDataModel](https://github.com/rebase-energy/EnergyDataModel) | Data model for energy assets (solar, wind, battery, grid, ...) |
+| [TimeDataModel](https://github.com/rebase-energy/timedatamodel) | Pythonic data model for time series |
+| [EnergyDataModel](https://github.com/rebase-energy/energydatamodel) | Data model for energy assets (solar, wind, battery, grid, ...) |
 
 ---
 
