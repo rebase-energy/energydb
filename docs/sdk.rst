@@ -400,9 +400,11 @@ scope:
    )
 
 A pandas or polars DataFrame is accepted; everything is converted to polars
-internally. ``write()`` returns the ``run_id`` used for this batch — all
-writes are recorded in the ``energydb.runs`` table, keyed by a client-side
-UUID7-derived integer.
+internally. ``write()`` returns a :class:`~energydb.WriteResult` — an ``int``
+whose value is the ``run_id`` used for this batch (so existing code that
+treats the result as a run_id keeps working), carrying ``.written`` /
+``.skipped`` row counts as attributes. All writes are recorded in the
+``energydb.runs`` table, keyed by a client-side UUID7-derived integer.
 
 Optional kwargs:
 
@@ -414,6 +416,11 @@ Optional kwargs:
 - ``run_id``, ``workflow_id``, ``model_name``, ``run_start_time``,
   ``run_finish_time``, ``run_params`` — provenance metadata stored in
   ``energydb.runs``
+- ``skip_unchanged`` / ``unchanged_scope`` — drop rows that only duplicate
+  the latest stored ``(value, annotation, changed_by)`` before the insert;
+  ``unchanged_scope`` (default ``"valid_time"``) selects the comparison key.
+  Forwarded to the underlying ``timedb`` write. The ``energydb.runs`` row is
+  upserted regardless, so an all-skipped write still records a run.
 
 Reading
 ~~~~~~~
@@ -554,8 +561,14 @@ Optional columns and kwargs:
 - ``run_id``, ``workflow_id``, ``model_name``, ``run_start_time``,
   ``run_finish_time``, ``run_params`` — provenance metadata; default
   ``run_id`` is one client-generated UUID7-derived integer per call
+- ``skip_unchanged`` / ``unchanged_scope`` (kwargs) — drop rows that only
+  duplicate the latest stored value before the insert; ``unchanged_scope``
+  (default ``"valid_time"``) selects the comparison key. Forwarded to the
+  underlying ``timedb`` write.
 
-Returns the ``run_id`` used.
+Returns a :class:`~energydb.WriteResult` — an ``int`` run_id carrying
+``.written`` / ``.skipped`` row counts. The ``energydb.runs`` row is upserted
+even when every row is skipped, so an all-skipped write still records a run.
 
 read() — manifest-based multi-series read
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

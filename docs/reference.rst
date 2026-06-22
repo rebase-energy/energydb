@@ -21,6 +21,19 @@ internally-constructed :class:`timedb.TimeDBClient` against ClickHouse
    :show-inheritance:
 
 
+Write Results
+-------------
+
+Returned by :meth:`Client.write <energydb.Client.write>`,
+:meth:`NodeScope.write <energydb.NodeScope.write>`, and
+:meth:`EdgeScope.write <energydb.EdgeScope.write>`. Subclasses ``int`` (the
+``run_id``) and carries ``written`` / ``skipped`` row counts.
+
+.. autoclass:: energydb.WriteResult
+   :members:
+   :show-inheritance:
+
+
 Fluent Scopes
 -------------
 
