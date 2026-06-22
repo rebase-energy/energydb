@@ -36,11 +36,11 @@ import polars as pl
 from psycopg_pool import ConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
-from timedb import TimeDBClient, profiling
+from timedb import TimeDBClient, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import read_manifest, read_relative_manifest, write_manifest
+from energydb._io import WriteResult, read_manifest, read_relative_manifest, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, register_tree_under
 from energydb.diff import TreeDiff
@@ -485,7 +485,9 @@ class Client:
         run_start_time: datetime | None = None,
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
-    ) -> int:
+        skip_unchanged: bool = False,
+        unchanged_scope: UnchangedScope = "valid_time",
+    ) -> WriteResult:
         """Bulk-write timeseries data via a routing manifest.
 
         ``df`` is a pandas or polars DataFrame carrying one routing column
@@ -495,8 +497,12 @@ class Client:
         optional ``knowledge_time``). Optional ``unit`` column triggers
         per-row unit conversion to each series's canonical unit.
 
+        ``skip_unchanged`` (with ``unchanged_scope``) drops rows whose latest
+        stored value is unchanged before the insert; see :func:`timedb.write`.
+
         Series must already be registered (typically via
-        :meth:`register_tree`). Returns the ``run_id`` used.
+        :meth:`register_tree`). Returns a :class:`WriteResult` — an ``int``
+        run_id carrying ``written`` / ``skipped`` counts.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             df_pl = to_polars(df)
@@ -511,6 +517,8 @@ class Client:
             run_start_time=run_start_time,
             run_finish_time=run_finish_time,
             run_params=run_params,
+            skip_unchanged=skip_unchanged,
+            unchanged_scope=unchanged_scope,
         )
 
     def read(

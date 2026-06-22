@@ -51,3 +51,8 @@ benchmark_argmax_vs_limit1by/
 
 # Local engineering notes (perf scratch, etc.)
 notes/
+
+# Local visual inspector tool (standalone, not part of the published package)
+inspect/
+# Snapshot of the pre-WASM server-backed inspector, kept as a reference/fallback.
+inspect_legacy/

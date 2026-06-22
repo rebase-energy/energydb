@@ -27,11 +27,11 @@ import pandas as pd
 import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
-from timedb import profiling
+from timedb import UnchangedScope, profiling
 
 from energydb import series as series_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import read_relative_resolved, read_resolved
+from energydb._io import WriteResult, read_relative_resolved, read_resolved
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -404,12 +404,17 @@ class _BaseScope:
         run_start_time: datetime | None = None,
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
-    ) -> int:
+        skip_unchanged: bool = False,
+        unchanged_scope: UnchangedScope = "valid_time",
+    ) -> WriteResult:
         """Write time-series data for a single series on this scope's owner.
 
         Builds a 1-route manifest (owner uuid, ``data_type``, ``name``,
         plus optional ``unit``) over ``df`` (pandas or polars) and
-        delegates to :meth:`Client.write`. Returns the ``run_id`` used.
+        delegates to :meth:`Client.write`. ``skip_unchanged`` /
+        ``unchanged_scope`` are forwarded; see :func:`timedb.write`. Returns a
+        :class:`WriteResult` — an ``int`` run_id carrying ``written`` /
+        ``skipped`` counts.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("write")
@@ -435,6 +440,8 @@ class _BaseScope:
             run_start_time=run_start_time,
             run_finish_time=run_finish_time,
             run_params=run_params,
+            skip_unchanged=skip_unchanged,
+            unchanged_scope=unchanged_scope,
         )
 
     def read(

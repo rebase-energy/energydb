@@ -14,7 +14,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import polars as pl
-from timedb import profiling
+from timedb import UnchangedScope, profiling
 
 from energydb import runs as runs_mod
 from energydb._join import (
@@ -45,6 +45,31 @@ _ROUTING_AND_META_COLS = (
 )
 
 
+class WriteResult(int):
+    """The ``run_id`` (an ``int``) carrying row counts from a write.
+
+    Subclasses ``int`` so existing callers that treat the return value as a
+    run_id keep working unchanged; ``written`` / ``skipped`` ride along as
+    attributes, and ``.run_id`` reads as the int value.
+    """
+
+    written: int
+    skipped: int
+
+    def __new__(cls, run_id: int, written: int, skipped: int) -> WriteResult:
+        self = super().__new__(cls, run_id)
+        self.written = written
+        self.skipped = skipped
+        return self
+
+    @property
+    def run_id(self) -> int:
+        return int(self)
+
+    def __repr__(self) -> str:
+        return f"WriteResult(run_id={int(self)}, written={self.written}, skipped={self.skipped})"
+
+
 def write_manifest(
     pool,
     td,
@@ -57,13 +82,21 @@ def write_manifest(
     run_start_time: datetime | None = None,
     run_finish_time: datetime | None = None,
     run_params: dict | None = None,
-) -> int:
+    skip_unchanged: bool = False,
+    unchanged_scope: UnchangedScope = "valid_time",
+) -> WriteResult:
     """Resolve a manifest's routing → series_id and bulk-write.
 
     The manifest carries the data columns (``valid_time`` + ``value``)
     alongside the routing columns and ``data_type`` / ``name``. An optional
     ``unit`` column triggers per-row unit conversion to each series's
-    canonical unit. Returns the ``run_id`` used.
+    canonical unit.
+
+    ``skip_unchanged`` (and ``unchanged_scope``) are forwarded to
+    :func:`timedb.write`; see that for the comparison semantics. The
+    ``energydb.runs`` row is upserted regardless, so an all-skipped write still
+    records a run (with no ``run_series`` mapping). Returns a :class:`WriteResult`
+    — an ``int`` run_id carrying ``written`` / ``skipped`` counts.
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
 
@@ -102,8 +135,13 @@ def write_manifest(
 
     # PG state is committed; CH write happens after. A CH failure leaves an
     # orphaned runs row but no PG inconsistency — detectable by run_id.
-    td.write(write_df, knowledge_time=knowledge_time)
-    return rid
+    counts = td.write(
+        write_df,
+        knowledge_time=knowledge_time,
+        skip_unchanged=skip_unchanged,
+        unchanged_scope=unchanged_scope,
+    )
+    return WriteResult(rid, counts.written, counts.skipped)
 
 
 # ---------------------------------------------------------------------------
