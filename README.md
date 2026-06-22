@@ -35,7 +35,7 @@ Most time-series systems are agnostic about what their series represent — they
 - ⏱️ **Time-of-knowledge queries:** Forecast revisions, corrections, and as-of backtests, powered by [TimeDB](https://github.com/rebase-energy/timedb).
 - 🧭 **Lazy fluent navigation:** `client.get_node("Portfolio", "Site", "T01").read(...)` resolves to one indexed SQL query, regardless of subtree size.
 - ⚖️ **Unit conversion at the boundary:** Declare canonical units once; pint rescales every read and write automatically.
-- 🧹 **Idempotent re-polls:** `write(..., skip_unchanged=True)` drops rows that only duplicate the latest stored value before insert, so feeds that re-poll the same window don't bloat storage. Opt-in; the write still returns its `run_id` (now a `WriteResult` carrying `.written` / `.skipped` counts).
+- 🧹 **Idempotent writes:** `write(..., skip_unchanged=True)` drops rows that only duplicate the latest stored value before insert, so writing the same window repeatedly doesn't bloat storage. Opt-in; the write still returns its `run_id` (now a `WriteResult` carrying `.written` / `.skipped` counts).
 
 ---
 
