@@ -55,6 +55,8 @@ pip install energydb
 
 Requires Python 3.12+, PostgreSQL (asset hierarchy + series catalog), and ClickHouse (time-series values).
 
+> **Need a local Postgres + ClickHouse?** One command brings both up: `cd local-db && docker compose up -d` (see [`local-db/`](local-db/), or [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup).
+
 ### 2. Usage Example
 
 ```python
