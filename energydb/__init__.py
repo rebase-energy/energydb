@@ -1,8 +1,11 @@
 """EnergyDB — Energy database extending TimeDB with hierarchical asset management."""
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 
-load_dotenv(find_dotenv())
+# Load only the .env in the current working directory (no upward tree-walk).
+# override=False so an already-set env var (Docker, CI, uv run --env-file, a
+# caller that loaded its own .env first) always wins over this dev fallback.
+load_dotenv(".env")
 
 from energydatamodel import (  # noqa: E402
     # Areas
