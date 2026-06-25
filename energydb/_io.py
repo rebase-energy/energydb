@@ -216,8 +216,9 @@ async def _read_pipeline(
     meta they already have from the scope's PG resolve.
     """
     is_edge = "edge_uuid" in manifest.columns
-    async with pool.connection() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
-        resolved, _summary = await resolve_manifest(conn, manifest)
+    with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+        async with pool.connection() as conn:
+            resolved, _summary = await resolve_manifest(conn, manifest)
     with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
         meta = _meta_from_resolved(resolved, is_edge=is_edge)
     return await _execute_read(pool, meta, td_call, unit=unit, output=output)

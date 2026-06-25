@@ -63,10 +63,12 @@ async def create_node(
     if parent_uuid is None:
         path = row_data["name"]
     else:
-        parent_row = await (await conn.execute(
-            "SELECT path FROM node WHERE uuid = %s",
-            (parent_uuid,),
-        )).fetchone()
+        parent_row = await (
+            await conn.execute(
+                "SELECT path FROM node WHERE uuid = %s",
+                (parent_uuid,),
+            )
+        ).fetchone()
         if parent_row is None:
             raise ValueError(f"parent_uuid={parent_uuid} does not exist")
         path = f"{parent_row[0]}/{row_data['name']}"
@@ -103,10 +105,12 @@ async def create_node_raw(
     if parent_uuid is None:
         path = name
     else:
-        parent_row = await (await conn.execute(
-            "SELECT path FROM node WHERE uuid = %s",
-            (parent_uuid,),
-        )).fetchone()
+        parent_row = await (
+            await conn.execute(
+                "SELECT path FROM node WHERE uuid = %s",
+                (parent_uuid,),
+            )
+        ).fetchone()
         if parent_row is None:
             raise ValueError(f"parent_uuid={parent_uuid} does not exist")
         path = f"{parent_row[0]}/{name}"
@@ -145,8 +149,9 @@ async def create_edge(
     from_uuid = _endpoint_uuid(edm_obj, "from_element", tree_root)
     to_uuid = _endpoint_uuid(edm_obj, "to_element", tree_root)
 
-    row = await (await conn.execute(
-        """
+    row = await (
+        await conn.execute(
+            """
         INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (uuid) DO UPDATE
@@ -158,14 +163,17 @@ async def create_edge(
           WHERE edge.edge_type = EXCLUDED.edge_type
         RETURNING uuid
         """,
-        (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
-    )).fetchone()
+            (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
+        )
+    ).fetchone()
 
     if row is None:
-        existing = await (await conn.execute(
-            "SELECT edge_type FROM edge WHERE uuid = %s",
-            (uuid_val,),
-        )).fetchone()
+        existing = await (
+            await conn.execute(
+                "SELECT edge_type FROM edge WHERE uuid = %s",
+                (uuid_val,),
+            )
+        ).fetchone()
         if existing is None:
             raise RuntimeError("edge upsert returned no row and follow-up SELECT found nothing")
         if existing[0] != row_data["edge_type"]:
@@ -368,20 +376,24 @@ async def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
     """
     if not uuids:
         return []
-    rows = await (await conn.execute(
-        f"SELECT uuid FROM {table} WHERE uuid = ANY(%s)",
-        (uuids,),
-    )).fetchall()
+    rows = await (
+        await conn.execute(
+            f"SELECT uuid FROM {table} WHERE uuid = ANY(%s)",
+            (uuids,),
+        )
+    ).fetchall()
     return [r[0] for r in rows]
 
 
 async def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
     if not uuids:
         return {}
-    rows = await (await conn.execute(
-        "SELECT uuid, node_type, name, parent_uuid, data FROM node WHERE uuid = ANY(%s)",
-        (uuids,),
-    )).fetchall()
+    rows = await (
+        await conn.execute(
+            "SELECT uuid, node_type, name, parent_uuid, data FROM node WHERE uuid = ANY(%s)",
+            (uuids,),
+        )
+    ).fetchall()
     return {
         r[0]: NodeSnapshot(uuid=r[0], node_type=r[1], name=r[2], parent_uuid=r[3], data=dict(r[4] or {})) for r in rows
     }
@@ -390,10 +402,12 @@ async def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnaps
 async def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
     if not uuids:
         return {}
-    rows = await (await conn.execute(
-        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM edge WHERE uuid = ANY(%s)",
-        (uuids,),
-    )).fetchall()
+    rows = await (
+        await conn.execute(
+            "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM edge WHERE uuid = ANY(%s)",
+            (uuids,),
+        )
+    ).fetchall()
     return {
         r[0]: EdgeSnapshot(
             uuid=r[0],

@@ -6,16 +6,18 @@ integration tests when ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are set.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import energydb as edb
 import polars as pl
 import pytest
 from energydatamodel.reference import Reference
-from energydb.client import Client
+from energydb import Client
+from energydb.client import AsyncClient
 
 # ---------------------------------------------------------------------------
 # Unit tests — mocked pool / td
@@ -32,11 +34,40 @@ def _simple_df(n: int = 3) -> pl.DataFrame:
     )
 
 
-def _mock_client(monkeypatch) -> Client:
-    """Build a Client with both pool and td fully mocked."""
-    monkeypatch.setattr(Client, "__init__", lambda self: None)
-    client = Client()  # type: ignore[call-arg]
-    client._pool = MagicMock()
+def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
+    """An async-aware mock connection for the ``await (await execute).fetch*()`` path.
+
+    ``commit``/``rollback`` are awaitable; ``execute`` returns a cursor whose
+    ``fetchall``/``fetchone`` are awaitable. Pass ``execute_side_effect`` to
+    dispatch cursors per-SQL (e.g. path resolution vs existence checks).
+    """
+    conn = MagicMock()
+    conn.commit = AsyncMock()
+    conn.rollback = AsyncMock()
+    if execute_side_effect is not None:
+        conn.execute = AsyncMock(side_effect=execute_side_effect)
+    else:
+        cursor = MagicMock()
+        cursor.fetchall = AsyncMock(return_value=fetchall if fetchall is not None else [])
+        cursor.fetchone = AsyncMock(return_value=None)
+        conn.execute = AsyncMock(return_value=cursor)
+    return conn
+
+
+def _async_pool(conn: MagicMock) -> MagicMock:
+    """A mock pool whose ``connection()`` is an async context manager yielding ``conn``."""
+    pool = MagicMock()
+    cm = pool.connection.return_value
+    cm.__aenter__ = AsyncMock(return_value=conn)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return pool
+
+
+def _mock_client(monkeypatch, conn: MagicMock | None = None) -> AsyncClient:
+    """Build an AsyncClient with an async-aware mock pool and td."""
+    monkeypatch.setattr(AsyncClient, "__init__", lambda self: None)
+    client = AsyncClient()  # type: ignore[call-arg]
+    client._pool = _async_pool(conn if conn is not None else _make_conn())
     client.td = MagicMock()
     return client
 
@@ -47,8 +78,10 @@ class TestRegisterSeriesShapeDefault:
 
     @staticmethod
     def _mock_conn(returned_sid: int = 1):
+        cursor = MagicMock()
+        cursor.fetchone = AsyncMock(return_value=(returned_sid,))
         conn = MagicMock()
-        conn.execute.return_value.fetchone.return_value = (returned_sid,)
+        conn.execute = AsyncMock(return_value=cursor)
         return conn
 
     def test_flat_defaults_to_forever(self):
@@ -57,14 +90,16 @@ class TestRegisterSeriesShapeDefault:
         from energydb import series as series_mod
 
         conn = self._mock_conn()
-        series_mod.register_series(
-            conn,
-            owner_col="node_uuid",
-            owner_uuid=uuid4(),
-            data_type="actual",
-            name="power",
-            canonical_unit="MW",
-            timeseries_type="FLAT",
+        asyncio.run(
+            series_mod.register_series(
+                conn,
+                owner_col="node_uuid",
+                owner_uuid=uuid4(),
+                data_type="actual",
+                name="power",
+                canonical_unit="MW",
+                timeseries_type="FLAT",
+            )
         )
         params = conn.execute.call_args.args[1]
         # retention is the 7th positional INSERT param (0-indexed 6).
@@ -76,14 +111,16 @@ class TestRegisterSeriesShapeDefault:
         from energydb import series as series_mod
 
         conn = self._mock_conn()
-        series_mod.register_series(
-            conn,
-            owner_col="node_uuid",
-            owner_uuid=uuid4(),
-            data_type="forecast",
-            name="power",
-            canonical_unit="MW",
-            timeseries_type="OVERLAPPING",
+        asyncio.run(
+            series_mod.register_series(
+                conn,
+                owner_col="node_uuid",
+                owner_uuid=uuid4(),
+                data_type="forecast",
+                name="power",
+                canonical_unit="MW",
+                timeseries_type="OVERLAPPING",
+            )
         )
         params = conn.execute.call_args.args[1]
         assert params[6] == "medium"
@@ -94,15 +131,17 @@ class TestRegisterSeriesShapeDefault:
         from energydb import series as series_mod
 
         conn = self._mock_conn()
-        series_mod.register_series(
-            conn,
-            owner_col="node_uuid",
-            owner_uuid=uuid4(),
-            data_type="actual",
-            name="power",
-            canonical_unit="MW",
-            timeseries_type="FLAT",
-            retention="short",
+        asyncio.run(
+            series_mod.register_series(
+                conn,
+                owner_col="node_uuid",
+                owner_uuid=uuid4(),
+                data_type="actual",
+                name="power",
+                canonical_unit="MW",
+                timeseries_type="FLAT",
+                retention="short",
+            )
         )
         params = conn.execute.call_args.args[1]
         assert params[6] == "short"
@@ -116,7 +155,7 @@ class TestRegisterTree:
 
         calls: list[tuple[str, UUID | None]] = []
 
-        def fake_create_node(_pool, edm_obj, *, parent_uuid=None):
+        async def fake_create_node(_pool, edm_obj, *, parent_uuid=None):
             calls.append((edm_obj.name, parent_uuid))
             return edm_obj.id
 
@@ -136,7 +175,7 @@ class TestRegisterTree:
         s2.members = [b1]
         portfolio.members = [s1, s2]
 
-        root_uuid = client.register_tree(portfolio)
+        root_uuid = asyncio.run(client.register_tree(portfolio))
 
         assert root_uuid == portfolio.id
         assert calls == [
@@ -154,7 +193,7 @@ class TestRegisterTree:
         client = _mock_client(monkeypatch)
         monkeypatch.setattr(
             "energydb._persist.create_node",
-            lambda _pool, obj, *, parent_uuid=None: obj.id,
+            AsyncMock(side_effect=lambda _pool, obj, *, parent_uuid=None: obj.id),
         )
 
         tree = edb.wind.WindTurbine(
@@ -162,7 +201,7 @@ class TestRegisterTree:
             capacity=3.5,
             timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
         )
-        client.register_tree(tree)
+        asyncio.run(client.register_tree(tree))
         client.td.write.assert_not_called()
 
     def test_inline_data_rejected(self, monkeypatch):
@@ -179,7 +218,7 @@ class TestRegisterTree:
             timeseries=[edb.TimeSeries(_simple_df(2), name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
         )
         with pytest.raises(ValueError, match="register_tree"):
-            client.register_tree(tree)
+            asyncio.run(client.register_tree(tree))
 
     def test_under_resolves_parent_path(self, monkeypatch):
         """``under=`` resolves to a parent_uuid and the tree is grafted there."""
@@ -197,27 +236,26 @@ class TestRegisterTree:
             res = MagicMock()
             if "WHERE path = %s" in sql:
                 # resolve_node_uuid materialized-path lookup uses fetchone.
-                res.fetchone.return_value = (parent_uuid,)
-            elif "FROM energydb.node WHERE uuid = ANY" in sql:
-                # New target node — not yet in DB.
-                res.fetchall.return_value = []
+                res.fetchone = AsyncMock(return_value=(parent_uuid,))
+                res.fetchall = AsyncMock(return_value=[])
             else:
-                res.fetchall.return_value = []
+                # New target node — not yet in DB (existence pre-check).
+                res.fetchone = AsyncMock(return_value=None)
+                res.fetchall = AsyncMock(return_value=[])
             return res
 
-        conn = MagicMock()
-        conn.execute.side_effect = execute_side_effect
-        client._pool.connection.return_value.__enter__.return_value = conn
+        conn = _make_conn(execute_side_effect=execute_side_effect)
+        client._pool = _async_pool(conn)
 
         captured_parent: list[UUID | None] = []
 
-        def fake_create_node(_pool, obj, *, parent_uuid=None):
+        async def fake_create_node(_pool, obj, *, parent_uuid=None):
             captured_parent.append(parent_uuid)
             return obj.id
 
         monkeypatch.setattr("energydb._persist.create_node", fake_create_node)
 
-        client.register_tree(edb.wind.WindTurbine(name="T", capacity=3.5), under=("Region", "Site"))
+        asyncio.run(client.register_tree(edb.wind.WindTurbine(name="T", capacity=3.5), under=("Region", "Site")))
         assert captured_parent == [parent_uuid]
 
 
@@ -228,11 +266,11 @@ class TestTwoPassWalk:
         node_calls: list[str] = []
         edge_calls: list[str] = []
 
-        def fake_create_node(_pool, obj, *, parent_uuid=None):
+        async def fake_create_node(_pool, obj, *, parent_uuid=None):
             node_calls.append(obj.name)
             return obj.id
 
-        def fake_create_edge(_pool, obj, *, tree_root=None):
+        async def fake_create_edge(_pool, obj, *, tree_root=None):
             edge_calls.append(obj.name)
             return obj.id
 
@@ -243,7 +281,7 @@ class TestTwoPassWalk:
         bus_b = edb.grid.JunctionPoint(name="BusB")
         line = edb.grid.Line(name="L1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
         tree = edb.Portfolio(name="Grid", members=[bus_a, bus_b, line])
-        client.register_tree(tree)
+        asyncio.run(client.register_tree(tree))
 
         assert "Grid" in node_calls
         assert "BusA" in node_calls

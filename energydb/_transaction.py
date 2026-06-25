@@ -21,7 +21,7 @@ from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.paths import resolve_node_uuid
 
 if TYPE_CHECKING:
-    from energydb.client import Client
+    from energydb.client import AsyncClient
     from energydb.scope import EdgeScope, NodeScope, Path
 
 
@@ -36,7 +36,7 @@ class Transaction:
     directly outside the transaction instead.
     """
 
-    def __init__(self, client: Client):
+    def __init__(self, client: AsyncClient):
         self._client = client
         self._pool_cm = None
         self._conn = None
@@ -54,12 +54,12 @@ class Transaction:
             state = "unopened"
         return f"Transaction({state}, {len(self._node_changes)} node + {len(self._edge_changes)} edge changes pending)"
 
-    def __enter__(self) -> Transaction:
+    async def __aenter__(self) -> Transaction:
         self._pool_cm = self._client._pool.connection()
-        self._conn = self._pool_cm.__enter__()
+        self._conn = await self._pool_cm.__aenter__()
         return self
 
-    async def __exit__(self, exc_type, exc, tb):
+    async def __aexit__(self, exc_type, exc, tb):
         assert self._conn is not None and self._pool_cm is not None
         try:
             if exc_type is not None:
@@ -75,7 +75,7 @@ class Transaction:
                 )
             return False
         finally:
-            self._pool_cm.__exit__(exc_type, exc, tb)
+            await self._pool_cm.__aexit__(exc_type, exc, tb)
 
     # ------------------------------------------------------------------
     # Scope factories — mirror Client surface, scopes bound to this txn.
@@ -96,7 +96,7 @@ class Transaction:
         scope = self._client.get_edge(from_path, to_path, type=type, uuid=uuid)
         return scope._with_txn(self)
 
-    def register_tree(
+    async def register_tree(
         self,
         edm_obj,
         *,
@@ -110,8 +110,8 @@ class Transaction:
         """
         from energydb.scope import _coerce_path
 
-        parent_uuid = resolve_node_uuid(self._conn, _coerce_path((), kwarg=under)) if under is not None else None
-        root_uuid, diff = register_tree_under(
+        parent_uuid = await resolve_node_uuid(self._conn, _coerce_path((), kwarg=under)) if under is not None else None
+        root_uuid, diff = await register_tree_under(
             self._conn,
             edm_obj,
             parent_uuid=parent_uuid,

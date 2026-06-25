@@ -23,6 +23,7 @@ API split:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 import pandas as pd
 import polars as pl
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, UnchangedScope, profiling
@@ -58,11 +59,14 @@ from energydb.serialization import reconstruct_edge, reconstruct_node
 _SEARCH_PATH = f"SET search_path TO {SCHEMA}, public" if SCHEMA else "SET search_path TO public"
 
 
-class Client:
-    """Client for energy assets, hierarchy, and time series.
+class AsyncClient:
+    """Async-native client for energy assets, hierarchy, and time series.
 
-    Owns the psycopg connection pool (used for all PG ops) and constructs
-    a :class:`TimeDBClient` for ClickHouse I/O.
+    Owns the psycopg ``AsyncConnectionPool`` (used for all PG ops) and
+    constructs a :class:`TimeDBClient` for ClickHouse I/O. Every PG
+    round-trip is awaited; the ClickHouse leg (sync ``clickhouse-connect``)
+    is offloaded to a worker thread. Synchronous callers use
+    :class:`energydb.Client`, a thin blocking facade over this class.
     """
 
     def __init__(
@@ -92,50 +96,55 @@ class Client:
             conn.prepare_threshold = 1
             await conn.commit()
 
-        self._pool = ConnectionPool(
+        self._pool = AsyncConnectionPool(
             conninfo=conninfo,
             min_size=1,
             max_size=10,
-            open=True,
+            open=False,
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
 
-    def __repr__(self) -> str:
-        """Repr with credentials stripped from the DSN.
+    async def open(self) -> None:
+        """Open the async connection pool. Await once before first use."""
+        await self._pool.open()
 
-        Shows scheme + host(:port) + db; the userinfo segment (user:pass) is
-        replaced with ``***``. Pure formatting — no I/O.
+    def _safe_dsn(self) -> str:
+        """The DSN with the userinfo segment (user:pass) replaced by ``***``.
+
+        Shows scheme + host(:port) + db. Pure formatting — no I/O. Shared by
+        :meth:`__repr__` and the sync :class:`energydb.Client` facade.
         """
         dsn = self._dsn
         if "://" in dsn:
             scheme, rest = dsn.split("://", 1)
             if "@" in rest:
                 _userinfo, hostpart = rest.split("@", 1)
-                safe = f"{scheme}://***@{hostpart}"
-            else:
-                safe = dsn
-        else:
-            safe = dsn
-        return f"Client(pg={safe!r})"
+                return f"{scheme}://***@{hostpart}"
+        return dsn
+
+    def __repr__(self) -> str:
+        return f"AsyncClient(pg={self._safe_dsn()!r})"
 
     # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
 
-    def create(self) -> None:
+    async def create(self) -> None:
         """Create PG schema + CH tables.
 
-        Schema is defined entirely by SQLAlchemy models in :mod:`energydb.models`
-        — including the ``energydb`` schema, the partial unique index on root
-        names, and the immutability trigger on ``series``. No raw SQL.
+        Schema is defined by the SQLAlchemy models in :mod:`energydb.models`.
+        SQLAlchemy's ``create_all`` and TimeDB's create are synchronous, so they
+        run in a worker thread to keep the event loop free.
         """
+        await asyncio.to_thread(self._create_blocking)
+
+    def _create_blocking(self) -> None:
         engine = create_engine(self._sqlalchemy_url())
         try:
             Base.metadata.create_all(engine, checkfirst=True)
         finally:
             engine.dispose()
-
         self.td.create()
 
     async def delete(self) -> None:
@@ -152,10 +161,10 @@ class Client:
             else:
                 await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             await conn.commit()
-        self.td.delete()
+        await asyncio.to_thread(self.td.delete)
 
-    def close(self) -> None:
-        self._pool.close()
+    async def close(self) -> None:
+        await self._pool.close()
 
     # ------------------------------------------------------------------
     # Fluent entry — scopes for navigation & single-element ops
@@ -272,8 +281,8 @@ class Client:
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
         """
         async with self._pool.connection() as conn:
-            parent_uuid = resolve_node_uuid(conn, _coerce_path((), kwarg=under)) if under is not None else None
-            root_uuid, diff = register_tree_under(
+            parent_uuid = await resolve_node_uuid(conn, _coerce_path((), kwarg=under)) if under is not None else None
+            root_uuid, diff = await register_tree_under(
                 conn,
                 edm_obj,
                 parent_uuid=parent_uuid,
@@ -310,16 +319,20 @@ class Client:
 
             if within is not None:
                 within_uuid = (
-                    within if isinstance(within, UUID) else resolve_node_uuid(conn, _coerce_path((), kwarg=within))
+                    within
+                    if isinstance(within, UUID)
+                    else await resolve_node_uuid(conn, _coerce_path((), kwarg=within))
                 )
                 conditions.append("uuid = ANY(%s)")
-                params.append(resolve_subtree_uuids(conn, within_uuid))
+                params.append(await resolve_subtree_uuids(conn, within_uuid))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = await (await conn.execute(
-                f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
-                params,
-            )).fetchall()
+            rows = await (
+                await conn.execute(
+                    f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
+                    params,
+                )
+            ).fetchall()
 
         return [reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]}) for r in rows]
 
@@ -336,7 +349,7 @@ class Client:
         index in one pass.
         """
         async with self._pool.connection() as conn:
-            edge_uuid = create_edge(conn, edm_obj, tree_root=None)
+            edge_uuid = await create_edge(conn, edm_obj, tree_root=None)
             await conn.commit()
         return edge_uuid
 
@@ -369,8 +382,8 @@ class Client:
             elif isinstance(parent, UUID):
                 parent_uuid = parent
             else:
-                parent_uuid = resolve_node_uuid(conn, _coerce_path((), kwarg=parent))
-            new_uuid = create_node_raw(
+                parent_uuid = await resolve_node_uuid(conn, _coerce_path((), kwarg=parent))
+            new_uuid = await create_node_raw(
                 conn,
                 node_type=node_type,
                 name=name,
@@ -389,11 +402,13 @@ class Client:
         :meth:`get_node` / :meth:`get_tree`.
         """
         async with self._pool.connection() as conn:
-            row = await (await conn.execute(
-                "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
-                "FROM node WHERE uuid = %s",
-                (node_uuid,),
-            )).fetchone()
+            row = await (
+                await conn.execute(
+                    "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
+                    "FROM node WHERE uuid = %s",
+                    (node_uuid,),
+                )
+            ).fetchone()
         if row is None:
             return None
         return {
@@ -415,22 +430,26 @@ class Client:
         the root itself; empty list if the root does not exist.
         """
         async with self._pool.connection() as conn:
-            root = await (await conn.execute(
-                "SELECT path FROM node WHERE uuid = %s",
-                (root_uuid,),
-            )).fetchone()
+            root = await (
+                await conn.execute(
+                    "SELECT path FROM node WHERE uuid = %s",
+                    (root_uuid,),
+                )
+            ).fetchone()
             if root is None:
                 return []
             root_path = root[0]
-            rows = await (await conn.execute(
-                r"""
+            rows = await (
+                await conn.execute(
+                    r"""
                 SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at
                 FROM node
                 WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 ORDER BY path
                 """,
-                (root_path, _like_escape(root_path)),
-            )).fetchall()
+                    (root_path, _like_escape(root_path)),
+                )
+            ).fetchall()
         return [
             {
                 "uuid": r[0],
@@ -455,11 +474,13 @@ class Client:
         if owner_col not in ("node_uuid", "edge_uuid"):
             raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
         async with self._pool.connection() as conn:
-            rows = await (await conn.execute(
-                f"SELECT name, data_type, canonical_unit, timeseries_type, description "
-                f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
-                (owner_uuid,),
-            )).fetchall()
+            rows = await (
+                await conn.execute(
+                    f"SELECT name, data_type, canonical_unit, timeseries_type, description "
+                    f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
+                    (owner_uuid,),
+                )
+            ).fetchall()
         return [
             {
                 "name": r[0],
@@ -495,19 +516,23 @@ class Client:
 
             if within is not None:
                 within_uuid = (
-                    within if isinstance(within, UUID) else resolve_node_uuid(conn, _coerce_path((), kwarg=within))
+                    within
+                    if isinstance(within, UUID)
+                    else await resolve_node_uuid(conn, _coerce_path((), kwarg=within))
                 )
-                subtree = resolve_subtree_uuids(conn, within_uuid)
+                subtree = await resolve_subtree_uuids(conn, within_uuid)
                 conditions.append("(from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s))")
                 params.append(subtree)
                 params.append(subtree)
 
             where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = await (await conn.execute(
-                f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
-                f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
-                params,
-            )).fetchall()
+            rows = await (
+                await conn.execute(
+                    f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
+                    f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
+                    params,
+                )
+            ).fetchall()
             if not rows:
                 return []
 
@@ -551,28 +576,32 @@ class Client:
             if uuid is not None:
                 root_uuid = uuid
             elif names_or_path:
-                root_uuid = resolve_node_uuid(conn, _coerce_path(names_or_path))
+                root_uuid = await resolve_node_uuid(conn, _coerce_path(names_or_path))
             else:
                 raise ValueError("Provide a path or uuid=.")
 
             # Two-step: fetch the root's path, then LIKE with the escaped
             # prefix as a bind param so PG picks Index Scan on
             # ``ix_node_path_prefix``. A column-source LIKE would Seq Scan.
-            root_path_row = await (await conn.execute(
-                "SELECT path FROM node WHERE uuid = %s",
-                (root_uuid,),
-            )).fetchone()
+            root_path_row = await (
+                await conn.execute(
+                    "SELECT path FROM node WHERE uuid = %s",
+                    (root_uuid,),
+                )
+            ).fetchone()
             if root_path_row is None:
                 raise ValueError(f"Node not found: uuid={root_uuid}")
             root_path = root_path_row[0]
-            rows = await (await conn.execute(
-                r"""
+            rows = await (
+                await conn.execute(
+                    r"""
                 SELECT uuid, node_type, name, data, parent_uuid
                 FROM node
                 WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
-                (root_path, _like_escape(root_path)),
-            )).fetchall()
+                    (root_path, _like_escape(root_path)),
+                )
+            ).fetchall()
 
             nodes: dict[UUID, Any] = {}
             parent_map: dict[UUID, UUID | None] = {}
@@ -582,11 +611,13 @@ class Client:
                 nodes[node_uuid] = reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]})
 
             if include_series:
-                series_rows = await (await conn.execute(
-                    "SELECT node_uuid, data_type, name, canonical_unit, timeseries_type, description "
-                    "FROM series WHERE node_uuid = ANY(%s)",
-                    (list(nodes.keys()),),
-                )).fetchall()
+                series_rows = await (
+                    await conn.execute(
+                        "SELECT node_uuid, data_type, name, canonical_unit, timeseries_type, description "
+                        "FROM series WHERE node_uuid = ANY(%s)",
+                        (list(nodes.keys()),),
+                    )
+                ).fetchall()
                 for nid, dt, sname, unit, tstype, desc in series_rows:
                     node_obj = nodes.get(nid)
                     if node_obj is None:
@@ -614,7 +645,7 @@ class Client:
     # Bulk timeseries I/O — manifest DataFrames only
     # ------------------------------------------------------------------
 
-    def write(
+    async def write(
         self,
         df: pl.DataFrame | pd.DataFrame,
         *,
@@ -646,7 +677,7 @@ class Client:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             df_pl = to_polars(df)
-        return write_manifest(
+        return await write_manifest(
             self._pool,
             self.td,
             df_pl,
@@ -661,7 +692,7 @@ class Client:
             unchanged_scope=unchanged_scope,
         )
 
-    def read(
+    async def read(
         self,
         df: pl.DataFrame | pd.DataFrame,
         *,
@@ -711,7 +742,7 @@ class Client:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = read_manifest(
+        result = await read_manifest(
             self._pool,
             self.td,
             manifest,
@@ -727,7 +758,7 @@ class Client:
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             return to_backend(result, backend)
 
-    def read_relative(
+    async def read_relative(
         self,
         df: pl.DataFrame | pd.DataFrame,
         *,
@@ -751,7 +782,7 @@ class Client:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = read_relative_manifest(
+        result = await read_relative_manifest(
             self._pool,
             self.td,
             manifest,
@@ -768,11 +799,11 @@ class Client:
 
     async def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
         """Return runs that wrote data for a given series_id, latest first."""
-        run_ids = self.td.read_run_series(series_id=series_id)
+        run_ids = await asyncio.to_thread(self.td.read_run_series, series_id=series_id)
         if not run_ids:
             return []
         async with self._pool.connection() as conn:
-            return runs_mod.get_runs(conn, run_ids)
+            return await runs_mod.get_runs(conn, run_ids)
 
     # ------------------------------------------------------------------
     # Internals

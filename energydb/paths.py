@@ -69,19 +69,23 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
 
     joined = "/".join(path)
     if start_uuid is None:
-        row = await (await conn.execute(
-            "SELECT uuid FROM node WHERE path = %s",
-            (joined,),
-        )).fetchone()
+        row = await (
+            await conn.execute(
+                "SELECT uuid FROM node WHERE path = %s",
+                (joined,),
+            )
+        ).fetchone()
     else:
         # One round-trip: derive the start node's path inline and compose.
-        row = await (await conn.execute(
-            """
+        row = await (
+            await conn.execute(
+                """
             SELECT n.uuid FROM node n, node s
             WHERE s.uuid = %s AND n.path = s.path || '/' || %s
             """,
-            (start_uuid, joined),
-        )).fetchone()
+                (start_uuid, joined),
+            )
+        ).fetchone()
 
     if row is None:
         if start_uuid is None:
@@ -110,10 +114,12 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
             unique.append(t)
 
     joined_keys = ["/".join(p) for p in unique]
-    rows = await (await conn.execute(
-        "SELECT path, uuid FROM node WHERE path = ANY(%s)",
-        (joined_keys,),
-    )).fetchall()
+    rows = await (
+        await conn.execute(
+            "SELECT path, uuid FROM node WHERE path = ANY(%s)",
+            (joined_keys,),
+        )
+    ).fetchall()
 
     out: dict[Path, UUID] = {}
     by_joined = {row[0]: row[1] for row in rows}
@@ -183,20 +189,24 @@ async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     LIKE would force a Seq Scan. Net 2.4× faster than the single-query
     self-join on bench-scale data (44 ms → 18 ms at C=200).
     """
-    row = await (await conn.execute(
-        "SELECT path FROM node WHERE uuid = %s",
-        (node_uuid,),
-    )).fetchone()
+    row = await (
+        await conn.execute(
+            "SELECT path FROM node WHERE uuid = %s",
+            (node_uuid,),
+        )
+    ).fetchone()
     if row is None:
         return []
     prefix = row[0]
-    rows = await (await conn.execute(
-        r"""
+    rows = await (
+        await conn.execute(
+            r"""
         SELECT uuid FROM node
         WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
         """,
-        (prefix, _like_escape(prefix)),
-    )).fetchall()
+            (prefix, _like_escape(prefix)),
+        )
+    ).fetchall()
     return [r[0] for r in rows]
 
 
@@ -207,10 +217,12 @@ async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
 
 async def resolve_path(conn, node_uuid: UUID) -> Path:
     """Return the full path tuple from root → node."""
-    row = await (await conn.execute(
-        "SELECT path FROM node WHERE uuid = %s",
-        (node_uuid,),
-    )).fetchone()
+    row = await (
+        await conn.execute(
+            "SELECT path FROM node WHERE uuid = %s",
+            (node_uuid,),
+        )
+    ).fetchone()
     if row is None:
         raise ValueError(f"Node not found: uuid={node_uuid}")
     return tuple(row[0].split("/"))
@@ -226,10 +238,12 @@ async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str
     paths = await resolve_paths_to_uuids(conn, [from_path, to_path])
     from_uuid = paths[tuple(from_path)]
     to_uuid = paths[tuple(to_path)]
-    rows = await (await conn.execute(
-        "SELECT uuid FROM edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
-        (edge_type, from_uuid, to_uuid),
-    )).fetchall()
+    rows = await (
+        await conn.execute(
+            "SELECT uuid FROM edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
+            (edge_type, from_uuid, to_uuid),
+        )
+    ).fetchall()
     if not rows:
         raise ValueError(f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}")
     return rows[0][0]
@@ -418,16 +432,18 @@ async def _resolve_manifest_by_owner(
     # per-row UUID-object parse.
     unique_owners = list({t[0] for t in miss_triples})
     extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
-    rows = await (await conn.execute(
-        f"""
+    rows = await (
+        await conn.execute(
+            f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
         FROM series s
         {join_sql}
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,
-        (unique_owners,),
-    )).fetchall()
+            (unique_owners,),
+        )
+    ).fetchall()
     # Meta tuple layout:
     #   attach_path=False:  (series_id, canonical_unit, timeseries_type, retention)
     #   node + attach_path: (series_id, canonical_unit, timeseries_type, retention, path)
