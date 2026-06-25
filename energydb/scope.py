@@ -983,25 +983,36 @@ class NodeScope(_BaseScope):
         :func:`resolve_manifest`. ``None`` when the subtree is empty or no
         series match the optional ``data_type`` / ``name`` filters.
         """
-        with self._use_conn() as conn:
-            target_uuids = self._resolve_target_node_uuids(conn)
-            if not target_uuids:
-                return None
-            data_type_str = str(data_type).lower() if data_type else None
-            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-                meta = series_mod.resolve_for_read(
+        data_type_str = str(data_type).lower() if data_type else None
+        if self._where_filters:
+            where_conds, where_params = build_filter_conditions(
+                self._where_filters, type_col="node_type", table_alias="n"
+            )
+        else:
+            where_conds, where_params = [], []
+        with self._use_conn() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
+            if self._path and self._node_uuid is None:
+                meta = series_mod.resolve_subtree_series_for_read(
                     conn,
-                    owner_col="node_uuid",
-                    owner_uuids=target_uuids,
+                    root_path="/".join(self._path),
+                    where_conds=where_conds,
+                    where_params=where_params,
                     data_type=data_type_str,
                     name=name,
                 )
-        if meta.is_empty():
-            return None
-        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            # Drop the unused owner column; resolve_for_read guarantees one
-            # row per series, so no extra dedupe pass.
-            return meta.drop("edge_uuid")
+            elif self._node_uuid is not None:
+                meta = series_mod.resolve_subtree_series_for_read(
+                    conn,
+                    start_uuid=self._node_uuid,
+                    rel_path="/".join(self._path) if self._path else None,
+                    where_conds=where_conds,
+                    where_params=where_params,
+                    data_type=data_type_str,
+                    name=name,
+                )
+            else:
+                raise ValueError("NodeScope has no path or uuid to resolve.")
+        return None if meta.is_empty() else meta
 
 
 # ---------------------------------------------------------------------------

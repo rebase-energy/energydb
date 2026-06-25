@@ -137,6 +137,96 @@ def register_series(
     return existing_sid
 
 
+def resolve_subtree_series_for_read(
+    conn,
+    *,
+    root_path: str | None = None,
+    start_uuid: UUID | None = None,
+    rel_path: str | None = None,
+    where_conds: list[str] | None = None,
+    where_params: list[Any] | None = None,
+    data_type: str | None = None,
+    name: str | None = None,
+) -> pl.DataFrame:
+    """Resolve a node subtree straight to per-series read meta in ONE round-trip.
+
+    A single query walks root → subtree (materialized-path prefix scan) →
+    ``series`` ⋈ ``node``, replacing the ``resolve_node_uuid`` +
+    ``resolve_subtree_uuids`` + :func:`resolve_for_read` chain on the node
+    read path (which round-tripped the resolved uuid set back to PG as an
+    ``ANY()`` param). The root is given either as ``root_path`` (a ``/``-joined
+    path the caller already holds) or as ``start_uuid`` (+ optional ``rel_path``
+    for relative navigation), whose path is derived inline via a CTE so the
+    resolve stays one round-trip.
+
+    ``where_conds`` / ``where_params`` are extra subtree-node predicates from
+    :func:`build_filter_conditions` (qualified with ``table_alias="n"``).
+    Returns one row per series with the columns :func:`resolve_for_read`
+    produces for node-routed reads, minus the unused ``edge_uuid``. Empty df
+    if the subtree is empty or nothing matches.
+    """
+    cte_params: list[Any] = []
+    if root_path is not None:
+        root_cte = "SELECT %s::text AS rp"
+        cte_params.append(root_path)
+    elif start_uuid is not None and rel_path:
+        root_cte = "SELECT (path || '/' || %s) AS rp FROM energydb.node WHERE uuid = %s"
+        cte_params.extend([rel_path, start_uuid])
+    elif start_uuid is not None:
+        root_cte = "SELECT path AS rp FROM energydb.node WHERE uuid = %s"
+        cte_params.append(start_uuid)
+    else:
+        raise ValueError("resolve_subtree_series_for_read needs root_path or start_uuid.")
+
+    where_parts = list(where_conds or [])
+    where_vals: list[Any] = list(where_params or [])
+    if data_type:
+        where_parts.append("s.data_type = %s")
+        where_vals.append(data_type)
+    if name:
+        where_parts.append("s.name = %s")
+        where_vals.append(name)
+    where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
+
+    sql = rf"""
+        WITH root AS ({root_cte})
+        SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               s.node_uuid::text AS node_uuid, s.data_type, s.name, n.path AS path
+        FROM root r
+        JOIN energydb.node n
+          ON (n.path = r.rp OR n.path LIKE energydb._like_esc(r.rp) || '/%%' ESCAPE '\')
+        JOIN energydb.series s ON s.node_uuid = n.uuid
+        WHERE TRUE{where_clause}
+    """
+    rows = conn.execute(sql, [*cte_params, *where_vals]).fetchall()
+
+    return pl.DataFrame(
+        [
+            {
+                "series_id": r[0],
+                "canonical_unit": r[1],
+                "timeseries_type": r[2],
+                "retention": r[3],
+                "node_uuid": r[4],
+                "data_type": r[5],
+                "name": r[6],
+                "path": r[7],
+            }
+            for r in rows
+        ],
+        schema={
+            "series_id": pl.Int64,
+            "canonical_unit": pl.Utf8,
+            "timeseries_type": pl.Utf8,
+            "retention": pl.Utf8,
+            "node_uuid": pl.Utf8,
+            "data_type": pl.Utf8,
+            "name": pl.Utf8,
+            "path": pl.Utf8,
+        },
+    )
+
+
 def resolve_for_read(
     conn,
     *,

@@ -285,6 +285,12 @@ def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) 
     if route == "edge_uuid":
         return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
     if route == "path":
+        # Write pipelines (attach_path=False) collapse path → series in ONE
+        # round-trip. Read pipelines keep the two-step (resolve path→uuid, then
+        # the owner scan) because the post-read hierarchy attach needs
+        # ``node_uuid`` surfaced on the resolved frame.
+        if not attach_path:
+            return _resolve_manifest_by_path(conn, manifest)
         manifest = _attach_node_uuid_from_path(conn, manifest)
     return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
 
@@ -484,6 +490,77 @@ def _resolve_manifest_by_owner(
     summary = ResolveSummary(
         has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()),
     )
+    return resolved, summary
+
+
+def _resolve_manifest_by_path(conn, manifest: pl.DataFrame) -> tuple[pl.DataFrame, ResolveSummary]:
+    """Resolve a path-routed *write* manifest to series in ONE round-trip.
+
+    Collapses the former two-step path resolve (:func:`resolve_paths_to_uuids`,
+    then a ``node_uuid``-keyed series scan, plus an intermediate per-row
+    ``node_uuid`` attach) into a single ``node`` ⋈ ``series`` query keyed by the
+    materialized ``path``. Mirrors :func:`_resolve_manifest_by_owner`: hash the
+    ``(path, data_type, name)`` triple, dedupe, one indexed ``ANY()`` scan,
+    attach ``series_id`` / ``retention`` / ``canonical_unit`` via a
+    ``_triple_k`` left-join. Write-only — ``node_uuid`` is not surfaced (writes
+    drop it before the CH insert); read pipelines that need it keep the
+    two-step path in :func:`resolve_manifest`.
+    """
+    if manifest["path"].dtype != pl.Utf8:
+        raise ValueError(f"Manifest 'path' column must be Utf8 joined with '/'; got {manifest['path'].dtype}.")
+    non_null = manifest.height - manifest["path"].null_count()
+    if non_null == 0:
+        raise ValueError("No path values to resolve in manifest.")
+    if manifest["path"].null_count() > 0:
+        null_row = manifest.filter(pl.col("path").is_null()).row(0, named=True)
+        raise ValueError(
+            f"Series not registered for path=None, data_type={null_row['data_type']!r}, name={null_row['name']!r}."
+        )
+
+    # Hash + dedupe the (path, data_type, name) triple, same as the owner path.
+    manifest = manifest.with_columns(manifest.select(["path", "data_type", "name"]).hash_rows().alias("_triple_k"))
+    triples_df = manifest.select(["path", "data_type", "name", "_triple_k"]).unique(subset=["_triple_k"])
+    miss_keys = triples_df["_triple_k"].to_list()
+    miss_triples: list[tuple[str, str, str]] = list(
+        zip(triples_df["path"].to_list(), triples_df["data_type"].to_list(), triples_df["name"].to_list(), strict=True)
+    )
+
+    unique_paths = list({t[0] for t in miss_triples})
+    rows = conn.execute(
+        """
+        SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention
+        FROM energydb.node n
+        JOIN energydb.series s ON s.node_uuid = n.uuid
+        WHERE n.path = ANY(%s)
+        """,
+        (unique_paths,),
+    ).fetchall()
+    triple_to_meta: dict[tuple[str, str, str], tuple] = {}
+    for path, dt, name, sid, unit, ts_type, retention in rows:
+        triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention)
+
+    for path, dt, name in miss_triples:
+        if (path, dt, name) not in triple_to_meta:
+            raise ValueError(f"Series not registered for path={path!r}, data_type={dt!r}, name={name!r}.")
+
+    hash_to_meta: dict[int, tuple] = {
+        hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+    }
+    metas = list(hash_to_meta.values())
+    lookup_df = pl.DataFrame(
+        {
+            "_triple_k": list(hash_to_meta.keys()),
+            "series_id": [m[0] for m in metas],
+            "retention": [m[3] for m in metas],
+            "canonical_unit": [m[1] for m in metas],
+        },
+        schema={"_triple_k": pl.UInt64, "series_id": pl.Int64, "retention": pl.Utf8, "canonical_unit": pl.Utf8},
+    )
+    overlap = [c for c in lookup_df.columns if c != "_triple_k" and c in manifest.columns]
+    if overlap:
+        manifest = manifest.drop(overlap)
+    resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
+    summary = ResolveSummary(has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()))
     return resolved, summary
 
 
