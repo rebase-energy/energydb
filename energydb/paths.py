@@ -18,6 +18,8 @@ from uuid import UUID
 
 import polars as pl
 
+from energydb.runs import RunRow, run_upsert_cte, upsert_run_row
+
 
 class ResolveSummary(NamedTuple):
     """Set-level signals derived during :func:`resolve_manifest`.
@@ -246,7 +248,9 @@ _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 
 
-def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) -> tuple[pl.DataFrame, ResolveSummary]:
+def resolve_manifest(
+    conn, manifest: pl.DataFrame, *, attach_path: bool = True, run: RunRow | None = None
+) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
     Detects routing mode from the columns present:
@@ -282,17 +286,26 @@ def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) 
 
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
+    # ``run`` (write pipelines only) upserts the energydb.runs row in the same
+    # call: folded into the path resolve as a data-modifying CTE (one round-trip),
+    # or run standalone for the owner routes that can't fold it.
     if route == "edge_uuid":
-        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
+        resolved, summary = _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
+        if run is not None:
+            upsert_run_row(conn, run)
+        return resolved, summary
     if route == "path":
-        # Write pipelines (attach_path=False) collapse path → series in ONE
-        # round-trip. Read pipelines keep the two-step (resolve path→uuid, then
-        # the owner scan) because the post-read hierarchy attach needs
-        # ``node_uuid`` surfaced on the resolved frame.
+        # Write pipelines (attach_path=False) collapse path → series (and the run
+        # upsert) into ONE round-trip. Read pipelines keep the two-step (resolve
+        # path→uuid, then the owner scan) because the post-read hierarchy attach
+        # needs ``node_uuid`` surfaced on the resolved frame.
         if not attach_path:
-            return _resolve_manifest_by_path(conn, manifest)
+            return _resolve_manifest_by_path(conn, manifest, run=run)
         manifest = _attach_node_uuid_from_path(conn, manifest)
-    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
+    resolved, summary = _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
+    if run is not None:
+        upsert_run_row(conn, run)
+    return resolved, summary
 
 
 def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
@@ -493,7 +506,9 @@ def _resolve_manifest_by_owner(
     return resolved, summary
 
 
-def _resolve_manifest_by_path(conn, manifest: pl.DataFrame) -> tuple[pl.DataFrame, ResolveSummary]:
+def _resolve_manifest_by_path(
+    conn, manifest: pl.DataFrame, *, run: RunRow | None = None
+) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a path-routed *write* manifest to series in ONE round-trip.
 
     Collapses the former two-step path resolve (:func:`resolve_paths_to_uuids`,
@@ -526,14 +541,20 @@ def _resolve_manifest_by_path(conn, manifest: pl.DataFrame) -> tuple[pl.DataFram
     )
 
     unique_paths = list({t[0] for t in miss_triples})
+    # Optionally fold the runs upsert into this same statement (one round-trip)
+    # as a leading data-modifying CTE; its params bind before the path ANY().
+    cte_sql, cte_params = ("", ())
+    if run is not None:
+        cte_sql, cte_params = run_upsert_cte(run)
     rows = conn.execute(
-        """
+        cte_sql
+        + """
         SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention
         FROM energydb.node n
         JOIN energydb.series s ON s.node_uuid = n.uuid
         WHERE n.path = ANY(%s)
         """,
-        (unique_paths,),
+        (*cte_params, unique_paths),
     ).fetchall()
     triple_to_meta: dict[tuple[str, str, str], tuple] = {}
     for path, dt, name, sid, unit, ts_type, retention in rows:

@@ -222,14 +222,15 @@ def _attach_routing(
     df: pl.DataFrame,
     *,
     owner_col: str,
-    owner_val: UUID,
+    owner_val: UUID | str,
     data_type: str,
     name: str,
     unit: str | None,
 ) -> pl.DataFrame:
     """Attach the routing columns required by the manifest pipeline.
 
-    ``owner_col`` is one of ``"node_uuid"`` / ``"edge_uuid"``. UUIDs are
+    ``owner_col`` is one of ``"node_uuid"`` / ``"edge_uuid"`` (a UUID owner) or
+    ``"path"`` (a ``/``-joined materialized path string). Owner values are
     serialized as strings on the manifest so polars-side joins work cleanly.
     """
     cols = [
@@ -287,6 +288,15 @@ class _BaseScope:
 
     def _resolve_uuid(self, conn) -> UUID:
         raise NotImplementedError
+
+    def _write_route(self) -> tuple[str, str] | None:
+        """Routing for ``write()`` that needs no DB call, or ``None``.
+
+        Default ``None`` → ``write()`` resolves the owner uuid (one PG
+        round-trip). :class:`NodeScope` overrides this to route a path-addressed
+        write by its materialized path, collapsing the resolve to one round-trip.
+        """
+        return None
 
     def _fetch_snapshot(self, conn, uuid_: UUID):
         raise NotImplementedError
@@ -418,14 +428,22 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("write")
-        with self._use_conn() as conn:
-            owner_val = self._resolve_uuid(conn)
+        # A path-addressed NodeScope routes by its materialized path, so the
+        # manifest resolve + runs upsert collapse to ONE PG round-trip
+        # (resolve_manifest's path route) and the separate uuid resolve is skipped.
+        route = self._write_route()
+        if route is not None:
+            owner_col, owner_val = route
+        else:
+            with self._use_conn() as conn:
+                owner_val = self._resolve_uuid(conn)
+            owner_col = self._owner_col
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             df_pl = to_polars(df)
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
             manifest = _attach_routing(
                 df_pl,
-                owner_col=self._owner_col,
+                owner_col=owner_col,
                 owner_val=owner_val,
                 data_type=data_type,
                 name=name,
@@ -557,6 +575,11 @@ class NodeScope(_BaseScope):
     """
 
     _owner_col = "node_uuid"
+
+    def _write_route(self) -> tuple[str, str] | None:
+        # Path-addressed → route by materialized path (one-round-trip folded
+        # resolve + runs upsert). uuid-addressed scopes fall back to the uuid resolve.
+        return ("path", "/".join(self._path)) if self._path else None
 
     def __init__(
         self,

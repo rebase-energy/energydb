@@ -99,31 +99,32 @@ def write_manifest(
     — an ``int`` run_id carrying ``written`` / ``skipped`` counts.
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
+    run = runs_mod.RunRow(
+        run_id=rid,
+        workflow_id=workflow_id,
+        model_name=model_name,
+        run_start_time=run_start_time or datetime.now(UTC),
+        run_finish_time=run_finish_time,
+        run_params=run_params,
+    )
 
     with pool.connection() as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            # Writes drop path / edge meta before the CH insert anyway, so
-            # skip the hierarchy JOIN — saves ~20ms PG-side at scale=200.
-            resolved, summary = resolve_manifest(conn, df, attach_path=False)
+            # Writes drop path / edge meta before the CH insert anyway, so skip the
+            # hierarchy JOIN. ``run`` folds the energydb.runs upsert into this same
+            # query (path route → one round-trip; owner routes → a second statement).
+            resolved, summary = resolve_manifest(conn, df, attach_path=False, run=run)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
+        # Raising here (before commit) rolls back the folded run upsert too — a bad
+        # call records no run, same as before the fold.
         if summary.has_overlapping and knowledge_time is None and "knowledge_time" not in resolved.columns:
             raise ValueError(
                 "knowledge_time is required for OVERLAPPING series; "
                 "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
             )
 
-        with profiling._phase(profiling.PHASE_EDB_RUNS_UPSERT):
-            runs_mod.upsert_run(
-                conn,
-                run_id=rid,
-                workflow_id=workflow_id,
-                model_name=model_name,
-                run_start_time=run_start_time or datetime.now(UTC),
-                run_finish_time=run_finish_time,
-                run_params=run_params,
-            )
-            conn.commit()
+        conn.commit()
 
     if "unit" in resolved.columns:
         with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):

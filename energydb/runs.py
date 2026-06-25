@@ -8,10 +8,68 @@ row, and calls ``td.write`` with that id already stamped on the dataframe.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from psycopg.types.json import Jsonb
 from uuid6 import uuid7
+
+
+class RunRow(NamedTuple):
+    """The columns of an ``energydb.runs`` upsert, carried as one value.
+
+    Lets the write path fold the run upsert into the manifest-resolve query
+    (one round-trip) via :func:`run_upsert_cte`, or run it standalone via
+    :func:`upsert_run_row`."""
+
+    run_id: int
+    workflow_id: str | None = None
+    model_name: str | None = None
+    run_start_time: datetime | None = None
+    run_finish_time: datetime | None = None
+    run_params: dict | None = None
+
+
+# INSERT … ON CONFLICT body, shared by the standalone upsert and the foldable
+# CTE. Idempotent under retry; immutable run identity keyed by run_id.
+_RUN_UPSERT_BODY = """INSERT INTO energydb.runs
+            (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (run_id) DO UPDATE SET
+            workflow_id     = EXCLUDED.workflow_id,
+            model_name      = EXCLUDED.model_name,
+            run_start_time  = EXCLUDED.run_start_time,
+            run_finish_time = EXCLUDED.run_finish_time,
+            run_params      = EXCLUDED.run_params"""
+
+
+def _run_params(run: RunRow) -> tuple:
+    if run.run_start_time is not None and run.run_start_time.tzinfo is None:
+        raise ValueError("run_start_time must be timezone-aware")
+    if run.run_finish_time is not None and run.run_finish_time.tzinfo is None:
+        raise ValueError("run_finish_time must be timezone-aware")
+    return (
+        run.run_id,
+        run.workflow_id,
+        run.model_name,
+        run.run_start_time,
+        run.run_finish_time,
+        Jsonb(run.run_params or {}),
+    )
+
+
+def run_upsert_cte(run: RunRow) -> tuple[str, tuple]:
+    """A data-modifying CTE that upserts ``run``, to prepend to another query.
+
+    Postgres executes a ``WITH … AS (INSERT …)`` exactly once, even when the
+    main query never references it — so the run is recorded regardless of what
+    the folded SELECT returns (preserves "an all-skipped write still records a
+    run"). Returns ``(cte_sql, params)``; the params bind before the rest."""
+    return f"WITH run_ins AS (\n        {_RUN_UPSERT_BODY}\n    )\n", _run_params(run)
+
+
+def upsert_run_row(conn, run: RunRow) -> None:
+    """Standalone run upsert (the non-folded path, e.g. owner-routed writes)."""
+    conn.execute(_RUN_UPSERT_BODY, _run_params(run))
 
 
 def generate_run_id() -> int:
@@ -35,31 +93,9 @@ def upsert_run(
     run_params: dict | None = None,
 ) -> None:
     """Insert or update a run row. Idempotent under retry."""
-    if run_start_time is not None and run_start_time.tzinfo is None:
-        raise ValueError("run_start_time must be timezone-aware")
-    if run_finish_time is not None and run_finish_time.tzinfo is None:
-        raise ValueError("run_finish_time must be timezone-aware")
-
-    conn.execute(
-        """
-        INSERT INTO energydb.runs
-            (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (run_id) DO UPDATE SET
-            workflow_id     = EXCLUDED.workflow_id,
-            model_name      = EXCLUDED.model_name,
-            run_start_time  = EXCLUDED.run_start_time,
-            run_finish_time = EXCLUDED.run_finish_time,
-            run_params      = EXCLUDED.run_params
-        """,
-        (
-            run_id,
-            workflow_id,
-            model_name,
-            run_start_time,
-            run_finish_time,
-            Jsonb(run_params or {}),
-        ),
+    upsert_run_row(
+        conn,
+        RunRow(run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params),
     )
 
 
