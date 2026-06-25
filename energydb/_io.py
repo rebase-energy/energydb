@@ -10,6 +10,7 @@ read pipeline and one write pipeline in the library.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -70,7 +71,7 @@ class WriteResult(int):
         return f"WriteResult(run_id={int(self)}, written={self.written}, skipped={self.skipped})"
 
 
-def write_manifest(
+async def write_manifest(
     pool,
     td,
     df: pl.DataFrame,
@@ -100,11 +101,11 @@ def write_manifest(
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
 
-    with pool.connection() as conn:
+    async with pool.connection() as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             # Writes drop path / edge meta before the CH insert anyway, so
             # skip the hierarchy JOIN — saves ~20ms PG-side at scale=200.
-            resolved, summary = resolve_manifest(conn, df, attach_path=False)
+            resolved, summary = await resolve_manifest(conn, df, attach_path=False)
 
         # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
         if summary.has_overlapping and knowledge_time is None and "knowledge_time" not in resolved.columns:
@@ -114,7 +115,7 @@ def write_manifest(
             )
 
         with profiling._phase(profiling.PHASE_EDB_RUNS_UPSERT):
-            runs_mod.upsert_run(
+            await runs_mod.upsert_run(
                 conn,
                 run_id=rid,
                 workflow_id=workflow_id,
@@ -123,7 +124,7 @@ def write_manifest(
                 run_finish_time=run_finish_time,
                 run_params=run_params,
             )
-            conn.commit()
+            await conn.commit()
 
     if "unit" in resolved.columns:
         with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
@@ -134,8 +135,11 @@ def write_manifest(
         write_df = resolved.select(keep).with_columns(pl.lit(rid, dtype=pl.Int64).alias("run_id"))
 
     # PG state is committed; CH write happens after. A CH failure leaves an
-    # orphaned runs row but no PG inconsistency — detectable by run_id.
-    counts = td.write(
+    # orphaned runs row but no PG inconsistency — detectable by run_id. TimeDB is
+    # synchronous (clickhouse-connect), so offload the CH leg to a worker thread
+    # to keep the event loop free.
+    counts = await asyncio.to_thread(
+        td.write,
         write_df,
         knowledge_time=knowledge_time,
         skip_unchanged=skip_unchanged,
@@ -149,7 +153,7 @@ def write_manifest(
 # ---------------------------------------------------------------------------
 
 
-def _execute_read(
+async def _execute_read(
     pool,
     meta: pl.DataFrame,
     td_call: Callable[[list[int], list[str]], pl.DataFrame],
@@ -171,7 +175,9 @@ def _execute_read(
 
     series_ids = meta["series_id"].unique().to_list()
     retentions = meta["retention"].unique().to_list()
-    result = td_call(series_ids, retentions)
+    # TimeDB (clickhouse-connect) is synchronous — offload the CH read so the
+    # event loop stays free.
+    result = await asyncio.to_thread(td_call, series_ids, retentions)
 
     if unit is not None and not result.is_empty():
         with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
@@ -195,7 +201,7 @@ def _execute_read(
         return attach_node_hierarchy(pool, result, meta)
 
 
-def _read_pipeline(
+async def _read_pipeline(
     pool,
     manifest: pl.DataFrame,
     td_call: Callable[[list[int], list[str]], pl.DataFrame],
@@ -210,14 +216,14 @@ def _read_pipeline(
     meta they already have from the scope's PG resolve.
     """
     is_edge = "edge_uuid" in manifest.columns
-    with pool.connection() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
-        resolved, _summary = resolve_manifest(conn, manifest)
+    async with pool.connection() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
+        resolved, _summary = await resolve_manifest(conn, manifest)
     with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
         meta = _meta_from_resolved(resolved, is_edge=is_edge)
-    return _execute_read(pool, meta, td_call, unit=unit, output=output)
+    return await _execute_read(pool, meta, td_call, unit=unit, output=output)
 
 
-def read_resolved(
+async def read_resolved(
     pool,
     td,
     meta: pl.DataFrame,
@@ -250,10 +256,10 @@ def read_resolved(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return _execute_read(pool, meta, _call, unit=unit, output=output)
+    return await _execute_read(pool, meta, _call, unit=unit, output=output)
 
 
-def read_relative_resolved(
+async def read_relative_resolved(
     pool,
     td,
     meta: pl.DataFrame,
@@ -267,7 +273,7 @@ def read_relative_resolved(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return _execute_read(pool, meta, _call, unit=unit, output=output)
+    return await _execute_read(pool, meta, _call, unit=unit, output=output)
 
 
 def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
@@ -293,7 +299,7 @@ def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFram
     return resolved.select(cols).unique()
 
 
-def read_manifest(
+async def read_manifest(
     pool,
     td,
     manifest: pl.DataFrame,
@@ -326,10 +332,10 @@ def read_manifest(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return _read_pipeline(pool, manifest, _call, unit=unit, output=output)
+    return await _read_pipeline(pool, manifest, _call, unit=unit, output=output)
 
 
-def read_relative_manifest(
+async def read_relative_manifest(
     pool,
     td,
     manifest: pl.DataFrame,
@@ -348,7 +354,7 @@ def read_relative_manifest(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return _read_pipeline(pool, manifest, _call, unit=unit, output=output)
+    return await _read_pipeline(pool, manifest, _call, unit=unit, output=output)
 
 
 def apply_per_series_unit(

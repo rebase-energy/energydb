@@ -68,7 +68,7 @@ def validate_name(name: str, *, kind: str) -> None:
         )
 
 
-def register_series(
+async def register_series(
     conn,
     *,
     owner_col: OwnerCol,
@@ -101,27 +101,31 @@ def register_series(
     edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
     conflict_constraint = _CONFLICT_CONSTRAINT_BY_OWNER[owner_col]
 
-    row = conn.execute(
-        f"""
-        INSERT INTO series
-            (node_uuid, edge_uuid, data_type, name, canonical_unit,
-             timeseries_type, retention, description)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
-        RETURNING series_id
-        """,
-        (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
+    row = await (
+        await conn.execute(
+            f"""
+            INSERT INTO series
+                (node_uuid, edge_uuid, data_type, name, canonical_unit,
+                 timeseries_type, retention, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
+            RETURNING series_id
+            """,
+            (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
+        )
     ).fetchone()
 
     if row is not None:
         return row[0]
 
     # Conflict: fetch the existing row and verify the immutable fields agree.
-    existing = conn.execute(
-        f"SELECT series_id, canonical_unit, retention "
-        f"FROM series "
-        f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
-        (owner_uuid, data_type, name),
+    existing = await (
+        await conn.execute(
+            f"SELECT series_id, canonical_unit, retention "
+            f"FROM series "
+            f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
+            (owner_uuid, data_type, name),
+        )
     ).fetchone()
     if existing is None:
         raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
@@ -137,7 +141,7 @@ def register_series(
     return existing_sid
 
 
-def resolve_for_read(
+async def resolve_for_read(
     conn,
     *,
     owner_col: OwnerCol,
@@ -185,7 +189,7 @@ def resolve_for_read(
         "FROM series s " + join_sql + " "
         "WHERE " + " AND ".join(conditions)
     )
-    rows = conn.execute(sql, params).fetchall()
+    rows = await (await conn.execute(sql, params)).fetchall()
 
     if owner_col == "node_uuid":
         return pl.DataFrame(

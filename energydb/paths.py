@@ -54,7 +54,7 @@ def _like_escape(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UUID:
+async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UUID:
     """Resolve a path tuple like ``("Europe", "Sweden", "Lillgrund")`` to a uuid.
 
     Single indexed equality on the materialized ``node.path`` column
@@ -69,19 +69,19 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
 
     joined = "/".join(path)
     if start_uuid is None:
-        row = conn.execute(
+        row = await (await conn.execute(
             "SELECT uuid FROM node WHERE path = %s",
             (joined,),
-        ).fetchone()
+        )).fetchone()
     else:
         # One round-trip: derive the start node's path inline and compose.
-        row = conn.execute(
+        row = await (await conn.execute(
             """
             SELECT n.uuid FROM node n, node s
             WHERE s.uuid = %s AND n.path = s.path || '/' || %s
             """,
             (start_uuid, joined),
-        ).fetchone()
+        )).fetchone()
 
     if row is None:
         if start_uuid is None:
@@ -90,7 +90,7 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
     return row[0]
 
 
-def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
+async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
     """Bulk-resolve a list of path tuples to uuids in one round-trip.
 
     Joins each tuple with ``/`` and hits the unique ``node.path`` index in
@@ -110,10 +110,10 @@ def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
             unique.append(t)
 
     joined_keys = ["/".join(p) for p in unique]
-    rows = conn.execute(
+    rows = await (await conn.execute(
         "SELECT path, uuid FROM node WHERE path = ANY(%s)",
         (joined_keys,),
-    ).fetchall()
+    )).fetchall()
 
     out: dict[Path, UUID] = {}
     by_joined = {row[0]: row[1] for row in rows}
@@ -173,7 +173,7 @@ def build_filter_conditions(
 # ---------------------------------------------------------------------------
 
 
-def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
+async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     """Return self + every descendant uuid for ``node_uuid``.
 
     Two PG round-trips: the root path lookup, then a prefix-LIKE on the
@@ -183,20 +183,20 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     LIKE would force a Seq Scan. Net 2.4× faster than the single-query
     self-join on bench-scale data (44 ms → 18 ms at C=200).
     """
-    row = conn.execute(
+    row = await (await conn.execute(
         "SELECT path FROM node WHERE uuid = %s",
         (node_uuid,),
-    ).fetchone()
+    )).fetchone()
     if row is None:
         return []
     prefix = row[0]
-    rows = conn.execute(
+    rows = await (await conn.execute(
         r"""
         SELECT uuid FROM node
         WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
         """,
         (prefix, _like_escape(prefix)),
-    ).fetchall()
+    )).fetchall()
     return [r[0] for r in rows]
 
 
@@ -205,12 +205,12 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_path(conn, node_uuid: UUID) -> Path:
+async def resolve_path(conn, node_uuid: UUID) -> Path:
     """Return the full path tuple from root → node."""
-    row = conn.execute(
+    row = await (await conn.execute(
         "SELECT path FROM node WHERE uuid = %s",
         (node_uuid,),
-    ).fetchone()
+    )).fetchone()
     if row is None:
         raise ValueError(f"Node not found: uuid={node_uuid}")
     return tuple(row[0].split("/"))
@@ -221,15 +221,15 @@ def resolve_path(conn, node_uuid: UUID) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str) -> UUID:
+async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str) -> UUID:
     """Resolve an edge by its triple identity to its uuid."""
-    paths = resolve_paths_to_uuids(conn, [from_path, to_path])
+    paths = await resolve_paths_to_uuids(conn, [from_path, to_path])
     from_uuid = paths[tuple(from_path)]
     to_uuid = paths[tuple(to_path)]
-    rows = conn.execute(
+    rows = await (await conn.execute(
         "SELECT uuid FROM edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
         (edge_type, from_uuid, to_uuid),
-    ).fetchall()
+    )).fetchall()
     if not rows:
         raise ValueError(f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}")
     return rows[0][0]
@@ -244,7 +244,9 @@ _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 
 
-def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) -> tuple[pl.DataFrame, ResolveSummary]:
+async def resolve_manifest(
+    conn, manifest: pl.DataFrame, *, attach_path: bool = True
+) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
     Detects routing mode from the columns present:
@@ -281,13 +283,13 @@ def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) 
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     if route == "edge_uuid":
-        return _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
+        return await _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
     if route == "path":
-        manifest = _attach_node_uuid_from_path(conn, manifest)
-    return _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
+        manifest = await _attach_node_uuid_from_path(conn, manifest)
+    return await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
 
 
-def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
+async def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     """Resolve every ``path`` (Utf8, joined with ``/``) to a ``node_uuid`` and attach it.
 
     The manifest ``path`` column must be ``Utf8`` — strings like ``"a/b/c"``.
@@ -309,7 +311,7 @@ def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
         return manifest.with_columns(pl.lit(None, dtype=pl.Utf8).cast(pl.Utf8).alias("node_uuid"))
 
     miss_tuples = [tuple(p.split("/")) for p in unique_paths_str]
-    pg_map = resolve_paths_to_uuids(conn, miss_tuples)
+    pg_map = await resolve_paths_to_uuids(conn, miss_tuples)
     path_to_uuid_str: dict[str, str] = {
         "/".join(path_tuple): str(node_uuid) for path_tuple, node_uuid in pg_map.items()
     }
@@ -347,7 +349,7 @@ _OWNER_PATH_SELECT = {
 }
 
 
-def _resolve_manifest_by_owner(
+async def _resolve_manifest_by_owner(
     conn,
     manifest: pl.DataFrame,
     *,
@@ -416,7 +418,7 @@ def _resolve_manifest_by_owner(
     # per-row UUID-object parse.
     unique_owners = list({t[0] for t in miss_triples})
     extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
-    rows = conn.execute(
+    rows = await (await conn.execute(
         f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
@@ -425,7 +427,7 @@ def _resolve_manifest_by_owner(
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,
         (unique_owners,),
-    ).fetchall()
+    )).fetchall()
     # Meta tuple layout:
     #   attach_path=False:  (series_id, canonical_unit, timeseries_type, retention)
     #   node + attach_path: (series_id, canonical_unit, timeseries_type, retention, path)

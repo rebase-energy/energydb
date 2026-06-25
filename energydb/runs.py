@@ -24,7 +24,7 @@ def generate_run_id() -> int:
     return uuid7().int >> 65
 
 
-def upsert_run(
+async def upsert_run(
     conn,
     *,
     run_id: int,
@@ -40,7 +40,7 @@ def upsert_run(
     if run_finish_time is not None and run_finish_time.tzinfo is None:
         raise ValueError("run_finish_time must be timezone-aware")
 
-    conn.execute(
+    await conn.execute(
         """
         INSERT INTO runs
             (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
@@ -63,20 +63,22 @@ def upsert_run(
     )
 
 
-def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
+async def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
     """Hydrate run metadata by id. Returns matched rows ordered by
     ``inserted_at`` descending (latest run first)."""
     if not run_ids:
         return []
-    rows = conn.execute(
-        """
-        SELECT run_id, workflow_id, model_name, run_start_time, run_finish_time,
-               run_params, inserted_at
-        FROM runs
-        WHERE run_id = ANY(%s)
-        ORDER BY inserted_at DESC
-        """,
-        (run_ids,),
+    rows = await (
+        await conn.execute(
+            """
+            SELECT run_id, workflow_id, model_name, run_start_time, run_finish_time,
+                   run_params, inserted_at
+            FROM runs
+            WHERE run_id = ANY(%s)
+            ORDER BY inserted_at DESC
+            """,
+            (run_ids,),
+        )
     ).fetchall()
     return [
         {

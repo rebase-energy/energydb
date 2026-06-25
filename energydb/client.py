@@ -83,14 +83,14 @@ class Client:
             )
         self._dsn = conninfo
 
-        def _configure(conn):
-            conn.execute(_SEARCH_PATH)
+        async def _configure(conn):
+            await conn.execute(_SEARCH_PATH)
             # ``prepare_threshold=1`` makes psycopg cache a server-side
             # prepared statement after the first execution of each SQL text.
             # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
             # (PG parse+plan stage skipped on subsequent calls).
             conn.prepare_threshold = 1
-            conn.commit()
+            await conn.commit()
 
         self._pool = ConnectionPool(
             conninfo=conninfo,
@@ -138,7 +138,7 @@ class Client:
 
         self.td.create()
 
-    def delete(self) -> None:
+    async def delete(self) -> None:
         """Drop EnergyDB's tables and CH tables.
 
         With a named schema, drops the whole schema (CASCADE). With the
@@ -146,12 +146,12 @@ class Client:
         own four tables — never the shared ``public`` schema, which would take
         the host application's tables with it.
         """
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             if SCHEMA is None:
-                conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
             else:
-                conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
-            conn.commit()
+                await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            await conn.commit()
         self.td.delete()
 
     def close(self) -> None:
@@ -238,7 +238,7 @@ class Client:
     # Structure — register_tree, edges, queries
     # ------------------------------------------------------------------
 
-    def register_tree(
+    async def register_tree(
         self,
         edm_obj,
         *,
@@ -271,7 +271,7 @@ class Client:
         Returns the ``uuid`` of the tree's root, except when
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
         """
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             parent_uuid = resolve_node_uuid(conn, _coerce_path((), kwarg=under)) if under is not None else None
             root_uuid, diff = register_tree_under(
                 conn,
@@ -280,14 +280,14 @@ class Client:
                 dry_run=dry_run,
             )
             if dry_run:
-                conn.rollback()
+                await conn.rollback()
             else:
-                conn.commit()
+                await conn.commit()
         if dry_run:
             return diff
         return root_uuid
 
-    def query_nodes(
+    async def query_nodes(
         self,
         *,
         type: str | None = None,
@@ -303,7 +303,7 @@ class Client:
         if type is not None:
             where_filters["node_type"] = type
 
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
             conditions: list[str] = list(filter_conds)
             params: list[Any] = list(filter_params)
@@ -316,14 +316,14 @@ class Client:
                 params.append(resolve_subtree_uuids(conn, within_uuid))
 
             where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = conn.execute(
+            rows = await (await conn.execute(
                 f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
                 params,
-            ).fetchall()
+            )).fetchall()
 
         return [reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]}) for r in rows]
 
-    def create_edge(self, edm_obj) -> UUID:
+    async def create_edge(self, edm_obj) -> UUID:
         """Upsert an edge between two existing nodes. Idempotent.
 
         The edge's :class:`Reference` endpoints (``from_element`` /
@@ -335,16 +335,16 @@ class Client:
         it walks the structure and validates endpoints against the tree's
         index in one pass.
         """
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             edge_uuid = create_edge(conn, edm_obj, tree_root=None)
-            conn.commit()
+            await conn.commit()
         return edge_uuid
 
     # ------------------------------------------------------------------
     # Generic raw node API — store/read by (node_type, data), no EDM class
     # ------------------------------------------------------------------
 
-    def create_node(
+    async def create_node(
         self,
         *,
         node_type: str,
@@ -363,7 +363,7 @@ class Client:
         ``NodeScope.children()`` — not the EDM readers, which require a
         registered type.
         """
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             if parent is None:
                 parent_uuid = None
             elif isinstance(parent, UUID):
@@ -378,22 +378,22 @@ class Client:
                 parent_uuid=parent_uuid,
                 uuid=uuid,
             )
-            conn.commit()
+            await conn.commit()
         return new_uuid
 
-    def get_node_raw(self, node_uuid: UUID) -> dict | None:
+    async def get_node_raw(self, node_uuid: UUID) -> dict | None:
         """Fetch one node as a raw dict, without EDM reconstruction.
 
         Returns ``{uuid, node_type, name, data, parent_uuid}`` or ``None`` if
         the node does not exist. Safe for any ``node_type`` string, unlike
         :meth:`get_node` / :meth:`get_tree`.
         """
-        with self._pool.connection() as conn:
-            row = conn.execute(
+        async with self._pool.connection() as conn:
+            row = await (await conn.execute(
                 "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
                 "FROM node WHERE uuid = %s",
                 (node_uuid,),
-            ).fetchone()
+            )).fetchone()
         if row is None:
             return None
         return {
@@ -407,22 +407,22 @@ class Client:
             "updated_at": row[7],
         }
 
-    def get_subtree_raw(self, root_uuid: UUID) -> list[dict]:
+    async def get_subtree_raw(self, root_uuid: UUID) -> list[dict]:
         """Return the node + every descendant as raw dicts (no EDM reconstruction).
 
         Indexed materialized-path prefix scan (``ix_node_path_prefix``). Each
         dict is ``{uuid, node_type, name, data, parent_uuid, path}``. Includes
         the root itself; empty list if the root does not exist.
         """
-        with self._pool.connection() as conn:
-            root = conn.execute(
+        async with self._pool.connection() as conn:
+            root = await (await conn.execute(
                 "SELECT path FROM node WHERE uuid = %s",
                 (root_uuid,),
-            ).fetchone()
+            )).fetchone()
             if root is None:
                 return []
             root_path = root[0]
-            rows = conn.execute(
+            rows = await (await conn.execute(
                 r"""
                 SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at
                 FROM node
@@ -430,7 +430,7 @@ class Client:
                 ORDER BY path
                 """,
                 (root_path, _like_escape(root_path)),
-            ).fetchall()
+            )).fetchall()
         return [
             {
                 "uuid": r[0],
@@ -445,7 +445,7 @@ class Client:
             for r in rows
         ]
 
-    def list_series(self, owner_uuid: UUID, *, owner_col: str = "node_uuid") -> list[dict]:
+    async def list_series(self, owner_uuid: UUID, *, owner_col: str = "node_uuid") -> list[dict]:
         """List the series catalog owned by a node (or edge).
 
         Returns ``{name, data_type, canonical_unit, timeseries_type,
@@ -454,12 +454,12 @@ class Client:
         """
         if owner_col not in ("node_uuid", "edge_uuid"):
             raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
-        with self._pool.connection() as conn:
-            rows = conn.execute(
+        async with self._pool.connection() as conn:
+            rows = await (await conn.execute(
                 f"SELECT name, data_type, canonical_unit, timeseries_type, description "
                 f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
                 (owner_uuid,),
-            ).fetchall()
+            )).fetchall()
         return [
             {
                 "name": r[0],
@@ -471,7 +471,7 @@ class Client:
             for r in rows
         ]
 
-    def query_edges(
+    async def query_edges(
         self,
         *,
         type: str | None = None,
@@ -488,7 +488,7 @@ class Client:
         if type is not None:
             where_filters["edge_type"] = type
 
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
             conditions: list[str] = list(filter_conds)
             params: list[Any] = list(filter_params)
@@ -503,11 +503,11 @@ class Client:
                 params.append(subtree)
 
             where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = conn.execute(
+            rows = await (await conn.execute(
                 f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
                 f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
                 params,
-            ).fetchall()
+            )).fetchall()
             if not rows:
                 return []
 
@@ -529,7 +529,7 @@ class Client:
     # Tree reconstruction
     # ------------------------------------------------------------------
 
-    def get_tree(
+    async def get_tree(
         self,
         *names_or_path,
         uuid: UUID | None = None,
@@ -547,7 +547,7 @@ class Client:
         outside the tree shape — query them separately with
         :meth:`get_edge` or :meth:`query_edges`.
         """
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             if uuid is not None:
                 root_uuid = uuid
             elif names_or_path:
@@ -558,21 +558,21 @@ class Client:
             # Two-step: fetch the root's path, then LIKE with the escaped
             # prefix as a bind param so PG picks Index Scan on
             # ``ix_node_path_prefix``. A column-source LIKE would Seq Scan.
-            root_path_row = conn.execute(
+            root_path_row = await (await conn.execute(
                 "SELECT path FROM node WHERE uuid = %s",
                 (root_uuid,),
-            ).fetchone()
+            )).fetchone()
             if root_path_row is None:
                 raise ValueError(f"Node not found: uuid={root_uuid}")
             root_path = root_path_row[0]
-            rows = conn.execute(
+            rows = await (await conn.execute(
                 r"""
                 SELECT uuid, node_type, name, data, parent_uuid
                 FROM node
                 WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
                 (root_path, _like_escape(root_path)),
-            ).fetchall()
+            )).fetchall()
 
             nodes: dict[UUID, Any] = {}
             parent_map: dict[UUID, UUID | None] = {}
@@ -582,11 +582,11 @@ class Client:
                 nodes[node_uuid] = reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]})
 
             if include_series:
-                series_rows = conn.execute(
+                series_rows = await (await conn.execute(
                     "SELECT node_uuid, data_type, name, canonical_unit, timeseries_type, description "
                     "FROM series WHERE node_uuid = ANY(%s)",
                     (list(nodes.keys()),),
-                ).fetchall()
+                )).fetchall()
                 for nid, dt, sname, unit, tstype, desc in series_rows:
                     node_obj = nodes.get(nid)
                     if node_obj is None:
@@ -766,12 +766,12 @@ class Client:
     # Runs
     # ------------------------------------------------------------------
 
-    def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
+    async def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
         """Return runs that wrote data for a given series_id, latest first."""
         run_ids = self.td.read_run_series(series_id=series_id)
         if not run_ids:
             return []
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             return runs_mod.get_runs(conn, run_ids)
 
     # ------------------------------------------------------------------

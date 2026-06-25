@@ -59,16 +59,16 @@ class Transaction:
         self._conn = self._pool_cm.__enter__()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    async def __exit__(self, exc_type, exc, tb):
         assert self._conn is not None and self._pool_cm is not None
         try:
             if exc_type is not None:
                 # User code raised — rollback and let the exception propagate.
-                self._conn.rollback()
+                await self._conn.rollback()
                 return False
             if not self._committed:
                 # Clean exit without commit — rollback and raise loudly.
-                self._conn.rollback()
+                await self._conn.rollback()
                 raise RuntimeError(
                     "Transaction exited without .commit(); changes rolled back. "
                     "Call txn.commit() before leaving the with-block, or raise to abort."
@@ -147,10 +147,10 @@ class Transaction:
             edge_changes=list(self._edge_changes),
         )
 
-    def commit(self) -> None:
+    async def commit(self) -> None:
         """Commit the transaction. Required before exiting the with-block."""
         if self._committed:
             raise RuntimeError("Transaction already committed.")
         assert self._conn is not None
-        self._conn.commit()
+        await self._conn.commit()
         self._committed = True
