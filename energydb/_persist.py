@@ -23,7 +23,9 @@ from uuid import UUID
 import energydatamodel as edm
 import polars as pl
 from energydatamodel.reference import Reference
+from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
+from uuid6 import uuid7
 
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
@@ -62,7 +64,7 @@ def create_node(
         path = row_data["name"]
     else:
         parent_row = conn.execute(
-            "SELECT path FROM energydb.node WHERE uuid = %s",
+            "SELECT path FROM node WHERE uuid = %s",
             (parent_uuid,),
         ).fetchone()
         if parent_row is None:
@@ -70,11 +72,49 @@ def create_node(
         path = f"{parent_row[0]}/{row_data['name']}"
 
     conn.execute(
-        "INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
         (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, path, row_data["data"]),
     )
 
     _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
+    return uuid_val
+
+
+def create_node_raw(
+    conn,
+    *,
+    node_type: str,
+    name: str,
+    data: dict | None = None,
+    parent_uuid: UUID | None,
+    uuid: UUID | None = None,
+) -> UUID:
+    """Insert one node from a type slug + ``data`` dict — no EDM object.
+
+    Generic, EDM-free counterpart to :func:`create_node`: ``node_type`` is
+    stored verbatim and the caller's ``data`` becomes the JSONB blob. Mints a
+    uuid7 when ``uuid`` is omitted, validates ``name``, and materializes
+    ``path`` from the parent. Caller controls the transaction (no commit). A
+    colliding ``(parent_uuid, name)`` pair surfaces as a DB uniqueness error.
+    """
+    uuid_val: UUID = uuid if uuid is not None else uuid7()
+    validate_name(name, kind="node")
+
+    if parent_uuid is None:
+        path = name
+    else:
+        parent_row = conn.execute(
+            "SELECT path FROM node WHERE uuid = %s",
+            (parent_uuid,),
+        ).fetchone()
+        if parent_row is None:
+            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
+        path = f"{parent_row[0]}/{name}"
+
+    conn.execute(
+        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+        (uuid_val, node_type, name, parent_uuid, path, Jsonb(data or {})),
+    )
     return uuid_val
 
 
@@ -107,7 +147,7 @@ def create_edge(
 
     row = conn.execute(
         """
-        INSERT INTO energydb.edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
+        INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (uuid) DO UPDATE
           SET name           = EXCLUDED.name,
@@ -115,7 +155,7 @@ def create_edge(
               to_node_uuid   = EXCLUDED.to_node_uuid,
               data           = EXCLUDED.data,
               updated_at     = now()
-          WHERE energydb.edge.edge_type = EXCLUDED.edge_type
+          WHERE edge.edge_type = EXCLUDED.edge_type
         RETURNING uuid
         """,
         (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
@@ -123,7 +163,7 @@ def create_edge(
 
     if row is None:
         existing = conn.execute(
-            "SELECT edge_type FROM energydb.edge WHERE uuid = %s",
+            "SELECT edge_type FROM edge WHERE uuid = %s",
             (uuid_val,),
         ).fetchone()
         if existing is None:
@@ -318,7 +358,7 @@ def _collect_target_state(
 
 
 def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
-    """Return the subset of ``uuids`` that exist in ``energydb.{table}``.
+    """Return the subset of ``uuids`` that exist in ``{table}``.
 
     Lighter than ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids``
     when the caller only needs to know *whether* the rows exist (e.g. the
@@ -329,7 +369,7 @@ def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
     if not uuids:
         return []
     rows = conn.execute(
-        f"SELECT uuid FROM energydb.{table} WHERE uuid = ANY(%s)",
+        f"SELECT uuid FROM {table} WHERE uuid = ANY(%s)",
         (uuids,),
     ).fetchall()
     return [r[0] for r in rows]
@@ -339,7 +379,7 @@ def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
     if not uuids:
         return {}
     rows = conn.execute(
-        "SELECT uuid, node_type, name, parent_uuid, data FROM energydb.node WHERE uuid = ANY(%s)",
+        "SELECT uuid, node_type, name, parent_uuid, data FROM node WHERE uuid = ANY(%s)",
         (uuids,),
     ).fetchall()
     return {
@@ -351,7 +391,7 @@ def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
     if not uuids:
         return {}
     rows = conn.execute(
-        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM energydb.edge WHERE uuid = ANY(%s)",
+        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM edge WHERE uuid = ANY(%s)",
         (uuids,),
     ).fetchall()
     return {

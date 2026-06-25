@@ -1,4 +1,4 @@
-"""Run metadata operations on the ``energydb.runs`` PostgreSQL table.
+"""Run metadata operations on the ``runs`` PostgreSQL table.
 
 ``run_id`` is client-generated (uuid7 truncated to UInt64). This removes the
 round-trip to PG for id allocation: the write path mints an id, upserts the
@@ -42,7 +42,7 @@ def upsert_run(
 
     conn.execute(
         """
-        INSERT INTO energydb.runs
+        INSERT INTO runs
             (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (run_id) DO UPDATE SET
@@ -72,7 +72,7 @@ def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
         """
         SELECT run_id, workflow_id, model_name, run_start_time, run_finish_time,
                run_params, inserted_at
-        FROM energydb.runs
+        FROM runs
         WHERE run_id = ANY(%s)
         ORDER BY inserted_at DESC
         """,

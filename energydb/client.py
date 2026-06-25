@@ -42,9 +42,9 @@ from energydb import runs as runs_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import WriteResult, read_manifest, read_relative_manifest, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
-from energydb._persist import create_edge, register_tree_under
+from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
-from energydb.models import Base
+from energydb.models import SCHEMA, Base
 from energydb.paths import (
     Path,
     _like_escape,
@@ -55,7 +55,7 @@ from energydb.paths import (
 from energydb.scope import EdgeScope, NodeScope, _coerce_path
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
-_SEARCH_PATH = "SET search_path TO energydb, public"
+_SEARCH_PATH = f"SET search_path TO {SCHEMA}, public" if SCHEMA else "SET search_path TO public"
 
 
 class Client:
@@ -139,9 +139,18 @@ class Client:
         self.td.create()
 
     def delete(self) -> None:
-        """Drop PG schema (CASCADE) and CH tables."""
+        """Drop EnergyDB's tables and CH tables.
+
+        With a named schema, drops the whole schema (CASCADE). With the
+        default ``public`` schema (``SCHEMA is None``), drops only EnergyDB's
+        own four tables — never the shared ``public`` schema, which would take
+        the host application's tables with it.
+        """
         with self._pool.connection() as conn:
-            conn.execute("DROP SCHEMA IF EXISTS energydb CASCADE")
+            if SCHEMA is None:
+                conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
+            else:
+                conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             conn.commit()
         self.td.delete()
 
@@ -308,7 +317,7 @@ class Client:
 
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
-                f"SELECT uuid, node_type, name, data FROM energydb.node WHERE {where} ORDER BY name",
+                f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
                 params,
             ).fetchall()
 
@@ -330,6 +339,137 @@ class Client:
             edge_uuid = create_edge(conn, edm_obj, tree_root=None)
             conn.commit()
         return edge_uuid
+
+    # ------------------------------------------------------------------
+    # Generic raw node API — store/read by (node_type, data), no EDM class
+    # ------------------------------------------------------------------
+
+    def create_node(
+        self,
+        *,
+        node_type: str,
+        name: str,
+        data: dict | None = None,
+        parent: UUID | Path | list[str] | str | None = None,
+        uuid: UUID | None = None,
+    ) -> UUID:
+        """Create a single node from a type slug + JSONB ``data`` — no EDM class.
+
+        Generic counterpart to :meth:`register_tree`: ``node_type`` is stored
+        as a free-form string and ``data`` verbatim, bypassing EnergyDataModel
+        (de)serialization. ``parent`` selects the parent node (UUID or path);
+        ``None`` creates a root. ``uuid`` is minted (uuid7) when omitted. Read
+        these nodes back with :meth:`get_node_raw` / :meth:`get_subtree_raw` or
+        ``NodeScope.children()`` — not the EDM readers, which require a
+        registered type.
+        """
+        with self._pool.connection() as conn:
+            if parent is None:
+                parent_uuid = None
+            elif isinstance(parent, UUID):
+                parent_uuid = parent
+            else:
+                parent_uuid = resolve_node_uuid(conn, _coerce_path((), kwarg=parent))
+            new_uuid = create_node_raw(
+                conn,
+                node_type=node_type,
+                name=name,
+                data=data,
+                parent_uuid=parent_uuid,
+                uuid=uuid,
+            )
+            conn.commit()
+        return new_uuid
+
+    def get_node_raw(self, node_uuid: UUID) -> dict | None:
+        """Fetch one node as a raw dict, without EDM reconstruction.
+
+        Returns ``{uuid, node_type, name, data, parent_uuid}`` or ``None`` if
+        the node does not exist. Safe for any ``node_type`` string, unlike
+        :meth:`get_node` / :meth:`get_tree`.
+        """
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
+                "FROM node WHERE uuid = %s",
+                (node_uuid,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "uuid": row[0],
+            "node_type": row[1],
+            "name": row[2],
+            "data": row[3],
+            "parent_uuid": row[4],
+            "path": row[5],
+            "created_at": row[6],
+            "updated_at": row[7],
+        }
+
+    def get_subtree_raw(self, root_uuid: UUID) -> list[dict]:
+        """Return the node + every descendant as raw dicts (no EDM reconstruction).
+
+        Indexed materialized-path prefix scan (``ix_node_path_prefix``). Each
+        dict is ``{uuid, node_type, name, data, parent_uuid, path}``. Includes
+        the root itself; empty list if the root does not exist.
+        """
+        with self._pool.connection() as conn:
+            root = conn.execute(
+                "SELECT path FROM node WHERE uuid = %s",
+                (root_uuid,),
+            ).fetchone()
+            if root is None:
+                return []
+            root_path = root[0]
+            rows = conn.execute(
+                r"""
+                SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at
+                FROM node
+                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
+                ORDER BY path
+                """,
+                (root_path, _like_escape(root_path)),
+            ).fetchall()
+        return [
+            {
+                "uuid": r[0],
+                "node_type": r[1],
+                "name": r[2],
+                "data": r[3],
+                "parent_uuid": r[4],
+                "path": r[5],
+                "created_at": r[6],
+                "updated_at": r[7],
+            }
+            for r in rows
+        ]
+
+    def list_series(self, owner_uuid: UUID, *, owner_col: str = "node_uuid") -> list[dict]:
+        """List the series catalog owned by a node (or edge).
+
+        Returns ``{name, data_type, canonical_unit, timeseries_type,
+        description}`` per series. ``owner_col`` is ``"node_uuid"`` (default)
+        or ``"edge_uuid"``.
+        """
+        if owner_col not in ("node_uuid", "edge_uuid"):
+            raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                f"SELECT name, data_type, canonical_unit, timeseries_type, description "
+                f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
+                (owner_uuid,),
+            ).fetchall()
+        return [
+            {
+                "name": r[0],
+                "data_type": r[1],
+                "canonical_unit": r[2],
+                "timeseries_type": r[3],
+                "description": r[4],
+            }
+            for r in rows
+        ]
 
     def query_edges(
         self,
@@ -365,7 +505,7 @@ class Client:
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = conn.execute(
                 f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
-                f"FROM energydb.edge WHERE {where} ORDER BY name NULLS LAST",
+                f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
                 params,
             ).fetchall()
             if not rows:
@@ -419,7 +559,7 @@ class Client:
             # prefix as a bind param so PG picks Index Scan on
             # ``ix_node_path_prefix``. A column-source LIKE would Seq Scan.
             root_path_row = conn.execute(
-                "SELECT path FROM energydb.node WHERE uuid = %s",
+                "SELECT path FROM node WHERE uuid = %s",
                 (root_uuid,),
             ).fetchone()
             if root_path_row is None:
@@ -428,7 +568,7 @@ class Client:
             rows = conn.execute(
                 r"""
                 SELECT uuid, node_type, name, data, parent_uuid
-                FROM energydb.node
+                FROM node
                 WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
                 (root_path, _like_escape(root_path)),
@@ -444,7 +584,7 @@ class Client:
             if include_series:
                 series_rows = conn.execute(
                     "SELECT node_uuid, data_type, name, canonical_unit, timeseries_type, description "
-                    "FROM energydb.series WHERE node_uuid = ANY(%s)",
+                    "FROM series WHERE node_uuid = ANY(%s)",
                     (list(nodes.keys()),),
                 ).fetchall()
                 for nid, dt, sname, unit, tstype, desc in series_rows:

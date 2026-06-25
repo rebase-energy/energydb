@@ -1,9 +1,10 @@
 """SQLAlchemy declarative models for EnergyDB PostgreSQL tables.
 
-These models are the single schema source of truth — Alembic-friendly. The
-``energydb`` schema, the immutability trigger on ``series``, and the partial
-unique index on root names are all attached as ``DDL`` events on
-``Base.metadata``.
+These models are the single schema source of truth — Alembic-friendly. They
+live in the schema named by ``ENERGYDB_SCHEMA`` (default ``public``). The
+partial unique index on root names is declared in ``Node.__table_args__``;
+series immutability is enforced in Python (see
+:func:`energydb.series.register_series`), not by a DB trigger.
 
 UUID is the primary identity for every row in ``node`` and ``edge``.
 ``parent_uuid`` and ``edge.from_node_uuid`` / ``to_node_uuid`` are FKs by
@@ -16,10 +17,27 @@ does **not** encode them in a CHECK constraint, so adding a tier in timedb
 does not require an energydb migration.
 """
 
+import os
+
 import sqlalchemy as sa
 from sqlalchemy import event
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase
+
+# Schema is configurable at import time via ``ENERGYDB_SCHEMA`` (default
+# ``"public"``). The default co-locates EnergyDB's tables with a host
+# application's tables in ``public``; a named schema isolates them. ``SCHEMA``
+# is ``None`` for ``"public"`` so the ORM tables carry no explicit schema —
+# identical to unqualified host tables, which keeps Alembic autogenerate from
+# churning on a redundant ``schema="public"`` qualifier. Raw SQL relies on the
+# session ``search_path`` (set per connection in ``Client``).
+_SCHEMA_ENV = os.environ.get("ENERGYDB_SCHEMA", "public")
+SCHEMA: str | None = None if _SCHEMA_ENV == "public" else _SCHEMA_ENV
+
+
+def _fk(target: str) -> str:
+    """Schema-qualified foreign-key target string for the ORM models."""
+    return f"{SCHEMA}.{target}" if SCHEMA else target
 
 
 class Base(DeclarativeBase):
@@ -34,7 +52,7 @@ class Node(Base):
     name = sa.Column(sa.Text, nullable=False)
     parent_uuid = sa.Column(
         UUID(as_uuid=True),
-        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
+        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
         nullable=True,
     )
     path = sa.Column(sa.Text, nullable=False)
@@ -60,7 +78,7 @@ class Node(Base):
         ),
         sa.CheckConstraint("name !~ '/' AND length(name) > 0", name="node_name_valid"),
         sa.CheckConstraint("length(path) > 0", name="node_path_nonempty"),
-        {"schema": "energydb"},
+        {"schema": SCHEMA},
     )
 
 
@@ -72,12 +90,12 @@ class Edge(Base):
     name = sa.Column(sa.Text, nullable=True)
     from_node_uuid = sa.Column(
         UUID(as_uuid=True),
-        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
+        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
         nullable=False,
     )
     to_node_uuid = sa.Column(
         UUID(as_uuid=True),
-        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
+        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
         nullable=False,
     )
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
@@ -91,7 +109,7 @@ class Edge(Base):
             "name IS NULL OR (name !~ '/' AND length(name) > 0)",
             name="edge_name_valid",
         ),
-        {"schema": "energydb"},
+        {"schema": SCHEMA},
     )
 
 
@@ -99,9 +117,9 @@ class Series(Base):
     """Polymorphic series owned by either a node or an edge (exactly one).
 
     ``retention``, ``canonical_unit``, and the owner columns are immutable
-    after insert (enforced by DB trigger). ``timeseries_type`` is mutable — a
-    series can legitimately transition from flat to overlapping if the
-    producer changes behavior.
+    after insert (enforced in Python by ``register_series``). ``timeseries_type``
+    is mutable — a series can legitimately transition from flat to overlapping
+    if the producer changes behavior.
 
     ``series_id`` stays BIGINT — it's the timedb-internal handle and never
     leaves the energydb / timedb pair.
@@ -112,12 +130,12 @@ class Series(Base):
     series_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
     node_uuid = sa.Column(
         UUID(as_uuid=True),
-        sa.ForeignKey("energydb.node.uuid", ondelete="CASCADE"),
+        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
         nullable=True,
     )
     edge_uuid = sa.Column(
         UUID(as_uuid=True),
-        sa.ForeignKey("energydb.edge.uuid", ondelete="CASCADE"),
+        sa.ForeignKey(_fk("edge.uuid"), ondelete="CASCADE"),
         nullable=True,
     )
     data_type = sa.Column(sa.Text, nullable=False)
@@ -136,7 +154,7 @@ class Series(Base):
         sa.CheckConstraint("name !~ '/' AND length(name) > 0", name="series_name_valid"),
         sa.Index("ix_series_node_uuid", "node_uuid", postgresql_where=sa.text("node_uuid IS NOT NULL")),
         sa.Index("ix_series_edge_uuid", "edge_uuid", postgresql_where=sa.text("edge_uuid IS NOT NULL")),
-        {"schema": "energydb"},
+        {"schema": SCHEMA},
     )
 
 
@@ -157,84 +175,24 @@ class Run(Base):
 
     __table_args__ = (
         sa.Index("ix_runs_workflow", "workflow_id", "inserted_at", postgresql_using="btree"),
-        {"schema": "energydb"},
+        {"schema": SCHEMA},
     )
 
 
 # ---------------------------------------------------------------------------
-# DDL events — schema, trigger function, immutability trigger
+# DDL events — schema creation only
 # ---------------------------------------------------------------------------
 
-# The ``energydb`` schema has to exist before any of the tables (which all
-# carry ``schema="energydb"`` in their __table_args__) can be created.
-event.listen(
-    Base.metadata,
-    "before_create",
-    sa.DDL("CREATE SCHEMA IF NOT EXISTS energydb"),
-)
-
-# Immutability guard on ``series``: retention, canonical_unit, and the owner
-# columns can't change after insert. Reclassifying a series means registering
-# a new one (preserves CH-side data integrity).
-_SERIES_GUARD_TRIGGER_FN = sa.DDL(
-    """
-    CREATE OR REPLACE FUNCTION energydb._series_guard_immutable()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF NEW.retention      IS DISTINCT FROM OLD.retention
-        OR NEW.canonical_unit IS DISTINCT FROM OLD.canonical_unit
-        OR NEW.node_uuid      IS DISTINCT FROM OLD.node_uuid
-        OR NEW.edge_uuid      IS DISTINCT FROM OLD.edge_uuid THEN
-            RAISE EXCEPTION
-                'energydb.series: retention, canonical_unit, and owner columns '
-                'are immutable. Register a new series to change tier, unit, or '
-                'ownership.';
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-    """
-)
-
-_SERIES_GUARD_TRIGGER = sa.DDL(
-    """
-    DROP TRIGGER IF EXISTS series_guard_immutable ON energydb.series;
-    CREATE TRIGGER series_guard_immutable
-        BEFORE UPDATE ON energydb.series
-        FOR EACH ROW EXECUTE FUNCTION energydb._series_guard_immutable();
-    """
-)
-
-event.listen(
-    Series.__table__,
-    "after_create",
-    _SERIES_GUARD_TRIGGER_FN,
-)
-event.listen(
-    Series.__table__,
-    "after_create",
-    _SERIES_GUARD_TRIGGER,
-)
-
-# LIKE-escape helper. The materialized ``node.path`` column is used as a
-# literal prefix in ``LIKE`` patterns for subtree queries. Names may legally
-# contain ``_`` (and, less commonly, ``%`` / ``\``) which would be interpreted
-# as LIKE metacharacters — escape them at the SQL boundary instead of forcing
-# every read site to do a per-row regex. ``CREATE OR REPLACE`` is idempotent.
-_LIKE_ESC_FN = sa.DDL(
-    r"""
-    CREATE OR REPLACE FUNCTION energydb._like_esc(text)
-    RETURNS text
-    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS $$
-        SELECT replace(replace(replace($1, E'\\', E'\\\\'),
-                               '%%', E'\\%%'),
-                       '_',  E'\\_')
-    $$;
-    """
-)
-
-event.listen(
-    Base.metadata,
-    "after_create",
-    _LIKE_ESC_FN.execute_if(dialect="postgresql"),
-)
+# A named schema must exist before its tables are created. For the default
+# ``public`` schema (``SCHEMA is None``) this is a no-op — ``public`` always
+# exists, and requiring CREATE-on-public privilege would be a needless ask.
+#
+# Series immutability (retention / canonical_unit / owner columns) is enforced
+# in Python by :func:`energydb.series.register_series`; there is intentionally
+# no DB trigger, so the schema is fully Alembic-autogeneratable.
+if SCHEMA is not None:
+    event.listen(
+        Base.metadata,
+        "before_create",
+        sa.DDL(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"),
+    )

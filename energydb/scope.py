@@ -709,14 +709,14 @@ class NodeScope(_BaseScope):
             filter_conds, filter_params = build_filter_conditions(self._where_filters, type_col="node_type")
             extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
             root_path_row = conn.execute(
-                "SELECT path FROM energydb.node WHERE uuid = %s",
+                "SELECT path FROM node WHERE uuid = %s",
                 (root_uuid,),
             ).fetchone()
             if root_path_row is None:
                 return []
             root_path = root_path_row[0]
             sql = rf"""
-                SELECT uuid FROM energydb.node
+                SELECT uuid FROM node
                 WHERE (path = %s OR path LIKE %s || '/%%' ESCAPE '\')
                   {extra}
             """
@@ -731,12 +731,36 @@ class NodeScope(_BaseScope):
         with self._use_conn() as conn:
             node_uuid = self._resolve_node_uuid(conn)
             row = conn.execute(
-                "SELECT uuid, node_type, name, data FROM energydb.node WHERE uuid = %s",
+                "SELECT uuid, node_type, name, data FROM node WHERE uuid = %s",
                 (node_uuid,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"Node not found: uuid={node_uuid}")
             return reconstruct_node({"uuid": row[0], "node_type": row[1], "name": row[2], "data": row[3]})
+
+    def get_raw(self) -> dict | None:
+        """Fetch this node as a raw dict, without EDM reconstruction.
+
+        Returns ``{uuid, node_type, name, data, parent_uuid, path}`` or ``None``
+        if the node does not exist. Use for generic node types (any ``node_type``
+        string), where :meth:`get` would raise on an unregistered EDM type.
+        """
+        with self._use_conn() as conn:
+            node_uuid = self._resolve_node_uuid(conn)
+            row = conn.execute(
+                "SELECT uuid, node_type, name, data, parent_uuid, path FROM node WHERE uuid = %s",
+                (node_uuid,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "uuid": row[0],
+            "node_type": row[1],
+            "name": row[2],
+            "data": row[3],
+            "parent_uuid": row[4],
+            "path": row[5],
+        }
 
     def children(self, *, type: str | None = None) -> list[dict]:
         """Direct children of this node only (one level). Optional type filter."""
@@ -744,17 +768,19 @@ class NodeScope(_BaseScope):
             node_uuid = self._resolve_node_uuid(conn)
             if type:
                 rows = conn.execute(
-                    "SELECT uuid, node_type, name, data "
-                    "FROM energydb.node WHERE parent_uuid = %s AND node_type = %s "
+                    "SELECT uuid, node_type, name, data, parent_uuid "
+                    "FROM node WHERE parent_uuid = %s AND node_type = %s "
                     "ORDER BY name",
                     (node_uuid, type),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT uuid, node_type, name, data FROM energydb.node WHERE parent_uuid = %s ORDER BY name",
+                    "SELECT uuid, node_type, name, data, parent_uuid FROM node WHERE parent_uuid = %s ORDER BY name",
                     (node_uuid,),
                 ).fetchall()
-            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
+            return [
+                {"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]} for r in rows
+            ]
 
     def descendants(self, *, type: str | None = None) -> list[dict]:
         """Every node in the subtree rooted at this node, excluding the node
@@ -768,7 +794,7 @@ class NodeScope(_BaseScope):
             # Two-step: fetch root path, then LIKE with escaped prefix as
             # bind param so PG Index Scans on ``ix_node_path_prefix``.
             root_path_row = conn.execute(
-                "SELECT path FROM energydb.node WHERE uuid = %s",
+                "SELECT path FROM node WHERE uuid = %s",
                 (node_uuid,),
             ).fetchone()
             if root_path_row is None:
@@ -776,14 +802,16 @@ class NodeScope(_BaseScope):
             root_path = root_path_row[0]
             rows = conn.execute(
                 r"""
-                SELECT uuid, node_type, name, data FROM energydb.node
+                SELECT uuid, node_type, name, data, parent_uuid FROM node
                 WHERE path LIKE %s || '/%%' ESCAPE '\'
                   AND (%s::text IS NULL OR node_type = %s::text)
                 ORDER BY name
                 """,
                 (_like_escape(root_path), type, type),
             ).fetchall()
-            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
+            return [
+                {"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]} for r in rows
+            ]
 
     def path(self) -> Path:
         """Return the resolved path of the scope's node."""
@@ -804,8 +832,8 @@ class NodeScope(_BaseScope):
             row = conn.execute(
                 """
                 SELECT n.path AS old_path, p.path AS parent_path
-                FROM energydb.node n
-                LEFT JOIN energydb.node p ON p.uuid = n.parent_uuid
+                FROM node n
+                LEFT JOIN node p ON p.uuid = n.parent_uuid
                 WHERE n.uuid = %s
                 """,
                 (node_uuid,),
@@ -817,7 +845,7 @@ class NodeScope(_BaseScope):
 
             conn.execute(
                 r"""
-                UPDATE energydb.node
+                UPDATE node
                 SET path = %s || substring(path FROM length(%s) + 1),
                     name = CASE WHEN path = %s THEN %s ELSE name END,
                     updated_at = now()
@@ -840,7 +868,7 @@ class NodeScope(_BaseScope):
 
         def _do(conn, node_uuid: UUID) -> None:
             conn.execute(
-                f"UPDATE energydb.node SET {op}, updated_at = now() WHERE uuid = %s",
+                f"UPDATE node SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), node_uuid),
             )
 
@@ -848,7 +876,7 @@ class NodeScope(_BaseScope):
 
     def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
         def _do(conn, node_uuid: UUID) -> None:
-            conn.execute("DELETE FROM energydb.node WHERE uuid = %s", (node_uuid,))
+            conn.execute("DELETE FROM node WHERE uuid = %s", (node_uuid,))
 
         return self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
 
@@ -883,19 +911,24 @@ class NodeScope(_BaseScope):
                 raise ValueError("Cannot move a node into itself.")
 
             # Cycle iff the prospective new parent is at or under the moving
-            # node's own path — one indexed materialized-path check.
+            # node's own path. Fetch the moving node's path to Python and use
+            # the bind-param LIKE-escape (the SQL ``_like_esc`` helper is gone).
+            subj_row = conn.execute(
+                "SELECT path FROM node WHERE uuid = %s",
+                (node_uuid,),
+            ).fetchone()
+            if subj_row is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
+            subj_path = subj_row[0]
             cycle_row = conn.execute(
                 r"""
                 SELECT EXISTS (
-                    SELECT 1
-                    FROM energydb.node subj, energydb.node cand
-                    WHERE subj.uuid = %s
-                      AND cand.uuid = %s
-                      AND (cand.path = subj.path
-                           OR cand.path LIKE energydb._like_esc(subj.path) || '/%%' ESCAPE '\')
+                    SELECT 1 FROM node cand
+                    WHERE cand.uuid = %s
+                      AND (cand.path = %s OR cand.path LIKE %s || '/%%' ESCAPE '\')
                 )
                 """,
-                (node_uuid, new_parent_uuid),
+                (new_parent_uuid, subj_path, _like_escape(subj_path)),
             ).fetchone()
             if cycle_row and cycle_row[0]:
                 raise ValueError("Cannot move a node into its own subtree (would create a cycle).")
@@ -908,8 +941,8 @@ class NodeScope(_BaseScope):
                 SELECT n.path AS old_path,
                        parent.path AS new_parent_path,
                        n.name AS own_name
-                FROM energydb.node n
-                LEFT JOIN energydb.node parent ON parent.uuid = %s
+                FROM node n
+                LEFT JOIN node parent ON parent.uuid = %s
                 WHERE n.uuid = %s
                 """,
                 (new_parent_uuid, node_uuid),
@@ -921,7 +954,7 @@ class NodeScope(_BaseScope):
 
             conn.execute(
                 r"""
-                UPDATE energydb.node
+                UPDATE node
                 SET parent_uuid = CASE WHEN uuid = %s THEN %s ELSE parent_uuid END,
                     path = %s || substring(path FROM length(%s) + 1),
                     updated_at = now()
@@ -1094,7 +1127,7 @@ class EdgeScope(_BaseScope):
         """Fetch ``(from_node_uuid, to_node_uuid)`` for this edge in one query."""
         edge_uuid = self._resolve_edge_uuid(conn)
         row = conn.execute(
-            "SELECT from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
+            "SELECT from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s",
             (edge_uuid,),
         ).fetchone()
         if row is None:
@@ -1109,7 +1142,7 @@ class EdgeScope(_BaseScope):
         with self._use_conn() as conn:
             edge_uuid = self._resolve_edge_uuid(conn)
             row = conn.execute(
-                "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
+                "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s",
                 (edge_uuid,),
             ).fetchone()
             if row is None:
@@ -1142,7 +1175,7 @@ class EdgeScope(_BaseScope):
     def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
         def _do(conn, edge_uuid: UUID) -> None:
             conn.execute(
-                "UPDATE energydb.edge SET name = %s, updated_at = now() WHERE uuid = %s",
+                "UPDATE edge SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, edge_uuid),
             )
 
@@ -1159,7 +1192,7 @@ class EdgeScope(_BaseScope):
 
         def _do(conn, edge_uuid: UUID) -> None:
             conn.execute(
-                f"UPDATE energydb.edge SET {op}, updated_at = now() WHERE uuid = %s",
+                f"UPDATE edge SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), edge_uuid),
             )
 
@@ -1185,7 +1218,7 @@ class EdgeScope(_BaseScope):
             if new_from_uuid == new_to_uuid:
                 raise ValueError("Edge endpoints must be distinct nodes.")
             conn.execute(
-                "UPDATE energydb.edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
+                "UPDATE edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_from_uuid, new_to_uuid, edge_uuid),
             )
 
@@ -1193,7 +1226,7 @@ class EdgeScope(_BaseScope):
 
     def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
         def _do(conn, edge_uuid: UUID) -> None:
-            conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (edge_uuid,))
+            conn.execute("DELETE FROM edge WHERE uuid = %s", (edge_uuid,))
 
         return self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
 

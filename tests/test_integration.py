@@ -209,18 +209,26 @@ def test_read_runs_for_series_hydrates_pg_metadata(edb):
     assert runs[0]["model_name"] == "test_model"
 
 
-def test_retention_immutable_trigger(edb):
-    edb.get_node("root").get_node("asset_a").register_series(
+def test_retention_immutable_on_reregister(edb):
+    # Immutability of retention / canonical_unit is enforced in Python by
+    # register_series (there is no DB trigger). Re-registering the same series
+    # with a different retention is rejected.
+    scope = edb.get_node("root").get_node("asset_a")
+    scope.register_series(
         name="capacity",
         canonical_unit="MW",
         data_type="actual",
         timeseries_type="FLAT",
         retention="medium",
     )
-    import psycopg
-
-    with edb._pool.connection() as conn, pytest.raises(psycopg.errors.RaiseException, match="immutable"):
-        conn.execute("UPDATE energydb.series SET retention = 'long' WHERE name = 'capacity'")
+    with pytest.raises(ValueError, match="immutable"):
+        scope.register_series(
+            name="capacity",
+            canonical_unit="MW",
+            data_type="actual",
+            timeseries_type="FLAT",
+            retention="long",
+        )
 
 
 def test_pandas_in_pandas_out(edb):

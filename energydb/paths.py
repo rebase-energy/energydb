@@ -35,10 +35,9 @@ class ResolveSummary(NamedTuple):
 Path = tuple[str, ...]
 
 
-# LIKE-escape helper for bind-param prefixes. The mirror SQL function is
-# ``energydb._like_esc`` (see models.py) for column-source prefixes — the
-# planner can fold the call when it sits in front of a bound row reference.
-# Both must produce the same output for the regression test to be meaningful.
+# LIKE-escape helper for bind-param prefixes: escape PG LIKE metacharacters so
+# a literal path prefix is matched literally with ``... LIKE %s ESCAPE '\\'``.
+# Subtree queries fetch the prefix into Python and pass it as a bind param.
 _LIKE_TRANS = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 
 
@@ -46,7 +45,6 @@ def _like_escape(s: str) -> str:
     """Escape PG LIKE metacharacters in a literal prefix.
 
     Use with ``... LIKE %s ESCAPE '\\'`` when the prefix is a bind parameter.
-    For column-source prefixes use the SQL ``energydb._like_esc()`` function.
     """
     return s.translate(_LIKE_TRANS)
 
@@ -72,14 +70,14 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
     joined = "/".join(path)
     if start_uuid is None:
         row = conn.execute(
-            "SELECT uuid FROM energydb.node WHERE path = %s",
+            "SELECT uuid FROM node WHERE path = %s",
             (joined,),
         ).fetchone()
     else:
         # One round-trip: derive the start node's path inline and compose.
         row = conn.execute(
             """
-            SELECT n.uuid FROM energydb.node n, energydb.node s
+            SELECT n.uuid FROM node n, node s
             WHERE s.uuid = %s AND n.path = s.path || '/' || %s
             """,
             (start_uuid, joined),
@@ -113,7 +111,7 @@ def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
 
     joined_keys = ["/".join(p) for p in unique]
     rows = conn.execute(
-        "SELECT path, uuid FROM energydb.node WHERE path = ANY(%s)",
+        "SELECT path, uuid FROM node WHERE path = ANY(%s)",
         (joined_keys,),
     ).fetchall()
 
@@ -186,7 +184,7 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     self-join on bench-scale data (44 ms → 18 ms at C=200).
     """
     row = conn.execute(
-        "SELECT path FROM energydb.node WHERE uuid = %s",
+        "SELECT path FROM node WHERE uuid = %s",
         (node_uuid,),
     ).fetchone()
     if row is None:
@@ -194,7 +192,7 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     prefix = row[0]
     rows = conn.execute(
         r"""
-        SELECT uuid FROM energydb.node
+        SELECT uuid FROM node
         WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
         """,
         (prefix, _like_escape(prefix)),
@@ -210,7 +208,7 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
 def resolve_path(conn, node_uuid: UUID) -> Path:
     """Return the full path tuple from root → node."""
     row = conn.execute(
-        "SELECT path FROM energydb.node WHERE uuid = %s",
+        "SELECT path FROM node WHERE uuid = %s",
         (node_uuid,),
     ).fetchone()
     if row is None:
@@ -229,7 +227,7 @@ def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str) -> U
     from_uuid = paths[tuple(from_path)]
     to_uuid = paths[tuple(to_path)]
     rows = conn.execute(
-        "SELECT uuid FROM energydb.edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
+        "SELECT uuid FROM edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
         (edge_type, from_uuid, to_uuid),
     ).fetchall()
     if not rows:
@@ -251,10 +249,10 @@ def resolve_manifest(conn, manifest: pl.DataFrame, *, attach_path: bool = True) 
 
     Detects routing mode from the columns present:
 
-    * ``node_uuid`` — direct lookup against ``energydb.series.node_uuid``.
+    * ``node_uuid`` — direct lookup against ``series.node_uuid``.
     * ``path``      — ``Utf8`` path joined with ``/`` (e.g. ``"a/b/c"``);
       resolved to ``node_uuid`` first.
-    * ``edge_uuid`` — direct lookup against ``energydb.series.edge_uuid``.
+    * ``edge_uuid`` — direct lookup against ``series.edge_uuid``.
 
     The manifest must also carry ``data_type`` and ``name`` columns. Returns
     the original frame plus per-row ``series_id``, ``retention``, and
@@ -337,13 +335,13 @@ def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
 # JOIN-to-owner-row from the core series scan lets writes opt out of the
 # hierarchy attach entirely — saves ~20ms PG-side at scale=200.
 _OWNER_PATH_SELECT = {
-    ("node_uuid", True): (", n.path AS path", " LEFT JOIN energydb.node n ON n.uuid = s.node_uuid"),
+    ("node_uuid", True): (", n.path AS path", " LEFT JOIN node n ON n.uuid = s.node_uuid"),
     ("node_uuid", False): ("", ""),
     ("edge_uuid", True): (
         ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path",
-        " LEFT JOIN energydb.edge e  ON e.uuid = s.edge_uuid"
-        " LEFT JOIN energydb.node fn ON fn.uuid = e.from_node_uuid"
-        " LEFT JOIN energydb.node tn ON tn.uuid = e.to_node_uuid",
+        " LEFT JOIN edge e  ON e.uuid = s.edge_uuid"
+        " LEFT JOIN node fn ON fn.uuid = e.from_node_uuid"
+        " LEFT JOIN node tn ON tn.uuid = e.to_node_uuid",
     ),
     ("edge_uuid", False): ("", ""),
 }
@@ -422,7 +420,7 @@ def _resolve_manifest_by_owner(
         f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
-        FROM energydb.series s
+        FROM series s
         {join_sql}
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,

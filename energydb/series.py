@@ -103,7 +103,7 @@ def register_series(
 
     row = conn.execute(
         f"""
-        INSERT INTO energydb.series
+        INSERT INTO series
             (node_uuid, edge_uuid, data_type, name, canonical_unit,
              timeseries_type, retention, description)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -119,7 +119,7 @@ def register_series(
     # Conflict: fetch the existing row and verify the immutable fields agree.
     existing = conn.execute(
         f"SELECT series_id, canonical_unit, retention "
-        f"FROM energydb.series "
+        f"FROM series "
         f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
         (owner_uuid, data_type, name),
     ).fetchone()
@@ -167,13 +167,13 @@ def resolve_for_read(
 
     if owner_col == "node_uuid":
         select_extra = ", n.path AS path"
-        join_sql = "JOIN energydb.node n ON n.uuid = s.node_uuid"
+        join_sql = "JOIN node n ON n.uuid = s.node_uuid"
     else:
         select_extra = ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path"
         join_sql = (
-            "JOIN energydb.edge e   ON e.uuid = s.edge_uuid "
-            "JOIN energydb.node fn  ON fn.uuid = e.from_node_uuid "
-            "JOIN energydb.node tn  ON tn.uuid = e.to_node_uuid"
+            "JOIN edge e   ON e.uuid = s.edge_uuid "
+            "JOIN node fn  ON fn.uuid = e.from_node_uuid "
+            "JOIN node tn  ON tn.uuid = e.to_node_uuid"
         )
 
     # ``::text`` casts on the uuid columns: PG returns strings directly,
@@ -182,7 +182,7 @@ def resolve_for_read(
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
         "s.node_uuid::text, s.edge_uuid::text, s.data_type, s.name" + select_extra + " "
-        "FROM energydb.series s " + join_sql + " "
+        "FROM series s " + join_sql + " "
         "WHERE " + " AND ".join(conditions)
     )
     rows = conn.execute(sql, params).fetchall()
