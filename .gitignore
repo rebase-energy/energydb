@@ -44,6 +44,11 @@ uv.lock
 
 setup-patterns.md
 ARCHITECTURE.md
+# Local perf/analysis + planning docs (not part of the published package)
+CH_AS_ENTRY_PLAN.md
+COLOCATION_ANALYSIS.md
+ROUNDTRIP_COLLAPSE.md
+SINGLE_ROUNDTRIP_PLAN.md
 .claude/
 
 benchmarks/
