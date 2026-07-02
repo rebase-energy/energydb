@@ -70,14 +70,16 @@ from timedatamodel import (  # noqa: E402
 
 from energydb._io import WriteResult  # noqa: E402
 from energydb._join import EdgeSeriesKey, SeriesKey, find  # noqa: E402
+from energydb._sync import Client  # noqa: E402
 from energydb._transaction import Transaction  # noqa: E402
-from energydb.client import Client  # noqa: E402
+from energydb.client import AsyncClient  # noqa: E402
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff  # noqa: E402
 from energydb.scope import EdgeScope, NodeScope  # noqa: E402
 from energydb.units import IncompatibleUnitError  # noqa: E402
 
 __all__ = [
     # Client
+    "AsyncClient",
     "Client",
     "IncompatibleUnitError",
     "NodeScope",

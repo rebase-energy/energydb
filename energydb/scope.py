@@ -17,8 +17,8 @@ resolution query and execute.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
@@ -48,7 +48,7 @@ from energydb.serialization import reconstruct_edge, reconstruct_node
 
 if TYPE_CHECKING:
     from energydb._transaction import Transaction
-    from energydb.client import Client
+    from energydb.client import AsyncClient
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def _coerce_path(args: tuple, kwarg: Path | list[str] | str | None = None) -> Pa
     return _flatten_segments(args)
 
 
-def _resolve_endpoint(conn, target: NodeScope | Path | list[str] | str) -> UUID:
+async def _resolve_endpoint(conn, target: NodeScope | Path | list[str] | str) -> UUID:
     """Resolve a node endpoint reference to a UUID against ``conn``.
 
     Accepts a :class:`NodeScope`, a ``/``-joined string (``"P/Site/T01"``),
@@ -141,11 +141,11 @@ def _resolve_endpoint(conn, target: NodeScope | Path | list[str] | str) -> UUID:
     see :func:`_coerce_path` for full semantics.
     """
     if isinstance(target, NodeScope):
-        return target._resolve_node_uuid(conn)
+        return await target._resolve_node_uuid(conn)
     path = _coerce_path((), kwarg=target)
     if not path:
         raise ValueError("Endpoint path cannot be empty.")
-    return resolve_node_uuid(conn, path)
+    return await resolve_node_uuid(conn, path)
 
 
 def _timeseries_type_from_ts(ts: TimeSeries) -> str | None:
@@ -256,7 +256,7 @@ class _BaseScope:
     routing, the 8-step mutator boilerplate) lives here.
     """
 
-    _client: Client
+    _client: AsyncClient
     _txn: Transaction | None
 
     # -- shared properties / connection management ---------------------
@@ -269,8 +269,8 @@ class _BaseScope:
     def _td(self):
         return self._client.td
 
-    @contextmanager
-    def _use_conn(self):
+    @asynccontextmanager
+    async def _use_conn(self):
         """Yield a DB connection. Inside a txn, use the txn's connection
         (caller MUST NOT call ``.commit()`` / ``.rollback()``). Otherwise
         borrow from the pool; mutators are responsible for explicit
@@ -279,14 +279,14 @@ class _BaseScope:
         if self._txn is not None:
             yield self._txn._conn
             return
-        with self._pool.connection() as conn:
+        async with self._pool.connection() as conn:
             yield conn
 
     # -- subclass contract (overridden in NodeScope / EdgeScope) -------
 
     _owner_col: Literal["node_uuid", "edge_uuid"]
 
-    def _resolve_uuid(self, conn) -> UUID:
+    async def _resolve_uuid(self, conn) -> UUID:
         raise NotImplementedError
 
     def _write_route(self) -> tuple[str, str] | None:
@@ -298,7 +298,7 @@ class _BaseScope:
         """
         return None
 
-    def _fetch_snapshot(self, conn, uuid_: UUID):
+    async def _fetch_snapshot(self, conn, uuid_: UUID):
         raise NotImplementedError
 
     def _record_to_txn(self, before, after) -> None:
@@ -310,7 +310,7 @@ class _BaseScope:
     def _not_found_msg(self, uuid_: UUID) -> str:
         raise NotImplementedError
 
-    def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
+    async def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
         """Subclass-specific: resolve the scope to per-series meta in PG.
 
         Returns one row per series with columns ``(series_id, retention,
@@ -322,9 +322,9 @@ class _BaseScope:
 
     # -- shared mutation machinery -------------------------------------
 
-    def _apply_mutation(
+    async def _apply_mutation(
         self,
-        exec_fn: Callable[[Any, UUID], None],
+        exec_fn: Callable[[Any, UUID], Awaitable[None]],
         *,
         dry_run: bool,
         fetch_after: bool = True,
@@ -344,25 +344,25 @@ class _BaseScope:
         """
         if dry_run and self._txn is not None:
             _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            uuid_ = self._resolve_uuid(conn)
-            before = self._fetch_snapshot(conn, uuid_)
+        async with self._use_conn() as conn:
+            uuid_ = await self._resolve_uuid(conn)
+            before = await self._fetch_snapshot(conn, uuid_)
             if before is None:
                 raise ValueError(self._not_found_msg(uuid_))
-            exec_fn(conn, uuid_)
-            after = self._fetch_snapshot(conn, uuid_) if fetch_after else None
+            (await exec_fn(conn, uuid_))
+            after = (await self._fetch_snapshot(conn, uuid_)) if fetch_after else None
             if self._txn is not None:
                 self._record_to_txn(before, after)
                 return None
             if dry_run:
-                conn.rollback()
+                await conn.rollback()
                 return self._wrap_in_diff(before, after)
-            conn.commit()
+            await conn.commit()
         return None
 
     # -- shared series + timeseries I/O --------------------------------
 
-    def register_series(
+    async def register_series(
         self,
         ts_or_name: TimeSeries | str | None = None,
         *,
@@ -388,19 +388,19 @@ class _BaseScope:
             timeseries_type=timeseries_type,
             description=description,
         )
-        with self._use_conn() as conn:
-            sid = series_mod.register_series(
+        async with self._use_conn() as conn:
+            sid = await series_mod.register_series(
                 conn,
                 owner_col=self._owner_col,
-                owner_uuid=self._resolve_uuid(conn),
+                owner_uuid=(await self._resolve_uuid(conn)),
                 retention=retention,
                 **args,
             )
             if self._txn is None:
-                conn.commit()
+                await conn.commit()
         return sid
 
-    def write(
+    async def write(
         self,
         df: pl.DataFrame | pd.DataFrame,
         *,
@@ -435,8 +435,8 @@ class _BaseScope:
         if route is not None:
             owner_col, owner_val = route
         else:
-            with self._use_conn() as conn:
-                owner_val = self._resolve_uuid(conn)
+            async with self._use_conn() as conn:
+                owner_val = await self._resolve_uuid(conn)
             owner_col = self._owner_col
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             df_pl = to_polars(df)
@@ -449,7 +449,7 @@ class _BaseScope:
                 name=name,
                 unit=unit,
             )
-        return self._client.write(
+        return await self._client.write(
             manifest,
             knowledge_time=knowledge_time,
             run_id=run_id,
@@ -462,7 +462,7 @@ class _BaseScope:
             unchanged_scope=unchanged_scope,
         )
 
-    def read(
+    async def read(
         self,
         *,
         data_type: str | None = None,
@@ -492,7 +492,7 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
-        meta = self._build_resolved_meta(data_type=data_type, name=name)
+        meta = await self._build_resolved_meta(data_type=data_type, name=name)
         if meta is None:
             empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
                 {} if output == "by_path" else pl.DataFrame()
@@ -500,7 +500,7 @@ class _BaseScope:
             return to_backend(empty, backend)
         # Take the polars result first so the auto-strip is a single dtype op;
         # convert to the requested backend at the boundary.
-        result = read_resolved(
+        result = await read_resolved(
             self._pool,
             self._td,
             meta,
@@ -517,7 +517,7 @@ class _BaseScope:
             result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
         return to_backend(result, backend)
 
-    def read_relative(
+    async def read_relative(
         self,
         *,
         data_type: str,
@@ -542,13 +542,13 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read_relative")
-        meta = self._build_resolved_meta(data_type=data_type, name=name)
+        meta = await self._build_resolved_meta(data_type=data_type, name=name)
         if meta is None:
             empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
                 {} if output == "by_path" else pl.DataFrame()
             )
             return to_backend(empty, backend)
-        result = read_relative_resolved(
+        result = await read_relative_resolved(
             self._pool,
             self._td,
             meta,
@@ -583,7 +583,7 @@ class NodeScope(_BaseScope):
 
     def __init__(
         self,
-        client: Client,
+        client: AsyncClient,
         *,
         node_uuid: UUID | None = None,
         path: Path = (),
@@ -641,11 +641,11 @@ class NodeScope(_BaseScope):
     # Subclass contract for _BaseScope._apply_mutation
     # ------------------------------------------------------------------
 
-    def _resolve_uuid(self, conn) -> UUID:
-        return self._resolve_node_uuid(conn)
+    async def _resolve_uuid(self, conn) -> UUID:
+        return await self._resolve_node_uuid(conn)
 
-    def _fetch_snapshot(self, conn, uuid_: UUID):
-        return _fetch_nodes_by_uuids(conn, [uuid_]).get(uuid_)
+    async def _fetch_snapshot(self, conn, uuid_: UUID):
+        return (await _fetch_nodes_by_uuids(conn, [uuid_])).get(uuid_)
 
     def _record_to_txn(self, before, after) -> None:
         assert self._txn is not None
@@ -712,18 +712,18 @@ class NodeScope(_BaseScope):
     # Internal: resolve scope → uuid(s)
     # ------------------------------------------------------------------
 
-    def _resolve_node_uuid(self, conn) -> UUID:
+    async def _resolve_node_uuid(self, conn) -> UUID:
         if self._path:
-            return resolve_node_uuid(conn, self._path, start_uuid=self._node_uuid)
+            return await resolve_node_uuid(conn, self._path, start_uuid=self._node_uuid)
         if self._node_uuid is not None:
             return self._node_uuid
         raise ValueError("NodeScope has no path or uuid to resolve.")
 
-    def _resolve_target_node_uuids(self, conn) -> list[UUID]:
+    async def _resolve_target_node_uuids(self, conn) -> list[UUID]:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE_SUBTREE):
-            root_uuid = self._resolve_node_uuid(conn)
+            root_uuid = await self._resolve_node_uuid(conn)
             if not self._where_filters:
-                return resolve_subtree_uuids(conn, root_uuid)
+                return await resolve_subtree_uuids(conn, root_uuid)
 
             # Two-step: fetch root path, then LIKE with escaped prefix as
             # bind param so PG can Index Scan via ``ix_node_path_prefix``.
@@ -731,116 +731,157 @@ class NodeScope(_BaseScope):
             # predicates now run directly on ``node``.
             filter_conds, filter_params = build_filter_conditions(self._where_filters, type_col="node_type")
             extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
-            root_path_row = conn.execute(
-                "SELECT path FROM energydb.node WHERE uuid = %s",
-                (root_uuid,),
+            root_path_row = await (
+                await conn.execute(
+                    "SELECT path FROM node WHERE uuid = %s",
+                    (root_uuid,),
+                )
             ).fetchone()
             if root_path_row is None:
                 return []
             root_path = root_path_row[0]
             sql = rf"""
-                SELECT uuid FROM energydb.node
+                SELECT uuid FROM node
                 WHERE (path = %s OR path LIKE %s || '/%%' ESCAPE '\')
                   {extra}
             """
-            rows = conn.execute(sql, (root_path, _like_escape(root_path), *filter_params)).fetchall()
+            rows = await (await conn.execute(sql, (root_path, _like_escape(root_path), *filter_params))).fetchall()
             return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # Get / hierarchy queries
     # ------------------------------------------------------------------
 
-    def get(self):
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            row = conn.execute(
-                "SELECT uuid, node_type, name, data FROM energydb.node WHERE uuid = %s",
-                (node_uuid,),
+    async def get(self):
+        async with self._use_conn() as conn:
+            node_uuid = await self._resolve_node_uuid(conn)
+            row = await (
+                await conn.execute(
+                    "SELECT uuid, node_type, name, data FROM node WHERE uuid = %s",
+                    (node_uuid,),
+                )
             ).fetchone()
             if row is None:
                 raise ValueError(f"Node not found: uuid={node_uuid}")
             return reconstruct_node({"uuid": row[0], "node_type": row[1], "name": row[2], "data": row[3]})
 
-    def children(self, *, type: str | None = None) -> list[dict]:
+    async def get_raw(self) -> dict | None:
+        """Fetch this node as a raw dict, without EDM reconstruction.
+
+        Returns ``{uuid, node_type, name, data, parent_uuid, path}`` or ``None``
+        if the node does not exist. Use for generic node types (any ``node_type``
+        string), where :meth:`get` would raise on an unregistered EDM type.
+        """
+        async with self._use_conn() as conn:
+            node_uuid = await self._resolve_node_uuid(conn)
+            row = await (
+                await conn.execute(
+                    "SELECT uuid, node_type, name, data, parent_uuid, path FROM node WHERE uuid = %s",
+                    (node_uuid,),
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "uuid": row[0],
+            "node_type": row[1],
+            "name": row[2],
+            "data": row[3],
+            "parent_uuid": row[4],
+            "path": row[5],
+        }
+
+    async def children(self, *, type: str | None = None) -> list[dict]:
         """Direct children of this node only (one level). Optional type filter."""
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
+        async with self._use_conn() as conn:
+            node_uuid = await self._resolve_node_uuid(conn)
             if type:
-                rows = conn.execute(
-                    "SELECT uuid, node_type, name, data "
-                    "FROM energydb.node WHERE parent_uuid = %s AND node_type = %s "
-                    "ORDER BY name",
-                    (node_uuid, type),
+                rows = await (
+                    await conn.execute(
+                        "SELECT uuid, node_type, name, data, parent_uuid "
+                        "FROM node WHERE parent_uuid = %s AND node_type = %s "
+                        "ORDER BY name",
+                        (node_uuid, type),
+                    )
                 ).fetchall()
             else:
-                rows = conn.execute(
-                    "SELECT uuid, node_type, name, data FROM energydb.node WHERE parent_uuid = %s ORDER BY name",
-                    (node_uuid,),
+                rows = await (
+                    await conn.execute(
+                        "SELECT uuid, node_type, name, data, parent_uuid "
+                        "FROM node WHERE parent_uuid = %s ORDER BY name",
+                        (node_uuid,),
+                    )
                 ).fetchall()
-            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
+            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]} for r in rows]
 
-    def descendants(self, *, type: str | None = None) -> list[dict]:
+    async def descendants(self, *, type: str | None = None) -> list[dict]:
         """Every node in the subtree rooted at this node, excluding the node
         itself (recursive). Optional type filter.
 
         Materialized-path prefix scan against ``ix_node_path_prefix`` —
         one indexed lookup, no recursive CTE.
         """
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
+        async with self._use_conn() as conn:
+            node_uuid = await self._resolve_node_uuid(conn)
             # Two-step: fetch root path, then LIKE with escaped prefix as
             # bind param so PG Index Scans on ``ix_node_path_prefix``.
-            root_path_row = conn.execute(
-                "SELECT path FROM energydb.node WHERE uuid = %s",
-                (node_uuid,),
+            root_path_row = await (
+                await conn.execute(
+                    "SELECT path FROM node WHERE uuid = %s",
+                    (node_uuid,),
+                )
             ).fetchone()
             if root_path_row is None:
                 return []
             root_path = root_path_row[0]
-            rows = conn.execute(
-                r"""
-                SELECT uuid, node_type, name, data FROM energydb.node
+            rows = await (
+                await conn.execute(
+                    r"""
+                SELECT uuid, node_type, name, data, parent_uuid FROM node
                 WHERE path LIKE %s || '/%%' ESCAPE '\'
                   AND (%s::text IS NULL OR node_type = %s::text)
                 ORDER BY name
                 """,
-                (_like_escape(root_path), type, type),
+                    (_like_escape(root_path), type, type),
+                )
             ).fetchall()
-            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]} for r in rows]
+            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]} for r in rows]
 
-    def path(self) -> Path:
+    async def path(self) -> Path:
         """Return the resolved path of the scope's node."""
-        with self._use_conn() as conn:
-            node_uuid = self._resolve_node_uuid(conn)
-            return resolve_path(conn, node_uuid)
+        async with self._use_conn() as conn:
+            node_uuid = await self._resolve_node_uuid(conn)
+            return await resolve_path(conn, node_uuid)
 
     # ------------------------------------------------------------------
     # Single-element mutations
     # ------------------------------------------------------------------
 
-    def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
-        def _do(conn, node_uuid: UUID) -> None:
+    async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        async def _do(conn, node_uuid: UUID) -> None:
             # One SELECT to grab the node's current path and its parent's path,
             # then a single UPDATE rewrites ``path`` for self + every descendant
             # via the ``ix_node_path_prefix`` index. ``name`` is only changed on
             # the renamed row itself.
-            row = conn.execute(
-                """
+            row = await (
+                await conn.execute(
+                    """
                 SELECT n.path AS old_path, p.path AS parent_path
-                FROM energydb.node n
-                LEFT JOIN energydb.node p ON p.uuid = n.parent_uuid
+                FROM node n
+                LEFT JOIN node p ON p.uuid = n.parent_uuid
                 WHERE n.uuid = %s
                 """,
-                (node_uuid,),
+                    (node_uuid,),
+                )
             ).fetchone()
             if row is None:
                 raise ValueError(f"Node not found: uuid={node_uuid}")
             old_path, parent_path = row
             new_path = f"{parent_path}/{new_name}" if parent_path else new_name
 
-            conn.execute(
+            await conn.execute(
                 r"""
-                UPDATE energydb.node
+                UPDATE node
                 SET path = %s || substring(path FROM length(%s) + 1),
                     name = CASE WHEN path = %s THEN %s ELSE name END,
                     updated_at = now()
@@ -849,9 +890,9 @@ class NodeScope(_BaseScope):
                 (new_path, old_path, old_path, new_name, old_path, _like_escape(old_path)),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        return await self._apply_mutation(_do, dry_run=dry_run)
 
-    def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
+    async def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
         """Patch the node's JSONB ``data`` column.
 
         Default is a shallow merge (Postgres ``data = data || %s``) — top-level
@@ -861,21 +902,21 @@ class NodeScope(_BaseScope):
         """
         op = "data = %s" if replace_data else "data = data || %s"
 
-        def _do(conn, node_uuid: UUID) -> None:
-            conn.execute(
-                f"UPDATE energydb.node SET {op}, updated_at = now() WHERE uuid = %s",
+        async def _do(conn, node_uuid: UUID) -> None:
+            await conn.execute(
+                f"UPDATE node SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), node_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        return await self._apply_mutation(_do, dry_run=dry_run)
 
-    def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
-        def _do(conn, node_uuid: UUID) -> None:
-            conn.execute("DELETE FROM energydb.node WHERE uuid = %s", (node_uuid,))
+    async def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        async def _do(conn, node_uuid: UUID) -> None:
+            await conn.execute("DELETE FROM node WHERE uuid = %s", (node_uuid,))
 
-        return self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        return await self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
 
-    def move_to(self, target: NodeScope | Path | list[str] | str, *, dry_run: bool = False) -> TreeDiff | None:
+    async def move_to(self, target: NodeScope | Path | list[str] | str, *, dry_run: bool = False) -> TreeDiff | None:
         """Re-parent this node to ``target``.
 
         ``target`` is a :class:`NodeScope`, a ``/``-joined string
@@ -894,9 +935,9 @@ class NodeScope(_BaseScope):
             target_path = _coerce_path((), kwarg=target)
             target_node_uuid = None
 
-        def _do(conn, node_uuid: UUID) -> None:
+        async def _do(conn, node_uuid: UUID) -> None:
             if target_path:
-                new_parent_uuid = resolve_node_uuid(conn, target_path, start_uuid=target_node_uuid)
+                new_parent_uuid = await resolve_node_uuid(conn, target_path, start_uuid=target_node_uuid)
             elif target_node_uuid is not None:
                 new_parent_uuid = target_node_uuid
             else:
@@ -906,19 +947,28 @@ class NodeScope(_BaseScope):
                 raise ValueError("Cannot move a node into itself.")
 
             # Cycle iff the prospective new parent is at or under the moving
-            # node's own path — one indexed materialized-path check.
-            cycle_row = conn.execute(
-                r"""
+            # node's own path. Fetch the moving node's path to Python and use
+            # the bind-param LIKE-escape (the SQL ``_like_esc`` helper is gone).
+            subj_row = await (
+                await conn.execute(
+                    "SELECT path FROM node WHERE uuid = %s",
+                    (node_uuid,),
+                )
+            ).fetchone()
+            if subj_row is None:
+                raise ValueError(f"Node not found: uuid={node_uuid}")
+            subj_path = subj_row[0]
+            cycle_row = await (
+                await conn.execute(
+                    r"""
                 SELECT EXISTS (
-                    SELECT 1
-                    FROM energydb.node subj, energydb.node cand
-                    WHERE subj.uuid = %s
-                      AND cand.uuid = %s
-                      AND (cand.path = subj.path
-                           OR cand.path LIKE energydb._like_esc(subj.path) || '/%%' ESCAPE '\')
+                    SELECT 1 FROM node cand
+                    WHERE cand.uuid = %s
+                      AND (cand.path = %s OR cand.path LIKE %s || '/%%' ESCAPE '\')
                 )
                 """,
-                (node_uuid, new_parent_uuid),
+                    (new_parent_uuid, subj_path, _like_escape(subj_path)),
+                )
             ).fetchone()
             if cycle_row and cycle_row[0]:
                 raise ValueError("Cannot move a node into its own subtree (would create a cycle).")
@@ -926,25 +976,27 @@ class NodeScope(_BaseScope):
             # Fetch old path, the new parent's path, and the moving node's own
             # name. ``LEFT JOIN`` against the new parent so a move-to-root
             # (``new_parent_uuid IS NULL``) returns ``new_parent_path = None``.
-            row = conn.execute(
-                """
+            row = await (
+                await conn.execute(
+                    """
                 SELECT n.path AS old_path,
                        parent.path AS new_parent_path,
                        n.name AS own_name
-                FROM energydb.node n
-                LEFT JOIN energydb.node parent ON parent.uuid = %s
+                FROM node n
+                LEFT JOIN node parent ON parent.uuid = %s
                 WHERE n.uuid = %s
                 """,
-                (new_parent_uuid, node_uuid),
+                    (new_parent_uuid, node_uuid),
+                )
             ).fetchone()
             if row is None:
                 raise ValueError(f"Node not found: uuid={node_uuid}")
             old_path, new_parent_path, own_name = row
             new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
 
-            conn.execute(
+            await conn.execute(
                 r"""
-                UPDATE energydb.node
+                UPDATE node
                 SET parent_uuid = CASE WHEN uuid = %s THEN %s ELSE parent_uuid END,
                     path = %s || substring(path FROM length(%s) + 1),
                     updated_at = now()
@@ -953,9 +1005,9 @@ class NodeScope(_BaseScope):
                 (node_uuid, new_parent_uuid, new_path, old_path, old_path, _like_escape(old_path)),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        return await self._apply_mutation(_do, dry_run=dry_run)
 
-    def add(self, edm_obj, *, dry_run: bool = False) -> NodeScope | TreeDiff:
+    async def add(self, edm_obj, *, dry_run: bool = False) -> NodeScope | TreeDiff:
         """Add a new child node (or subtree) under this scope.
 
         Sugar for ``register_tree(edm_obj, under=<this scope>)``. Returns a
@@ -970,9 +1022,9 @@ class NodeScope(_BaseScope):
         """
         if dry_run and self._txn is not None:
             _dry_run_unsupported_in_txn()
-        with self._use_conn() as conn:
-            parent_uuid = self._resolve_node_uuid(conn)
-            root_uuid, diff = register_tree_under(
+        async with self._use_conn() as conn:
+            parent_uuid = await self._resolve_node_uuid(conn)
+            root_uuid, diff = await register_tree_under(
                 conn,
                 edm_obj,
                 parent_uuid=parent_uuid,
@@ -983,16 +1035,16 @@ class NodeScope(_BaseScope):
                 self._txn._edge_changes.extend(diff.edge_changes)
                 return NodeScope(self._client, node_uuid=root_uuid, txn=self._txn)
             if dry_run:
-                conn.rollback()
+                await conn.rollback()
                 return diff
-            conn.commit()
+            await conn.commit()
         return NodeScope(self._client, node_uuid=root_uuid)
 
     # ------------------------------------------------------------------
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
 
-    def _build_resolved_meta(
+    async def _build_resolved_meta(
         self,
         *,
         data_type: str | None,
@@ -1013,28 +1065,29 @@ class NodeScope(_BaseScope):
             )
         else:
             where_conds, where_params = [], []
-        with self._use_conn() as conn, profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            if self._path and self._node_uuid is None:
-                meta = series_mod.resolve_subtree_series_for_read(
-                    conn,
-                    root_path="/".join(self._path),
-                    where_conds=where_conds,
-                    where_params=where_params,
-                    data_type=data_type_str,
-                    name=name,
-                )
-            elif self._node_uuid is not None:
-                meta = series_mod.resolve_subtree_series_for_read(
-                    conn,
-                    start_uuid=self._node_uuid,
-                    rel_path="/".join(self._path) if self._path else None,
-                    where_conds=where_conds,
-                    where_params=where_params,
-                    data_type=data_type_str,
-                    name=name,
-                )
-            else:
-                raise ValueError("NodeScope has no path or uuid to resolve.")
+        async with self._use_conn() as conn:
+            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                if self._path and self._node_uuid is None:
+                    meta = await series_mod.resolve_subtree_series_for_read(
+                        conn,
+                        root_path="/".join(self._path),
+                        where_conds=where_conds,
+                        where_params=where_params,
+                        data_type=data_type_str,
+                        name=name,
+                    )
+                elif self._node_uuid is not None:
+                    meta = await series_mod.resolve_subtree_series_for_read(
+                        conn,
+                        start_uuid=self._node_uuid,
+                        rel_path="/".join(self._path) if self._path else None,
+                        where_conds=where_conds,
+                        where_params=where_params,
+                        data_type=data_type_str,
+                        name=name,
+                    )
+                else:
+                    raise ValueError("NodeScope has no path or uuid to resolve.")
         return None if meta.is_empty() else meta
 
 
@@ -1054,7 +1107,7 @@ class EdgeScope(_BaseScope):
 
     def __init__(
         self,
-        client: Client,
+        client: AsyncClient,
         *,
         edge_uuid: UUID | None = None,
         from_path: Path | None = None,
@@ -1097,11 +1150,11 @@ class EdgeScope(_BaseScope):
     # Subclass contract for _BaseScope._apply_mutation
     # ------------------------------------------------------------------
 
-    def _resolve_uuid(self, conn) -> UUID:
-        return self._resolve_edge_uuid(conn)
+    async def _resolve_uuid(self, conn) -> UUID:
+        return await self._resolve_edge_uuid(conn)
 
-    def _fetch_snapshot(self, conn, uuid_: UUID):
-        return _fetch_edges_by_uuids(conn, [uuid_]).get(uuid_)
+    async def _fetch_snapshot(self, conn, uuid_: UUID):
+        return (await _fetch_edges_by_uuids(conn, [uuid_])).get(uuid_)
 
     def _record_to_txn(self, before, after) -> None:
         assert self._txn is not None
@@ -1117,19 +1170,21 @@ class EdgeScope(_BaseScope):
     # Internal: identity resolution + endpoint helpers
     # ------------------------------------------------------------------
 
-    def _resolve_edge_uuid(self, conn) -> UUID:
+    async def _resolve_edge_uuid(self, conn) -> UUID:
         if self._edge_uuid is not None:
             return self._edge_uuid
         if self._from_path is not None and self._to_path is not None and self._edge_type is not None:
-            return resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
+            return await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
         raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
 
-    def _endpoints(self, conn) -> tuple[UUID, UUID]:
+    async def _endpoints(self, conn) -> tuple[UUID, UUID]:
         """Fetch ``(from_node_uuid, to_node_uuid)`` for this edge in one query."""
-        edge_uuid = self._resolve_edge_uuid(conn)
-        row = conn.execute(
-            "SELECT from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
-            (edge_uuid,),
+        edge_uuid = await self._resolve_edge_uuid(conn)
+        row = await (
+            await conn.execute(
+                "SELECT from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s",
+                (edge_uuid,),
+            )
         ).fetchone()
         if row is None:
             raise ValueError(f"Edge not found: uuid={edge_uuid}")
@@ -1139,12 +1194,14 @@ class EdgeScope(_BaseScope):
     # get / navigation
     # ------------------------------------------------------------------
 
-    def get(self):
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
-            row = conn.execute(
-                "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM energydb.edge WHERE uuid = %s",
-                (edge_uuid,),
+    async def get(self):
+        async with self._use_conn() as conn:
+            edge_uuid = await self._resolve_edge_uuid(conn)
+            row = await (
+                await conn.execute(
+                    "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s",
+                    (edge_uuid,),
+                )
             ).fetchone()
             if row is None:
                 raise ValueError(f"Edge not found: uuid={edge_uuid}")
@@ -1159,30 +1216,30 @@ class EdgeScope(_BaseScope):
                 }
             )
 
-    def from_node(self) -> NodeScope:
-        with self._use_conn() as conn:
-            from_uuid, _ = self._endpoints(conn)
+    async def from_node(self) -> NodeScope:
+        async with self._use_conn() as conn:
+            from_uuid, _ = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=from_uuid, txn=self._txn)
 
-    def to_node(self) -> NodeScope:
-        with self._use_conn() as conn:
-            _, to_uuid = self._endpoints(conn)
+    async def to_node(self) -> NodeScope:
+        async with self._use_conn() as conn:
+            _, to_uuid = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=to_uuid, txn=self._txn)
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
 
-    def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
-        def _do(conn, edge_uuid: UUID) -> None:
-            conn.execute(
-                "UPDATE energydb.edge SET name = %s, updated_at = now() WHERE uuid = %s",
+    async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        async def _do(conn, edge_uuid: UUID) -> None:
+            await conn.execute(
+                "UPDATE edge SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, edge_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        return await self._apply_mutation(_do, dry_run=dry_run)
 
-    def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
+    async def update(self, data: dict, *, replace_data: bool = False, dry_run: bool = False) -> TreeDiff | None:
         """Patch the edge's JSONB ``data`` column.
 
         Default is a shallow merge (Postgres ``data = data || %s``); pass
@@ -1191,15 +1248,15 @@ class EdgeScope(_BaseScope):
         """
         op = "data = %s" if replace_data else "data = data || %s"
 
-        def _do(conn, edge_uuid: UUID) -> None:
-            conn.execute(
-                f"UPDATE energydb.edge SET {op}, updated_at = now() WHERE uuid = %s",
+        async def _do(conn, edge_uuid: UUID) -> None:
+            await conn.execute(
+                f"UPDATE edge SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), edge_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        return await self._apply_mutation(_do, dry_run=dry_run)
 
-    def move_to(
+    async def move_to(
         self,
         *,
         from_node: NodeScope | Path | list[str],
@@ -1213,40 +1270,40 @@ class EdgeScope(_BaseScope):
         surfaces collisions with an existing edge as a Postgres error.
         """
 
-        def _do(conn, edge_uuid: UUID) -> None:
-            new_from_uuid = _resolve_endpoint(conn, from_node)
-            new_to_uuid = _resolve_endpoint(conn, to_node)
+        async def _do(conn, edge_uuid: UUID) -> None:
+            new_from_uuid = await _resolve_endpoint(conn, from_node)
+            new_to_uuid = await _resolve_endpoint(conn, to_node)
             if new_from_uuid == new_to_uuid:
                 raise ValueError("Edge endpoints must be distinct nodes.")
-            conn.execute(
-                "UPDATE energydb.edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
+            await conn.execute(
+                "UPDATE edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_from_uuid, new_to_uuid, edge_uuid),
             )
 
-        return self._apply_mutation(_do, dry_run=dry_run)
+        return await self._apply_mutation(_do, dry_run=dry_run)
 
-    def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
-        def _do(conn, edge_uuid: UUID) -> None:
-            conn.execute("DELETE FROM energydb.edge WHERE uuid = %s", (edge_uuid,))
+    async def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        async def _do(conn, edge_uuid: UUID) -> None:
+            await conn.execute("DELETE FROM edge WHERE uuid = %s", (edge_uuid,))
 
-        return self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
+        return await self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
 
     # ------------------------------------------------------------------
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
 
-    def _build_resolved_meta(
+    async def _build_resolved_meta(
         self,
         *,
         data_type: str | None,
         name: str | None,
     ) -> pl.DataFrame | None:
         """Resolve this edge to per-series read meta. ``None`` if no series match."""
-        with self._use_conn() as conn:
-            edge_uuid = self._resolve_edge_uuid(conn)
+        async with self._use_conn() as conn:
+            edge_uuid = await self._resolve_edge_uuid(conn)
             data_type_str = str(data_type).lower() if data_type else None
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-                meta = series_mod.resolve_for_read(
+                meta = await series_mod.resolve_for_read(
                     conn,
                     owner_col="edge_uuid",
                     owner_uuids=[edge_uuid],

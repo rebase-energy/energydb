@@ -23,7 +23,9 @@ from uuid import UUID
 import energydatamodel as edm
 import polars as pl
 from energydatamodel.reference import Reference
+from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
+from uuid6 import uuid7
 
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
@@ -36,7 +38,7 @@ from energydb.units import compute_unit_factor
 # ---------------------------------------------------------------------------
 
 
-def create_node(
+async def create_node(
     conn,
     edm_obj,
     *,
@@ -61,24 +63,66 @@ def create_node(
     if parent_uuid is None:
         path = row_data["name"]
     else:
-        parent_row = conn.execute(
-            "SELECT path FROM energydb.node WHERE uuid = %s",
-            (parent_uuid,),
+        parent_row = await (
+            await conn.execute(
+                "SELECT path FROM node WHERE uuid = %s",
+                (parent_uuid,),
+            )
         ).fetchone()
         if parent_row is None:
             raise ValueError(f"parent_uuid={parent_uuid} does not exist")
         path = f"{parent_row[0]}/{row_data['name']}"
 
-    conn.execute(
-        "INSERT INTO energydb.node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+    await conn.execute(
+        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
         (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, path, row_data["data"]),
     )
 
-    _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
+    await _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
     return uuid_val
 
 
-def create_edge(
+async def create_node_raw(
+    conn,
+    *,
+    node_type: str,
+    name: str,
+    data: dict | None = None,
+    parent_uuid: UUID | None,
+    uuid: UUID | None = None,
+) -> UUID:
+    """Insert one node from a type slug + ``data`` dict — no EDM object.
+
+    Generic, EDM-free counterpart to :func:`create_node`: ``node_type`` is
+    stored verbatim and the caller's ``data`` becomes the JSONB blob. Mints a
+    uuid7 when ``uuid`` is omitted, validates ``name``, and materializes
+    ``path`` from the parent. Caller controls the transaction (no commit). A
+    colliding ``(parent_uuid, name)`` pair surfaces as a DB uniqueness error.
+    """
+    uuid_val: UUID = uuid if uuid is not None else uuid7()
+    validate_name(name, kind="node")
+
+    if parent_uuid is None:
+        path = name
+    else:
+        parent_row = await (
+            await conn.execute(
+                "SELECT path FROM node WHERE uuid = %s",
+                (parent_uuid,),
+            )
+        ).fetchone()
+        if parent_row is None:
+            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
+        path = f"{parent_row[0]}/{name}"
+
+    await conn.execute(
+        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+        (uuid_val, node_type, name, parent_uuid, path, Jsonb(data or {})),
+    )
+    return uuid_val
+
+
+async def create_edge(
     conn,
     edm_obj,
     *,
@@ -105,9 +149,10 @@ def create_edge(
     from_uuid = _endpoint_uuid(edm_obj, "from_element", tree_root)
     to_uuid = _endpoint_uuid(edm_obj, "to_element", tree_root)
 
-    row = conn.execute(
-        """
-        INSERT INTO energydb.edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
+    row = await (
+        await conn.execute(
+            """
+        INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (uuid) DO UPDATE
           SET name           = EXCLUDED.name,
@@ -115,16 +160,19 @@ def create_edge(
               to_node_uuid   = EXCLUDED.to_node_uuid,
               data           = EXCLUDED.data,
               updated_at     = now()
-          WHERE energydb.edge.edge_type = EXCLUDED.edge_type
+          WHERE edge.edge_type = EXCLUDED.edge_type
         RETURNING uuid
         """,
-        (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
+            (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
+        )
     ).fetchone()
 
     if row is None:
-        existing = conn.execute(
-            "SELECT edge_type FROM energydb.edge WHERE uuid = %s",
-            (uuid_val,),
+        existing = await (
+            await conn.execute(
+                "SELECT edge_type FROM edge WHERE uuid = %s",
+                (uuid_val,),
+            )
         ).fetchone()
         if existing is None:
             raise RuntimeError("edge upsert returned no row and follow-up SELECT found nothing")
@@ -135,7 +183,7 @@ def create_edge(
                 f"Edge type is immutable for a given id."
             )
 
-    _register_descriptors(conn, owner_col="edge_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
+    await _register_descriptors(conn, owner_col="edge_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
     return uuid_val
 
 
@@ -171,7 +219,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
 # ---------------------------------------------------------------------------
 
 
-def register_tree_under(
+async def register_tree_under(
     conn,
     edm_obj,
     *,
@@ -199,8 +247,8 @@ def register_tree_under(
     _validate_no_inline_data(edm_obj)
 
     target_nodes, target_edges, node_objs, edge_objs, root_uuid = _collect_target_state(edm_obj, parent_uuid)
-    existing_node_uuids = _existing_uuids(conn, "node", list(target_nodes.keys()))
-    existing_edge_uuids = _existing_uuids(conn, "edge", list(target_edges.keys()))
+    existing_node_uuids = await _existing_uuids(conn, "node", list(target_nodes.keys()))
+    existing_edge_uuids = await _existing_uuids(conn, "edge", list(target_edges.keys()))
 
     if existing_node_uuids or existing_edge_uuids:
         parts = []
@@ -232,9 +280,9 @@ def register_tree_under(
     # Series declarations attached to each owner are registered as a side
     # effect of create_node / create_edge.
     for uid, obj in node_objs.items():
-        create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid)
+        await create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid)
     for obj in edge_objs.values():
-        create_edge(conn, obj, tree_root=edm_obj)
+        await create_edge(conn, obj, tree_root=edm_obj)
     return root_uuid, diff
 
 
@@ -317,8 +365,8 @@ def _collect_target_state(
 # ---------------------------------------------------------------------------
 
 
-def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
-    """Return the subset of ``uuids`` that exist in ``energydb.{table}``.
+async def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
+    """Return the subset of ``uuids`` that exist in ``{table}``.
 
     Lighter than ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids``
     when the caller only needs to know *whether* the rows exist (e.g. the
@@ -328,31 +376,37 @@ def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
     """
     if not uuids:
         return []
-    rows = conn.execute(
-        f"SELECT uuid FROM energydb.{table} WHERE uuid = ANY(%s)",
-        (uuids,),
+    rows = await (
+        await conn.execute(
+            f"SELECT uuid FROM {table} WHERE uuid = ANY(%s)",
+            (uuids,),
+        )
     ).fetchall()
     return [r[0] for r in rows]
 
 
-def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
+async def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
     if not uuids:
         return {}
-    rows = conn.execute(
-        "SELECT uuid, node_type, name, parent_uuid, data FROM energydb.node WHERE uuid = ANY(%s)",
-        (uuids,),
+    rows = await (
+        await conn.execute(
+            "SELECT uuid, node_type, name, parent_uuid, data FROM node WHERE uuid = ANY(%s)",
+            (uuids,),
+        )
     ).fetchall()
     return {
         r[0]: NodeSnapshot(uuid=r[0], node_type=r[1], name=r[2], parent_uuid=r[3], data=dict(r[4] or {})) for r in rows
     }
 
 
-def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
+async def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnapshot]:
     if not uuids:
         return {}
-    rows = conn.execute(
-        "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM energydb.edge WHERE uuid = ANY(%s)",
-        (uuids,),
+    rows = await (
+        await conn.execute(
+            "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM edge WHERE uuid = ANY(%s)",
+            (uuids,),
+        )
     ).fetchall()
     return {
         r[0]: EdgeSnapshot(
@@ -396,7 +450,7 @@ def _validate_no_inline_data(edm_obj) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _register_descriptors(
+async def _register_descriptors(
     conn,
     *,
     owner_col: Literal["node_uuid", "edge_uuid"],
@@ -405,10 +459,10 @@ def _register_descriptors(
 ) -> None:
     """Walk ``edm_obj.timeseries`` and register every entry on this owner."""
     for ts in getattr(edm_obj, "timeseries", None) or []:
-        _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts)
+        await _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts)
 
 
-def _register_one(
+async def _register_one(
     conn,
     *,
     owner_col: Literal["node_uuid", "edge_uuid"],
@@ -429,7 +483,7 @@ def _register_one(
     if timeseries_type is None:
         raise ValueError(f"ts.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
 
-    return series_mod.register_series(
+    return await series_mod.register_series(
         conn,
         owner_col=owner_col,
         owner_uuid=owner_uuid,

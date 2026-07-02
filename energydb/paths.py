@@ -37,10 +37,9 @@ class ResolveSummary(NamedTuple):
 Path = tuple[str, ...]
 
 
-# LIKE-escape helper for bind-param prefixes. The mirror SQL function is
-# ``energydb._like_esc`` (see models.py) for column-source prefixes — the
-# planner can fold the call when it sits in front of a bound row reference.
-# Both must produce the same output for the regression test to be meaningful.
+# LIKE-escape helper for bind-param prefixes: escape PG LIKE metacharacters so
+# a literal path prefix is matched literally with ``... LIKE %s ESCAPE '\\'``.
+# Subtree queries fetch the prefix into Python and pass it as a bind param.
 _LIKE_TRANS = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 
 
@@ -48,7 +47,6 @@ def _like_escape(s: str) -> str:
     """Escape PG LIKE metacharacters in a literal prefix.
 
     Use with ``... LIKE %s ESCAPE '\\'`` when the prefix is a bind parameter.
-    For column-source prefixes use the SQL ``energydb._like_esc()`` function.
     """
     return s.translate(_LIKE_TRANS)
 
@@ -58,7 +56,7 @@ def _like_escape(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UUID:
+async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UUID:
     """Resolve a path tuple like ``("Europe", "Sweden", "Lillgrund")`` to a uuid.
 
     Single indexed equality on the materialized ``node.path`` column
@@ -73,18 +71,22 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
 
     joined = "/".join(path)
     if start_uuid is None:
-        row = conn.execute(
-            "SELECT uuid FROM energydb.node WHERE path = %s",
-            (joined,),
+        row = await (
+            await conn.execute(
+                "SELECT uuid FROM node WHERE path = %s",
+                (joined,),
+            )
         ).fetchone()
     else:
         # One round-trip: derive the start node's path inline and compose.
-        row = conn.execute(
-            """
-            SELECT n.uuid FROM energydb.node n, energydb.node s
+        row = await (
+            await conn.execute(
+                """
+            SELECT n.uuid FROM node n, node s
             WHERE s.uuid = %s AND n.path = s.path || '/' || %s
             """,
-            (start_uuid, joined),
+                (start_uuid, joined),
+            )
         ).fetchone()
 
     if row is None:
@@ -94,7 +96,7 @@ def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None) -> UU
     return row[0]
 
 
-def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
+async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
     """Bulk-resolve a list of path tuples to uuids in one round-trip.
 
     Joins each tuple with ``/`` and hits the unique ``node.path`` index in
@@ -114,9 +116,11 @@ def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
             unique.append(t)
 
     joined_keys = ["/".join(p) for p in unique]
-    rows = conn.execute(
-        "SELECT path, uuid FROM energydb.node WHERE path = ANY(%s)",
-        (joined_keys,),
+    rows = await (
+        await conn.execute(
+            "SELECT path, uuid FROM node WHERE path = ANY(%s)",
+            (joined_keys,),
+        )
     ).fetchall()
 
     out: dict[Path, UUID] = {}
@@ -177,7 +181,7 @@ def build_filter_conditions(
 # ---------------------------------------------------------------------------
 
 
-def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
+async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     """Return self + every descendant uuid for ``node_uuid``.
 
     Two PG round-trips: the root path lookup, then a prefix-LIKE on the
@@ -187,19 +191,23 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     LIKE would force a Seq Scan. Net 2.4× faster than the single-query
     self-join on bench-scale data (44 ms → 18 ms at C=200).
     """
-    row = conn.execute(
-        "SELECT path FROM energydb.node WHERE uuid = %s",
-        (node_uuid,),
+    row = await (
+        await conn.execute(
+            "SELECT path FROM node WHERE uuid = %s",
+            (node_uuid,),
+        )
     ).fetchone()
     if row is None:
         return []
     prefix = row[0]
-    rows = conn.execute(
-        r"""
-        SELECT uuid FROM energydb.node
+    rows = await (
+        await conn.execute(
+            r"""
+        SELECT uuid FROM node
         WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
         """,
-        (prefix, _like_escape(prefix)),
+            (prefix, _like_escape(prefix)),
+        )
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -209,11 +217,13 @@ def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_path(conn, node_uuid: UUID) -> Path:
+async def resolve_path(conn, node_uuid: UUID) -> Path:
     """Return the full path tuple from root → node."""
-    row = conn.execute(
-        "SELECT path FROM energydb.node WHERE uuid = %s",
-        (node_uuid,),
+    row = await (
+        await conn.execute(
+            "SELECT path FROM node WHERE uuid = %s",
+            (node_uuid,),
+        )
     ).fetchone()
     if row is None:
         raise ValueError(f"Node not found: uuid={node_uuid}")
@@ -225,14 +235,16 @@ def resolve_path(conn, node_uuid: UUID) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str) -> UUID:
+async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str) -> UUID:
     """Resolve an edge by its triple identity to its uuid."""
-    paths = resolve_paths_to_uuids(conn, [from_path, to_path])
+    paths = await resolve_paths_to_uuids(conn, [from_path, to_path])
     from_uuid = paths[tuple(from_path)]
     to_uuid = paths[tuple(to_path)]
-    rows = conn.execute(
-        "SELECT uuid FROM energydb.edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
-        (edge_type, from_uuid, to_uuid),
+    rows = await (
+        await conn.execute(
+            "SELECT uuid FROM edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
+            (edge_type, from_uuid, to_uuid),
+        )
     ).fetchall()
     if not rows:
         raise ValueError(f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}")
@@ -248,17 +260,17 @@ _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 
 
-def resolve_manifest(
+async def resolve_manifest(
     conn, manifest: pl.DataFrame, *, attach_path: bool = True, run: RunRow | None = None
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
     Detects routing mode from the columns present:
 
-    * ``node_uuid`` — direct lookup against ``energydb.series.node_uuid``.
+    * ``node_uuid`` — direct lookup against ``series.node_uuid``.
     * ``path``      — ``Utf8`` path joined with ``/`` (e.g. ``"a/b/c"``);
       resolved to ``node_uuid`` first.
-    * ``edge_uuid`` — direct lookup against ``energydb.series.edge_uuid``.
+    * ``edge_uuid`` — direct lookup against ``series.edge_uuid``.
 
     The manifest must also carry ``data_type`` and ``name`` columns. Returns
     the original frame plus per-row ``series_id``, ``retention``, and
@@ -290,9 +302,11 @@ def resolve_manifest(
     # call: folded into the path resolve as a data-modifying CTE (one round-trip),
     # or run standalone for the owner routes that can't fold it.
     if route == "edge_uuid":
-        resolved, summary = _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
+        resolved, summary = await _resolve_manifest_by_owner(
+            conn, manifest, owner_col="edge_uuid", attach_path=attach_path
+        )
         if run is not None:
-            upsert_run_row(conn, run)
+            await upsert_run_row(conn, run)
         return resolved, summary
     if route == "path":
         # Write pipelines (attach_path=False) collapse path → series (and the run
@@ -300,15 +314,15 @@ def resolve_manifest(
         # path→uuid, then the owner scan) because the post-read hierarchy attach
         # needs ``node_uuid`` surfaced on the resolved frame.
         if not attach_path:
-            return _resolve_manifest_by_path(conn, manifest, run=run)
-        manifest = _attach_node_uuid_from_path(conn, manifest)
-    resolved, summary = _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
+            return await _resolve_manifest_by_path(conn, manifest, run=run)
+        manifest = await _attach_node_uuid_from_path(conn, manifest)
+    resolved, summary = await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
     if run is not None:
-        upsert_run_row(conn, run)
+        await upsert_run_row(conn, run)
     return resolved, summary
 
 
-def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
+async def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
     """Resolve every ``path`` (Utf8, joined with ``/``) to a ``node_uuid`` and attach it.
 
     The manifest ``path`` column must be ``Utf8`` — strings like ``"a/b/c"``.
@@ -330,7 +344,7 @@ def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
         return manifest.with_columns(pl.lit(None, dtype=pl.Utf8).cast(pl.Utf8).alias("node_uuid"))
 
     miss_tuples = [tuple(p.split("/")) for p in unique_paths_str]
-    pg_map = resolve_paths_to_uuids(conn, miss_tuples)
+    pg_map = await resolve_paths_to_uuids(conn, miss_tuples)
     path_to_uuid_str: dict[str, str] = {
         "/".join(path_tuple): str(node_uuid) for path_tuple, node_uuid in pg_map.items()
     }
@@ -356,19 +370,19 @@ def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
 # JOIN-to-owner-row from the core series scan lets writes opt out of the
 # hierarchy attach entirely — saves ~20ms PG-side at scale=200.
 _OWNER_PATH_SELECT = {
-    ("node_uuid", True): (", n.path AS path", " LEFT JOIN energydb.node n ON n.uuid = s.node_uuid"),
+    ("node_uuid", True): (", n.path AS path", " LEFT JOIN node n ON n.uuid = s.node_uuid"),
     ("node_uuid", False): ("", ""),
     ("edge_uuid", True): (
         ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path",
-        " LEFT JOIN energydb.edge e  ON e.uuid = s.edge_uuid"
-        " LEFT JOIN energydb.node fn ON fn.uuid = e.from_node_uuid"
-        " LEFT JOIN energydb.node tn ON tn.uuid = e.to_node_uuid",
+        " LEFT JOIN edge e  ON e.uuid = s.edge_uuid"
+        " LEFT JOIN node fn ON fn.uuid = e.from_node_uuid"
+        " LEFT JOIN node tn ON tn.uuid = e.to_node_uuid",
     ),
     ("edge_uuid", False): ("", ""),
 }
 
 
-def _resolve_manifest_by_owner(
+async def _resolve_manifest_by_owner(
     conn,
     manifest: pl.DataFrame,
     *,
@@ -437,15 +451,17 @@ def _resolve_manifest_by_owner(
     # per-row UUID-object parse.
     unique_owners = list({t[0] for t in miss_triples})
     extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
-    rows = conn.execute(
-        f"""
+    rows = await (
+        await conn.execute(
+            f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
-        FROM energydb.series s
+        FROM series s
         {join_sql}
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,
-        (unique_owners,),
+            (unique_owners,),
+        )
     ).fetchall()
     # Meta tuple layout:
     #   attach_path=False:  (series_id, canonical_unit, timeseries_type, retention)
@@ -506,7 +522,7 @@ def _resolve_manifest_by_owner(
     return resolved, summary
 
 
-def _resolve_manifest_by_path(
+async def _resolve_manifest_by_path(
     conn, manifest: pl.DataFrame, *, run: RunRow | None = None
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a path-routed *write* manifest to series in ONE round-trip.
@@ -546,15 +562,17 @@ def _resolve_manifest_by_path(
     cte_sql, cte_params = ("", ())
     if run is not None:
         cte_sql, cte_params = run_upsert_cte(run)
-    rows = conn.execute(
-        cte_sql
-        + """
+    rows = await (
+        await conn.execute(
+            cte_sql
+            + """
         SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention
-        FROM energydb.node n
-        JOIN energydb.series s ON s.node_uuid = n.uuid
+        FROM node n
+        JOIN series s ON s.node_uuid = n.uuid
         WHERE n.path = ANY(%s)
         """,
-        (*cte_params, unique_paths),
+            (*cte_params, unique_paths),
+        )
     ).fetchall()
     triple_to_meta: dict[tuple[str, str, str], tuple] = {}
     for path, dt, name, sid, unit, ts_type, retention in rows:

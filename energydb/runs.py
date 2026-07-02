@@ -1,4 +1,4 @@
-"""Run metadata operations on the ``energydb.runs`` PostgreSQL table.
+"""Run metadata operations on the ``runs`` PostgreSQL table.
 
 ``run_id`` is client-generated (uuid7 truncated to UInt64). This removes the
 round-trip to PG for id allocation: the write path mints an id, upserts the
@@ -15,7 +15,7 @@ from uuid6 import uuid7
 
 
 class RunRow(NamedTuple):
-    """The columns of an ``energydb.runs`` upsert, carried as one value.
+    """The columns of a ``runs`` upsert, carried as one value.
 
     Lets the write path fold the run upsert into the manifest-resolve query
     (one round-trip) via :func:`run_upsert_cte`, or run it standalone via
@@ -31,7 +31,7 @@ class RunRow(NamedTuple):
 
 # INSERT … ON CONFLICT body, shared by the standalone upsert and the foldable
 # CTE. Idempotent under retry; immutable run identity keyed by run_id.
-_RUN_UPSERT_BODY = """INSERT INTO energydb.runs
+_RUN_UPSERT_BODY = """INSERT INTO runs
             (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (run_id) DO UPDATE SET
@@ -67,9 +67,9 @@ def run_upsert_cte(run: RunRow) -> tuple[str, tuple]:
     return f"WITH run_ins AS (\n        {_RUN_UPSERT_BODY}\n    )\n", _run_params(run)
 
 
-def upsert_run_row(conn, run: RunRow) -> None:
+async def upsert_run_row(conn, run: RunRow) -> None:
     """Standalone run upsert (the non-folded path, e.g. owner-routed writes)."""
-    conn.execute(_RUN_UPSERT_BODY, _run_params(run))
+    await conn.execute(_RUN_UPSERT_BODY, _run_params(run))
 
 
 def generate_run_id() -> int:
@@ -82,7 +82,7 @@ def generate_run_id() -> int:
     return uuid7().int >> 65
 
 
-def upsert_run(
+async def upsert_run(
     conn,
     *,
     run_id: int,
@@ -93,26 +93,28 @@ def upsert_run(
     run_params: dict | None = None,
 ) -> None:
     """Insert or update a run row. Idempotent under retry."""
-    upsert_run_row(
+    await upsert_run_row(
         conn,
         RunRow(run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params),
     )
 
 
-def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
+async def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
     """Hydrate run metadata by id. Returns matched rows ordered by
     ``inserted_at`` descending (latest run first)."""
     if not run_ids:
         return []
-    rows = conn.execute(
-        """
-        SELECT run_id, workflow_id, model_name, run_start_time, run_finish_time,
-               run_params, inserted_at
-        FROM energydb.runs
-        WHERE run_id = ANY(%s)
-        ORDER BY inserted_at DESC
-        """,
-        (run_ids,),
+    rows = await (
+        await conn.execute(
+            """
+            SELECT run_id, workflow_id, model_name, run_start_time, run_finish_time,
+                   run_params, inserted_at
+            FROM runs
+            WHERE run_id = ANY(%s)
+            ORDER BY inserted_at DESC
+            """,
+            (run_ids,),
+        )
     ).fetchall()
     return [
         {

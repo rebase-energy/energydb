@@ -68,7 +68,7 @@ def validate_name(name: str, *, kind: str) -> None:
         )
 
 
-def register_series(
+async def register_series(
     conn,
     *,
     owner_col: OwnerCol,
@@ -101,27 +101,31 @@ def register_series(
     edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
     conflict_constraint = _CONFLICT_CONSTRAINT_BY_OWNER[owner_col]
 
-    row = conn.execute(
-        f"""
-        INSERT INTO energydb.series
-            (node_uuid, edge_uuid, data_type, name, canonical_unit,
-             timeseries_type, retention, description)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
-        RETURNING series_id
-        """,
-        (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
+    row = await (
+        await conn.execute(
+            f"""
+            INSERT INTO series
+                (node_uuid, edge_uuid, data_type, name, canonical_unit,
+                 timeseries_type, retention, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
+            RETURNING series_id
+            """,
+            (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
+        )
     ).fetchone()
 
     if row is not None:
         return row[0]
 
     # Conflict: fetch the existing row and verify the immutable fields agree.
-    existing = conn.execute(
-        f"SELECT series_id, canonical_unit, retention "
-        f"FROM energydb.series "
-        f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
-        (owner_uuid, data_type, name),
+    existing = await (
+        await conn.execute(
+            f"SELECT series_id, canonical_unit, retention "
+            f"FROM series "
+            f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
+            (owner_uuid, data_type, name),
+        )
     ).fetchone()
     if existing is None:
         raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
@@ -137,7 +141,7 @@ def register_series(
     return existing_sid
 
 
-def resolve_subtree_series_for_read(
+async def resolve_subtree_series_for_read(
     conn,
     *,
     root_path: str | None = None,
@@ -170,10 +174,10 @@ def resolve_subtree_series_for_read(
         root_cte = "SELECT %s::text AS rp"
         cte_params.append(root_path)
     elif start_uuid is not None and rel_path:
-        root_cte = "SELECT (path || '/' || %s) AS rp FROM energydb.node WHERE uuid = %s"
+        root_cte = "SELECT (path || '/' || %s) AS rp FROM node WHERE uuid = %s"
         cte_params.extend([rel_path, start_uuid])
     elif start_uuid is not None:
-        root_cte = "SELECT path AS rp FROM energydb.node WHERE uuid = %s"
+        root_cte = "SELECT path AS rp FROM node WHERE uuid = %s"
         cte_params.append(start_uuid)
     else:
         raise ValueError("resolve_subtree_series_for_read needs root_path or start_uuid.")
@@ -188,17 +192,24 @@ def resolve_subtree_series_for_read(
         where_vals.append(name)
     where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
 
+    # The subtree prefix is the root path or a DB-derived path (start_uuid
+    # branch), so it can't always be escaped Python-side; inline the LIKE
+    # metacharacter escape in SQL — the former ``energydb._like_esc`` helper,
+    # dropped from the schema, expanded here — to keep the resolve one round-trip.
     sql = rf"""
         WITH root AS ({root_cte})
         SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
                s.node_uuid::text AS node_uuid, s.data_type, s.name, n.path AS path
         FROM root r
-        JOIN energydb.node n
-          ON (n.path = r.rp OR n.path LIKE energydb._like_esc(r.rp) || '/%%' ESCAPE '\')
-        JOIN energydb.series s ON s.node_uuid = n.uuid
+        JOIN node n
+          ON (n.path = r.rp
+              OR n.path LIKE
+                 replace(replace(replace(r.rp, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_')
+                 || '/%%' ESCAPE '\')
+        JOIN series s ON s.node_uuid = n.uuid
         WHERE TRUE{where_clause}
     """
-    rows = conn.execute(sql, [*cte_params, *where_vals]).fetchall()
+    rows = await (await conn.execute(sql, [*cte_params, *where_vals])).fetchall()
 
     return pl.DataFrame(
         [
@@ -227,7 +238,7 @@ def resolve_subtree_series_for_read(
     )
 
 
-def resolve_for_read(
+async def resolve_for_read(
     conn,
     *,
     owner_col: OwnerCol,
@@ -257,13 +268,13 @@ def resolve_for_read(
 
     if owner_col == "node_uuid":
         select_extra = ", n.path AS path"
-        join_sql = "JOIN energydb.node n ON n.uuid = s.node_uuid"
+        join_sql = "JOIN node n ON n.uuid = s.node_uuid"
     else:
         select_extra = ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path"
         join_sql = (
-            "JOIN energydb.edge e   ON e.uuid = s.edge_uuid "
-            "JOIN energydb.node fn  ON fn.uuid = e.from_node_uuid "
-            "JOIN energydb.node tn  ON tn.uuid = e.to_node_uuid"
+            "JOIN edge e   ON e.uuid = s.edge_uuid "
+            "JOIN node fn  ON fn.uuid = e.from_node_uuid "
+            "JOIN node tn  ON tn.uuid = e.to_node_uuid"
         )
 
     # ``::text`` casts on the uuid columns: PG returns strings directly,
@@ -272,10 +283,10 @@ def resolve_for_read(
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
         "s.node_uuid::text, s.edge_uuid::text, s.data_type, s.name" + select_extra + " "
-        "FROM energydb.series s " + join_sql + " "
+        "FROM series s " + join_sql + " "
         "WHERE " + " AND ".join(conditions)
     )
-    rows = conn.execute(sql, params).fetchall()
+    rows = await (await conn.execute(sql, params)).fetchall()
 
     if owner_col == "node_uuid":
         return pl.DataFrame(
