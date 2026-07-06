@@ -42,7 +42,7 @@ from timedb import TimeDBClient, UnchangedScope, profiling
 from energydb import runs as runs_mod
 from energydb._fast_read import engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, read_manifest, read_relative_manifest, write_manifest
+from energydb._io import WriteResult, execute_read, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
@@ -765,10 +765,10 @@ class AsyncClient:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = await read_manifest(
+        result = await execute_read(
             self._pool,
             self.td,
-            manifest,
+            manifest=manifest,
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -805,13 +805,14 @@ class AsyncClient:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = await read_relative_manifest(
+        result = await execute_read(
             self._pool,
             self.td,
-            manifest,
+            manifest=manifest,
+            relative=True,
             unit=unit,
             output=output,
-            **td_kwargs,
+            td_kwargs=td_kwargs,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             return to_backend(result, backend)

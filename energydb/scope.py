@@ -32,7 +32,7 @@ from timedb import UnchangedScope, profiling
 
 from energydb import series as series_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, execute_concurrent, read_relative_resolved, read_resolved
+from energydb._io import WriteResult, execute_concurrent, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -323,7 +323,7 @@ class _BaseScope:
 
         Returns one row per series with columns ``(series_id, retention,
         canonical_unit, data_type, name)`` plus exactly one of
-        ``node_uuid`` / ``edge_uuid`` — the input shape :func:`read_resolved`
+        ``node_uuid`` / ``edge_uuid`` — the input shape :func:`execute_read`
         expects. Returns ``None`` when the scope is empty / nothing matches.
         """
         raise NotImplementedError
@@ -348,6 +348,18 @@ class _BaseScope:
         never run concurrent.
         """
         return _FALLBACK
+
+    def _finalize_result(self, result, *, n_series: int, output: str, backend: Backend):
+        """Shared tail of every scope read: single-series identity strip + backend convert.
+
+        When a frame-shaped read resolved to exactly one series, the caller
+        unambiguously asked for that series' data, so the broadcast identity
+        columns are dropped (see :func:`_strip_scope_identity`). The polars
+        result converts to the requested backend at this boundary.
+        """
+        if output == "frame" and n_series == 1 and isinstance(result, pl.DataFrame):
+            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+        return to_backend(result, backend)
 
     # -- shared mutation machinery -------------------------------------
 
@@ -540,21 +552,17 @@ class _BaseScope:
             )
             if res is not _FALLBACK:
                 result, n_series = res
-                if output == "frame" and n_series == 1 and isinstance(result, pl.DataFrame):
-                    result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
-                return to_backend(result, backend)
+                return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
         meta = await self._build_resolved_meta(data_type=data_type, name=name)
         if meta is None:
             empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
                 {} if output == "by_path" else pl.DataFrame()
             )
             return to_backend(empty, backend)
-        # Take the polars result first so the auto-strip is a single dtype op;
-        # convert to the requested backend at the boundary.
-        result = await read_resolved(
+        result = await execute_read(
             self._pool,
             self._td,
-            meta,
+            meta=meta,
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -564,9 +572,7 @@ class _BaseScope:
             include_knowledge_time=include_knowledge_time,
             output=output,
         )
-        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
-            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
-        return to_backend(result, backend)
+        return self._finalize_result(result, n_series=meta.height, output=output, backend=backend)
 
     async def read_relative(
         self,
@@ -599,17 +605,16 @@ class _BaseScope:
                 {} if output == "by_path" else pl.DataFrame()
             )
             return to_backend(empty, backend)
-        result = await read_relative_resolved(
+        result = await execute_read(
             self._pool,
             self._td,
-            meta,
+            meta=meta,
+            relative=True,
             unit=unit,
             output=output,
-            **td_read_kwargs,
+            td_kwargs=td_read_kwargs,
         )
-        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
-            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
-        return to_backend(result, backend)
+        return self._finalize_result(result, n_series=meta.height, output=output, backend=backend)
 
 
 # ---------------------------------------------------------------------------
@@ -1148,7 +1153,7 @@ class NodeScope(_BaseScope):
         """Resolve the scope's subtree to per-series read meta in one PG round-trip.
 
         Returns the per-series ``(series_id, retention, canonical_unit,
-        data_type, name, node_uuid)`` frame :func:`read_resolved` consumes
+        data_type, name, node_uuid)`` frame :func:`execute_read` consumes
         directly — no second hash-and-join pass through
         :func:`resolve_manifest`. ``None`` when the subtree is empty or no
         series match the optional ``data_type`` / ``name`` filters.

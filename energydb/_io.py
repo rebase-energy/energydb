@@ -245,105 +245,56 @@ async def execute_concurrent(
     apply the single-series identity strip).
     """
     ms = PgEngineMeta(table=CH_ENGINE_TABLE, root_path=root_path, data_type=data_type, name=name)
-
-    def _call() -> pl.DataFrame:
-        return td.read(
-            series_ids=[],
-            retention=None,
-            meta_source=ms,
-            start_valid=start_valid,
-            end_valid=end_valid,
-            start_known=start_known,
-            end_known=end_known,
-            include_updates=include_updates,
-            include_knowledge_time=include_knowledge_time,
-        )
-
-    meta, result = await asyncio.gather(meta_awaitable, asyncio.to_thread(_call))
+    call = _td_call(
+        td,
+        relative=False,
+        meta_source=ms,
+        kwargs={
+            "start_valid": start_valid,
+            "end_valid": end_valid,
+            "start_known": start_known,
+            "end_known": end_known,
+            "include_updates": include_updates,
+            "include_knowledge_time": include_knowledge_time,
+        },
+    )
+    # series_ids/retention are unused when meta_source resolves them server-side.
+    meta, result = await asyncio.gather(meta_awaitable, asyncio.to_thread(call, [], None))
     if meta is None or meta.height == 0:
         return ({} if output == "by_path" else pl.DataFrame()), 0
     return _finish_read(pool, result, meta, unit=unit, output=output), meta.height
 
 
-async def _read_pipeline(
-    pool,
-    manifest: pl.DataFrame,
-    td_call: Callable[[list[int], list[str]], pl.DataFrame],
-    *,
-    unit: str | None,
-    output: str = "frame",
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
-    """Manifest-driven read: resolve then execute. Used by ``Client.read`` and
-    ``Client.read_relative`` (which both accept a routing manifest).
-
-    Scope reads bypass this and call :func:`read_resolved` directly with
-    meta they already have from the scope's PG resolve.
-    """
-    is_edge = "edge_uuid" in manifest.columns
-    with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-        async with pool.connection() as conn:
-            resolved, _summary = await resolve_manifest(conn, manifest)
-    with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-        meta = _meta_from_resolved(resolved, is_edge=is_edge)
-    return await _execute_read(pool, meta, td_call, unit=unit, output=output)
-
-
-async def read_resolved(
-    pool,
+def _td_call(
     td,
-    meta: pl.DataFrame,
     *,
-    unit: str | None = None,
-    start_valid: datetime | None = None,
-    end_valid: datetime | None = None,
-    start_known: datetime | None = None,
-    end_known: datetime | None = None,
-    include_updates: bool = False,
-    include_knowledge_time: bool = False,
-    output: str = "frame",
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
-    """Read entry-point for callers who already have per-series meta.
+    relative: bool,
+    kwargs: dict,
+    meta_source: PgEngineMeta | None = None,
+) -> Callable[[list[int], list[str] | None], pl.DataFrame]:
+    """Build the ClickHouse value-read closure for :func:`_execute_read`.
 
-    Skips :func:`resolve_manifest` entirely — scope reads compute ``meta``
-    via the single-round-trip scope resolvers (``resolve_subtree_series_for_read``
-    / ``resolve_edge_series_for_read``) and feed it
-    straight in, avoiding the manifest hash / unique / lookup-join pass.
+    One factory instead of a copy of this closure per read entry point.
+    ``relative`` picks ``td.read_relative`` over ``td.read``; ``kwargs`` carry
+    the read's bitemporal/window arguments; ``meta_source`` (the concurrent
+    path) makes the CH query self-resolve its ``series_id`` set via the
+    PostgreSQL engine table instead of the id array.
     """
+    if relative:
 
-    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
-        return td.read(
-            series_ids=series_ids,
-            retention=retentions,
-            start_valid=start_valid,
-            end_valid=end_valid,
-            start_known=start_known,
-            end_known=end_known,
-            include_updates=include_updates,
-            include_knowledge_time=include_knowledge_time,
-        )
+        def _call(series_ids: list[int], retentions: list[str] | None) -> pl.DataFrame:
+            return td.read_relative(series_ids=series_ids, retention=retentions, **kwargs)
 
-    return await _execute_read(pool, meta, _call, unit=unit, output=output)
+    else:
+
+        def _call(series_ids: list[int], retentions: list[str] | None) -> pl.DataFrame:
+            return td.read(series_ids=series_ids, retention=retentions, meta_source=meta_source, **kwargs)
+
+    return _call
 
 
-async def read_relative_resolved(
-    pool,
-    td,
-    meta: pl.DataFrame,
-    *,
-    unit: str | None = None,
-    output: str = "frame",
-    **td_kwargs,
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
-    """Like :func:`read_resolved` but routes through ``td.read_relative``."""
-
-    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
-        return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
-
-    return await _execute_read(pool, meta, _call, unit=unit, output=output)
-
-
-def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
-    """Project the per-series meta columns the read pipeline needs.
+def _project_meta(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
+    """Project a resolved manifest to the canonical per-series meta slice.
 
     Returns the per-series identity slice deduplicated by ``series_id``.
     Includes the hierarchy paths attached by :func:`resolve_manifest` so
@@ -365,62 +316,66 @@ def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFram
     return resolved.select(cols).unique()
 
 
-async def read_manifest(
+async def execute_read(
     pool,
     td,
-    manifest: pl.DataFrame,
     *,
+    meta: pl.DataFrame | None = None,
+    manifest: pl.DataFrame | None = None,
+    relative: bool = False,
     unit: str | None = None,
+    output: str = "frame",
     start_valid: datetime | None = None,
     end_valid: datetime | None = None,
     start_known: datetime | None = None,
     end_known: datetime | None = None,
     include_updates: bool = False,
     include_knowledge_time: bool = False,
-    output: str = "frame",
+    td_kwargs: dict | None = None,
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
-    """Bulk read via manifest. Detects edge vs node routing automatically.
+    """The one sequential read pipeline: obtain meta → CH value read → finish.
 
-    ``output="frame"`` returns a single long DataFrame; ``output="by_path"``
-    returns a ``dict[(path, data_type, name), DataFrame]`` (or edge
-    equivalent). See :meth:`Client.read` for the public contract.
+    Callers hand in exactly one of:
+
+    * ``meta`` — pre-resolved per-series meta (scope reads, which resolve in a
+      single PG round-trip via ``resolve_subtree_series_for_read`` /
+      ``resolve_edge_series_for_read``), or
+    * ``manifest`` — a routing manifest (``Client.read`` /
+      ``Client.read_relative``), resolved here via :func:`resolve_manifest` +
+      :func:`_project_meta`.
+
+    ``relative=False`` reads values through ``td.read`` with the explicit
+    bitemporal args; ``relative=True`` routes through ``td.read_relative`` with
+    ``td_kwargs`` (see :meth:`timedb.TimeDBClient.read_relative` for accepted
+    window arguments). All paths converge on :func:`_execute_read` →
+    :func:`_finish_read`.
     """
-
-    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
-        return td.read(
-            series_ids=series_ids,
-            retention=retentions,
-            start_valid=start_valid,
-            end_valid=end_valid,
-            start_known=start_known,
-            end_known=end_known,
-            include_updates=include_updates,
-            include_knowledge_time=include_knowledge_time,
+    if (meta is None) == (manifest is None):
+        raise ValueError("execute_read requires exactly one of meta= or manifest=.")
+    if manifest is not None:
+        is_edge = "edge_uuid" in manifest.columns
+        with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+            async with pool.connection() as conn:
+                resolved, _summary = await resolve_manifest(conn, manifest)
+        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            meta = _project_meta(resolved, is_edge=is_edge)
+    assert meta is not None  # narrowed by the exactly-one guard above
+    if relative:
+        call = _td_call(td, relative=True, kwargs=td_kwargs or {})
+    else:
+        call = _td_call(
+            td,
+            relative=False,
+            kwargs={
+                "start_valid": start_valid,
+                "end_valid": end_valid,
+                "start_known": start_known,
+                "end_known": end_known,
+                "include_updates": include_updates,
+                "include_knowledge_time": include_knowledge_time,
+            },
         )
-
-    return await _read_pipeline(pool, manifest, _call, unit=unit, output=output)
-
-
-async def read_relative_manifest(
-    pool,
-    td,
-    manifest: pl.DataFrame,
-    *,
-    unit: str | None = None,
-    output: str = "frame",
-    **td_kwargs,
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
-    """Bulk relative read via manifest.
-
-    ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
-    see that signature for accepted arguments. See :meth:`Client.read_relative`
-    for the public contract of ``output``.
-    """
-
-    def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
-        return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
-
-    return await _read_pipeline(pool, manifest, _call, unit=unit, output=output)
+    return await _execute_read(pool, meta, call, unit=unit, output=output)
 
 
 def apply_per_series_unit(
