@@ -24,6 +24,7 @@ API split:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -40,7 +41,7 @@ from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
-from energydb._fast_read import engine_table_ddl
+from energydb._ch_meta_engine import DROP_ENGINE_TABLE, engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import WriteResult, execute_read, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
@@ -58,6 +59,8 @@ from energydb.scope import EdgeScope, NodeScope, _coerce_path
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
 _SEARCH_PATH = f"SET search_path TO {SCHEMA}, public" if SCHEMA else "SET search_path TO public"
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncClient:
@@ -80,9 +83,10 @@ class AsyncClient:
         """Construct a client.
 
         ``strategy`` is the default read strategy (``"today"`` | ``"concurrent"``);
-        a per-read ``strategy=`` overrides it. ``concurrent`` requires
-        :meth:`setup_ch_fast_read` to have provisioned the ClickHouse engine table,
-        and falls back to ``"today"`` on any gate-miss or error.
+        a per-read ``strategy=`` overrides it. ``concurrent`` requires the ClickHouse
+        engine table (provisioned by :meth:`create` for fresh DBs, or explicitly by
+        :meth:`setup_ch_meta_engine`), and falls back to ``"today"`` on any gate-miss
+        or error.
         """
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
@@ -113,6 +117,9 @@ class AsyncClient:
         )
         self.td = TimeDBClient(ch_url=ch_url)
         self._strategy = strategy
+        # Set on the first concurrent-path failure; the rest of the session uses the
+        # sequential resolve without re-trying the engine. setup_ch_meta_engine() resets it.
+        self._engine_unavailable = False
 
     async def open(self) -> None:
         """Open the async connection pool. Await once before first use."""
@@ -140,13 +147,28 @@ class AsyncClient:
     # ------------------------------------------------------------------
 
     async def create(self) -> None:
-        """Create PG schema + CH tables.
+        """Create PG schema + CH tables, and provision the CH meta engine table.
 
-        Schema is defined by the SQLAlchemy models in :mod:`energydb.models`.
-        SQLAlchemy's ``create_all`` and TimeDB's create are synchronous, so they
-        run in a worker thread to keep the event loop free.
+        Schema is defined by the SQLAlchemy models in :mod:`energydb.models`
+        (the ``series_meta`` view rides on the DDL events). SQLAlchemy's
+        ``create_all`` and TimeDB's create are synchronous, so they run in a
+        worker thread to keep the event loop free.
+
+        The engine table is best-effort: a CH role that cannot create
+        ``PostgreSQL()`` engine tables must not break ``create()`` for
+        deployments that never enable ``concurrent`` — those get a logged
+        warning and reads fall back to the sequential path.
+        :meth:`setup_ch_meta_engine` is the explicit, raising alternative.
         """
         await asyncio.to_thread(self._create_blocking)
+        try:
+            await asyncio.to_thread(self.td._ch.command, engine_table_ddl(self._dsn, SCHEMA or "public"))
+        except Exception:  # noqa: BLE001  -- best-effort; concurrent reads degrade to sequential
+            logger.warning(
+                "could not provision the ClickHouse meta engine table; "
+                "'concurrent' reads will fall back to the sequential path",
+                exc_info=True,
+            )
 
     def _create_blocking(self) -> None:
         engine = create_engine(self._sqlalchemy_url())
@@ -171,20 +193,23 @@ class AsyncClient:
                 await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             await conn.commit()
         await asyncio.to_thread(self.td.delete)
+        await asyncio.to_thread(self.td._ch.command, DROP_ENGINE_TABLE)
 
-    async def setup_ch_fast_read(self) -> None:
-        """Provision the ClickHouse scaffolding for the ``concurrent`` read strategy.
+    async def setup_ch_meta_engine(self) -> None:
+        """Provision the ClickHouse ↔ PG metadata bridge for ``concurrent`` reads.
 
-        Idempotent. (Re)creates the PG ``series_meta`` view and the ClickHouse ``PostgreSQL()``
-        engine table over it (PG creds taken inline from the client DSN -- works with an
-        unprivileged CH role). Call once per deployment before enabling ``concurrent``;
-        safe to call repeatedly.
+        Idempotent. (Re)creates the PG ``series_meta`` view and the ClickHouse
+        ``PostgreSQL()`` engine table over it (see :mod:`energydb._ch_meta_engine`
+        for the credential/vantage resolution). Unlike :meth:`create`'s best-effort
+        provisioning this raises on failure, and it clears the session's
+        engine-unavailable degrade flag — call it to re-enable ``concurrent``
+        after fixing engine infrastructure.
         """
         async with self._pool.connection() as conn:
             await conn.execute(CREATE_SERIES_META_VIEW)
             await conn.commit()
-        schema = os.environ.get("ENERGYDB_SCHEMA", "public")
-        await asyncio.to_thread(self.td._ch.command, engine_table_ddl(self._dsn, schema))
+        await asyncio.to_thread(self.td._ch.command, engine_table_ddl(self._dsn, SCHEMA or "public"))
+        self._engine_unavailable = False
 
     async def close(self) -> None:
         await self._pool.close()

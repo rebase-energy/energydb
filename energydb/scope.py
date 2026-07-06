@@ -17,6 +17,7 @@ resolution query and execute.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -1118,8 +1119,12 @@ class NodeScope(_BaseScope):
 
         Gated to path-based, filter-free subtrees (a node-column/JSONB filter or a uuid-only
         scope can't push to the engine view without a pre-resolve). Any gate-miss or runtime
-        error returns :data:`_FALLBACK`, so :meth:`read` uses today's path.
+        error returns :data:`_FALLBACK`, so :meth:`read` uses today's path. The first runtime
+        error also sets the client's engine-unavailable flag, so the rest of the session goes
+        sequential without re-trying the engine (``setup_ch_meta_engine()`` re-enables).
         """
+        if self._client._engine_unavailable:
+            return _FALLBACK
         if self._where_filters or self._node_uuid is not None or not self._path:
             return _FALLBACK
         try:
@@ -1142,6 +1147,12 @@ class NodeScope(_BaseScope):
         except Exception:  # noqa: BLE001  -- fallback is load-bearing: engine/connectivity error -> today's path
             if _STRICT_STRATEGY:
                 raise
+            self._client._engine_unavailable = True
+            logging.getLogger(__name__).warning(
+                "concurrent read failed; using the sequential path for the rest of the session "
+                "(setup_ch_meta_engine() re-enables)",
+                exc_info=True,
+            )
             return _FALLBACK
 
     async def _build_resolved_meta(

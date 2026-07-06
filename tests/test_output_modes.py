@@ -344,14 +344,14 @@ def test_concurrent_strategy_matches_today(client, monkeypatch):
     raises instead of silently falling back to today (which would trivially pass).
     """
     import energydb.scope as _scope
-    from energydb._fast_read import CH_ENGINE_TABLE
+    from energydb._ch_meta_engine import CH_ENGINE_TABLE
     from polars.testing import assert_frame_equal
 
     try:
-        client.setup_ch_fast_read()
+        client.setup_ch_meta_engine()
         client.td._ch.command(f"SELECT count() FROM {CH_ENGINE_TABLE}")  # force a CH->PG connection
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"CH fast-read not usable in this env: {exc}")
+        pytest.skip(f"CH meta engine not usable in this env: {exc}")
     monkeypatch.setattr(_scope, "_STRICT_STRATEGY", True)
 
     scope = client.get_node("P")

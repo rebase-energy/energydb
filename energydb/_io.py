@@ -18,7 +18,7 @@ import polars as pl
 from timedb import PgEngineMeta, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
-from energydb._fast_read import CH_ENGINE_TABLE
+from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._join import (
     EdgeSeriesKey,
     SeriesKey,
