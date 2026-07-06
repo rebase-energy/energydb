@@ -17,6 +17,7 @@ resolution query and execute.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -31,7 +32,7 @@ from timedb import UnchangedScope, profiling
 
 from energydb import series as series_mod
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, read_relative_resolved, read_resolved
+from energydb._io import WriteResult, execute_concurrent, read_relative_resolved, read_resolved
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -204,6 +205,13 @@ _SCOPE_IDENTITY_NODE = ("path", "data_type", "name")
 _SCOPE_IDENTITY_EDGE = ("from_path", "to_path", "edge_type", "data_type", "name")
 
 
+# Sentinel: a fast-read strategy could not run (gate miss / runtime error) -> defer to today's path.
+_FALLBACK = object()
+# When set, a fast-read runtime error re-raises instead of silently falling back -- for tests /
+# debugging, so a broken strategy is loud rather than masked by today's path.
+_STRICT_STRATEGY = os.environ.get("ENERGYDB_STRATEGY_STRICT") == "1"
+
+
 def _strip_scope_identity(result: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
     """Drop identity columns the scope caller already knows.
 
@@ -319,6 +327,27 @@ class _BaseScope:
         expects. Returns ``None`` when the scope is empty / nothing matches.
         """
         raise NotImplementedError
+
+    async def _read_concurrent(
+        self,
+        *,
+        data_type: str | None,
+        name: str | None,
+        unit: str | None,
+        start_valid: datetime | None,
+        end_valid: datetime | None,
+        start_known: datetime | None,
+        end_known: datetime | None,
+        include_updates: bool,
+        include_knowledge_time: bool,
+        output: str,
+    ):
+        """Try the ``concurrent`` strategy, else return :data:`_FALLBACK` to defer to today's path.
+
+        Default is always-fallback; :class:`NodeScope` overrides it. Non-node scopes (edges)
+        never run concurrent.
+        """
+        return _FALLBACK
 
     # -- shared mutation machinery -------------------------------------
 
@@ -476,6 +505,7 @@ class _BaseScope:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
+        strategy: str | None = None,
     ) -> (
         pl.DataFrame
         | pd.DataFrame
@@ -488,10 +518,31 @@ class _BaseScope:
 
         For :class:`NodeScope` the manifest spans the resolved subtree;
         for :class:`EdgeScope` it's the single edge. See :meth:`Client.read`
-        for the ``output`` / ``backend`` contract.
+        for the ``output`` / ``backend`` contract. ``strategy`` (``"today"`` |
+        ``"concurrent"``) overrides the client default; fast strategies fall back
+        to ``"today"`` on any gate-miss or runtime error.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
+        strat = strategy if strategy is not None else self._client._strategy
+        if strat == "concurrent":
+            res = await self._read_concurrent(
+                data_type=data_type,
+                name=name,
+                unit=unit,
+                start_valid=start_valid,
+                end_valid=end_valid,
+                start_known=start_known,
+                end_known=end_known,
+                include_updates=include_updates,
+                include_knowledge_time=include_knowledge_time,
+                output=output,
+            )
+            if res is not _FALLBACK:
+                result, n_series = res
+                if output == "frame" and n_series == 1 and isinstance(result, pl.DataFrame):
+                    result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+                return to_backend(result, backend)
         meta = await self._build_resolved_meta(data_type=data_type, name=name)
         if meta is None:
             empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
@@ -1043,6 +1094,50 @@ class NodeScope(_BaseScope):
     # ------------------------------------------------------------------
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
+
+    async def _read_concurrent(
+        self,
+        *,
+        data_type: str | None,
+        name: str | None,
+        unit: str | None,
+        start_valid: datetime | None,
+        end_valid: datetime | None,
+        start_known: datetime | None,
+        end_known: datetime | None,
+        include_updates: bool,
+        include_knowledge_time: bool,
+        output: str,
+    ):
+        """``concurrent`` read for a node subtree: PG label-resolve ∥ CH engine value-read.
+
+        Gated to path-based, filter-free subtrees (a node-column/JSONB filter or a uuid-only
+        scope can't push to the engine view without a pre-resolve). Any gate-miss or runtime
+        error returns :data:`_FALLBACK`, so :meth:`read` uses today's path.
+        """
+        if self._where_filters or self._node_uuid is not None or not self._path:
+            return _FALLBACK
+        try:
+            return await execute_concurrent(
+                self._pool,
+                self._td,
+                self._build_resolved_meta(data_type=data_type, name=name),
+                root_path="/".join(self._path),
+                data_type=(str(data_type).lower() if data_type else None),
+                name=name,
+                unit=unit,
+                start_valid=start_valid,
+                end_valid=end_valid,
+                start_known=start_known,
+                end_known=end_known,
+                include_updates=include_updates,
+                include_knowledge_time=include_knowledge_time,
+                output=output,
+            )
+        except Exception:  # noqa: BLE001  -- fallback is load-bearing: engine/connectivity error -> today's path
+            if _STRICT_STRATEGY:
+                raise
+            return _FALLBACK
 
     async def _build_resolved_meta(
         self,

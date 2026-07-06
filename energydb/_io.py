@@ -15,9 +15,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import polars as pl
-from timedb import UnchangedScope, profiling
+from timedb import PgEngineMeta, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
+from energydb._fast_read import CH_ENGINE_TABLE
 from energydb._join import (
     EdgeSeriesKey,
     SeriesKey,
@@ -172,13 +173,29 @@ async def _execute_read(
     """
     if output not in {"frame", "by_path"}:
         raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")
-    is_edge = "edge_uuid" in meta.columns
-
     series_ids = meta["series_id"].unique().to_list()
     retentions = meta["retention"].unique().to_list()
     # TimeDB (clickhouse-connect) is synchronous — offload the CH read so the
     # event loop stays free.
     result = await asyncio.to_thread(td_call, series_ids, retentions)
+    return _finish_read(pool, result, meta, unit=unit, output=output)
+
+
+def _finish_read(
+    pool,
+    result: pl.DataFrame,
+    meta: pl.DataFrame,
+    *,
+    unit: str | None,
+    output: str,
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
+    """Unit-convert then attach/partition the labelled hierarchy onto a CH value frame.
+
+    The shared tail of every read: joins ``meta`` (path / data_type / name / canonical_unit)
+    onto ``result`` by ``series_id``. Pure polars — no DB round-trip. Used by the today path
+    (:func:`_execute_read`) and the ``concurrent`` path (:func:`execute_concurrent`).
+    """
+    is_edge = "edge_uuid" in meta.columns
 
     if unit is not None and not result.is_empty():
         with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):
@@ -200,6 +217,52 @@ async def _execute_read(
         if is_edge:
             return attach_edge_hierarchy(pool, result, meta)
         return attach_node_hierarchy(pool, result, meta)
+
+
+async def execute_concurrent(
+    pool,
+    td,
+    meta_awaitable,
+    *,
+    root_path: str,
+    data_type: str | None,
+    name: str | None,
+    unit: str | None = None,
+    start_valid: datetime | None = None,
+    end_valid: datetime | None = None,
+    start_known: datetime | None = None,
+    end_known: datetime | None = None,
+    include_updates: bool = False,
+    include_knowledge_time: bool = False,
+    output: str = "frame",
+) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int]:
+    """The ``concurrent`` read: resolve labels in PG and read values from CH in parallel.
+
+    ``meta_awaitable`` is the scope's PG label resolve; it runs concurrently with a CH value
+    read whose ``series_id`` set is resolved server-side via the PostgreSQL engine table
+    (:data:`CH_ENGINE_TABLE`). Joined on ``series_id`` client-side, so the result is
+    byte-identical to today's path. Returns ``(result, n_series)`` (``n_series`` lets the caller
+    apply the single-series identity strip).
+    """
+    ms = PgEngineMeta(table=CH_ENGINE_TABLE, root_path=root_path, data_type=data_type, name=name)
+
+    def _call() -> pl.DataFrame:
+        return td.read(
+            series_ids=[],
+            retention=None,
+            meta_source=ms,
+            start_valid=start_valid,
+            end_valid=end_valid,
+            start_known=start_known,
+            end_known=end_known,
+            include_updates=include_updates,
+            include_knowledge_time=include_knowledge_time,
+        )
+
+    meta, result = await asyncio.gather(meta_awaitable, asyncio.to_thread(_call))
+    if meta is None or meta.height == 0:
+        return ({} if output == "by_path" else pl.DataFrame()), 0
+    return _finish_read(pool, result, meta, unit=unit, output=output), meta.height
 
 
 async def _read_pipeline(

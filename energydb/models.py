@@ -196,3 +196,20 @@ if SCHEMA is not None:
         "before_create",
         sa.DDL(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"),
     )
+
+# ``series_meta`` view — the read-only projection the ClickHouse ``concurrent`` read
+# path resolves against: CH's PostgreSQL table engine selects from it. Node-owned
+# series only (the inner join drops edge-owned rows).
+# Created after the tables by ``Client.create()``; also (re)created idempotently by
+# ``Client.setup_ch_fast_read()`` since Alembic autogenerate does not track views.
+_Q = f"{SCHEMA}." if SCHEMA else ""
+SERIES_META_VIEW = f"{_Q}series_meta"
+CREATE_SERIES_META_VIEW = (
+    f"CREATE OR REPLACE VIEW {SERIES_META_VIEW} AS "
+    "SELECT s.series_id, n.path, s.data_type, s.name, s.canonical_unit, s.retention, s.timeseries_type "
+    f"FROM {_Q}node n JOIN {_Q}series s ON s.node_uuid = n.uuid"
+)
+DROP_SERIES_META_VIEW = f"DROP VIEW IF EXISTS {SERIES_META_VIEW}"
+
+event.listen(Base.metadata, "after_create", sa.DDL(CREATE_SERIES_META_VIEW))
+event.listen(Base.metadata, "before_drop", sa.DDL(DROP_SERIES_META_VIEW))

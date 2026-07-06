@@ -327,3 +327,42 @@ def test_find_unknown_attribute_matches_nothing(client):
     """Unknown filter attribute matches nothing (defensive)."""
     out = client.read(_manifest("P/T1"), output="by_path")
     assert edb.find(out, nonexistent_attr="x") == []
+
+
+# ---------------------------------------------------------------------------
+# Read strategies — concurrent must be byte-identical to today
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_strategy_matches_today(client, monkeypatch):
+    """The ``concurrent`` strategy returns the identical labelled result as ``today``.
+
+    Skips if the ClickHouse fast-read engine table can't be provisioned in this environment
+    (e.g. the CH role can't create a ``PostgreSQL()`` engine table). Runs in strict mode so a
+    broken concurrent path raises instead of silently falling back to today (which would trivially pass).
+    """
+    import energydb.scope as _scope
+    from polars.testing import assert_frame_equal
+
+    try:
+        client.setup_ch_fast_read()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"CH fast-read not provisioned in this env: {exc}")
+    monkeypatch.setattr(_scope, "_STRICT_STRATEGY", True)
+
+    scope = client.get_node("P")
+    for kw in (
+        {},  # read_latest
+        {"include_updates": True},  # latest + changes
+        {"include_knowledge_time": True},  # overlapping
+        {"include_updates": True, "include_knowledge_time": True},  # overlapping + changes
+    ):
+        today = scope.read(data_type="actual", name="power", strategy="today", **kw)
+        conc = scope.read(data_type="actual", name="power", strategy="concurrent", **kw)
+        assert_frame_equal(today.sort(today.columns), conc.sort(conc.columns))
+
+    today_bp = scope.read(data_type="actual", name="power", strategy="today", output="by_path")
+    conc_bp = scope.read(data_type="actual", name="power", strategy="concurrent", output="by_path")
+    assert today_bp.keys() == conc_bp.keys()
+    for key, sub in today_bp.items():
+        assert_frame_equal(sub.sort(sub.columns), conc_bp[key].sort(conc_bp[key].columns))

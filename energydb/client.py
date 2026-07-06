@@ -40,12 +40,13 @@ from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
+from energydb._fast_read import engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import WriteResult, read_manifest, read_relative_manifest, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
-from energydb.models import SCHEMA, Base
+from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
 from energydb.paths import (
     Path,
     _like_escape,
@@ -74,8 +75,15 @@ class AsyncClient:
         *,
         pg_conninfo: str | None = None,
         ch_url: str | None = None,
+        strategy: str = "today",
     ):
-        """Construct a client."""
+        """Construct a client.
+
+        ``strategy`` is the default read strategy (``"today"`` | ``"concurrent"``);
+        a per-read ``strategy=`` overrides it. ``concurrent`` requires
+        :meth:`setup_ch_fast_read` to have provisioned the ClickHouse engine table,
+        and falls back to ``"today"`` on any gate-miss or error.
+        """
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
             raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
@@ -104,6 +112,7 @@ class AsyncClient:
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
+        self._strategy = strategy
 
     async def open(self) -> None:
         """Open the async connection pool. Await once before first use."""
@@ -162,6 +171,20 @@ class AsyncClient:
                 await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             await conn.commit()
         await asyncio.to_thread(self.td.delete)
+
+    async def setup_ch_fast_read(self) -> None:
+        """Provision the ClickHouse scaffolding for the ``concurrent`` read strategy.
+
+        Idempotent. (Re)creates the PG ``series_meta`` view and the ClickHouse ``PostgreSQL()``
+        engine table over it (PG creds taken inline from the client DSN -- works with an
+        unprivileged CH role). Call once per deployment before enabling ``concurrent``;
+        safe to call repeatedly.
+        """
+        async with self._pool.connection() as conn:
+            await conn.execute(CREATE_SERIES_META_VIEW)
+            await conn.commit()
+        schema = os.environ.get("ENERGYDB_SCHEMA", "public")
+        await asyncio.to_thread(self.td._ch.command, engine_table_ddl(self._dsn, schema))
 
     async def close(self) -> None:
         await self._pool.close()
