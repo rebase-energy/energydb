@@ -305,7 +305,8 @@ async def read_resolved(
     """Read entry-point for callers who already have per-series meta.
 
     Skips :func:`resolve_manifest` entirely — scope reads compute ``meta``
-    via :func:`series.resolve_for_read` (one PG round-trip) and feed it
+    via the single-round-trip scope resolvers (``resolve_subtree_series_for_read``
+    / ``resolve_edge_series_for_read``) and feed it
     straight in, avoiding the manifest hash / unique / lookup-join pass.
     """
 

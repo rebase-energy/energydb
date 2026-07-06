@@ -337,17 +337,21 @@ def test_find_unknown_attribute_matches_nothing(client):
 def test_concurrent_strategy_matches_today(client, monkeypatch):
     """The ``concurrent`` strategy returns the identical labelled result as ``today``.
 
-    Skips if the ClickHouse fast-read engine table can't be provisioned in this environment
-    (e.g. the CH role can't create a ``PostgreSQL()`` engine table). Runs in strict mode so a
-    broken concurrent path raises instead of silently falling back to today (which would trivially pass).
+    Skips if the ClickHouse fast-read engine table can't be provisioned OR can't reach Postgres
+    from ClickHouse's network vantage (the CREATE TABLE itself never dials PG, so an unreachable
+    engine only surfaces on first use — e.g. local docker, where the app's PG address is not
+    resolvable from inside the CH container). Runs in strict mode so a broken concurrent path
+    raises instead of silently falling back to today (which would trivially pass).
     """
     import energydb.scope as _scope
+    from energydb._fast_read import CH_ENGINE_TABLE
     from polars.testing import assert_frame_equal
 
     try:
         client.setup_ch_fast_read()
+        client.td._ch.command(f"SELECT count() FROM {CH_ENGINE_TABLE}")  # force a CH->PG connection
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"CH fast-read not provisioned in this env: {exc}")
+        pytest.skip(f"CH fast-read not usable in this env: {exc}")
     monkeypatch.setattr(_scope, "_STRICT_STRATEGY", True)
 
     scope = client.get_node("P")

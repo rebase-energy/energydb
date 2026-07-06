@@ -149,3 +149,34 @@ def test_unresolved_triple_raises_with_owner_message():
 
     with pytest.raises(ValueError, match="Series not registered for node_uuid="):
         asyncio.run(resolve_manifest(conn, manifest))
+
+
+def test_path_manifest_read_resolves_in_one_round_trip():
+    """The path route is a single PG statement for reads (attach_path=True),
+    and surfaces node_uuid on the resolved frame for the hierarchy attach."""
+    node_uuid = str(uuid4())
+    # New path-route row layout: path, data_type, name, series_id,
+    # canonical_unit, timeseries_type, retention, node_uuid::text.
+    rows = [("P/T1", "actual", "power", 7, "MW", "FLAT", "forever", node_uuid)]
+    conn = _mock_conn_with_series(rows)
+
+    manifest = pl.DataFrame({"path": ["P/T1"], "data_type": ["actual"], "name": ["power"]})
+    resolved, summary = asyncio.run(resolve_manifest(conn, manifest))
+
+    assert conn.execute.await_count == 1  # the collapse: one statement, not path->uuid + owner scan
+    assert resolved["node_uuid"].to_list() == [node_uuid]
+    assert resolved["series_id"].to_list() == [7]
+    assert resolved["path"].to_list() == ["P/T1"]  # manifest path kept (== DB path by the join)
+    assert summary.has_overlapping is False
+
+
+def test_path_manifest_missing_path_raises_series_not_registered():
+    """A path PG can't match raises the same 'Series not registered for path=...'
+    contract as the write route (formerly a separate 'Could not resolve path(s)')."""
+    import pytest
+
+    conn = _mock_conn_with_series([])
+    manifest = pl.DataFrame({"path": ["P/NOPE"], "data_type": ["actual"], "name": ["power"]})
+
+    with pytest.raises(ValueError, match="Series not registered for path="):
+        asyncio.run(resolve_manifest(conn, manifest))

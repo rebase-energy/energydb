@@ -1393,19 +1393,31 @@ class EdgeScope(_BaseScope):
         data_type: str | None,
         name: str | None,
     ) -> pl.DataFrame | None:
-        """Resolve this edge to per-series read meta. ``None`` if no series match."""
+        """Resolve this edge to per-series read meta in ONE PG round-trip.
+
+        Both addressings go through :func:`series.resolve_edge_series_for_read`
+        directly — the triple form collapses the former paths → edge → series
+        chain (3 round-trips) into a single query. ``None`` if no series match.
+        """
+        data_type_str = str(data_type).lower() if data_type else None
         async with self._use_conn() as conn:
-            edge_uuid = await self._resolve_edge_uuid(conn)
-            data_type_str = str(data_type).lower() if data_type else None
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-                meta = await series_mod.resolve_for_read(
-                    conn,
-                    owner_col="edge_uuid",
-                    owner_uuids=[edge_uuid],
-                    data_type=data_type_str,
-                    name=name,
-                )
-        if meta.is_empty():
-            return None
-        with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            return meta.drop("node_uuid")
+                if self._edge_uuid is not None:
+                    meta = await series_mod.resolve_edge_series_for_read(
+                        conn,
+                        edge_uuid=self._edge_uuid,
+                        data_type=data_type_str,
+                        name=name,
+                    )
+                elif self._from_path is not None and self._to_path is not None and self._edge_type is not None:
+                    meta = await series_mod.resolve_edge_series_for_read(
+                        conn,
+                        from_path="/".join(self._from_path),
+                        to_path="/".join(self._to_path),
+                        edge_type=self._edge_type,
+                        data_type=data_type_str,
+                        name=name,
+                    )
+                else:
+                    raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
+        return None if meta.is_empty() else meta

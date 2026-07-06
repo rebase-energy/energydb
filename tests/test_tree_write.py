@@ -479,3 +479,33 @@ def test_live_query_within_accepts_str_tuple_list_uuid(live_edb):
     assert len(e_tuple) == 1
     assert len(e_list) == 1
     assert len(e_uuid) == 1
+
+
+@pytestmark_live
+def test_live_edge_triple_read_matches_uuid_read(live_edb):
+    """Triple-addressed edge reads (one collapsed PG round-trip) return the
+    identical frame as uuid-addressed reads, and a missing edge raises."""
+    bus_a = edb.grid.JunctionPoint(name="BusX")
+    bus_b = edb.grid.JunctionPoint(name="BusY")
+    live_edb.register_tree(edb.Portfolio(name="Grid2", members=[bus_a, bus_b]))
+    line = edb.grid.Line(name="Cable-2", capacity=300, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    edge_uuid = live_edb.create_edge(line)
+
+    scope_uuid = live_edb.get_edge(uuid=edge_uuid)
+    scope_uuid.register_series(
+        name="power_flow", canonical_unit="MW", data_type="actual", timeseries_type="FLAT", retention="medium"
+    )
+    base = datetime(2026, 2, 1, tzinfo=UTC)
+    scope_uuid.write(
+        pl.DataFrame({"valid_time": [base + timedelta(hours=i) for i in range(2)], "value": [10.0, 20.0]}),
+        data_type="actual",
+        name="power_flow",
+    )
+
+    by_uuid = scope_uuid.read(data_type="actual", name="power_flow")
+    by_triple = live_edb.get_edge("Grid2/BusX", "Grid2/BusY", type="Line").read(data_type="actual", name="power_flow")
+    assert by_uuid.equals(by_triple)
+
+    # Missing edge under triple addressing raises (same contract as before the collapse).
+    with pytest.raises(ValueError, match="Edge not found"):
+        live_edb.get_edge("Grid2/BusX", "Grid2/BusY", type="nonexistent").read(data_type="actual", name="power_flow")

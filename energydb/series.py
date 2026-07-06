@@ -155,8 +155,8 @@ async def resolve_subtree_series_for_read(
     """Resolve a node subtree straight to per-series read meta in ONE round-trip.
 
     A single query walks root → subtree (materialized-path prefix scan) →
-    ``series`` ⋈ ``node``, replacing the ``resolve_node_uuid`` +
-    ``resolve_subtree_uuids`` + :func:`resolve_for_read` chain on the node
+    ``series`` ⋈ ``node``, replacing the former ``resolve_node_uuid`` +
+    ``resolve_subtree_uuids`` + per-owner series scan chain on the node
     read path (which round-tripped the resolved uuid set back to PG as an
     ``ANY()`` param). The root is given either as ``root_path`` (a ``/``-joined
     path the caller already holds) or as ``start_uuid`` (+ optional ``rel_path``
@@ -165,9 +165,10 @@ async def resolve_subtree_series_for_read(
 
     ``where_conds`` / ``where_params`` are extra subtree-node predicates from
     :func:`build_filter_conditions` (qualified with ``table_alias="n"``).
-    Returns one row per series with the columns :func:`resolve_for_read`
-    produces for node-routed reads, minus the unused ``edge_uuid``. Empty df
-    if the subtree is empty or nothing matches.
+    Returns one row per series with the per-series read-meta columns
+    (``series_id``, ``canonical_unit``, ``timeseries_type``, ``retention``,
+    ``node_uuid``, ``data_type``, ``name``, ``path``). Empty df if the subtree
+    is empty or nothing matches.
     """
     cte_params: list[Any] = []
     if root_path is not None:
@@ -238,84 +239,66 @@ async def resolve_subtree_series_for_read(
     )
 
 
-async def resolve_for_read(
+async def resolve_edge_series_for_read(
     conn,
     *,
-    owner_col: OwnerCol,
-    owner_uuids: list[UUID],
+    edge_uuid: UUID | None = None,
+    from_path: str | None = None,
+    to_path: str | None = None,
+    edge_type: str | None = None,
     data_type: str | None = None,
     name: str | None = None,
 ) -> pl.DataFrame:
-    """Bulk resolve series rows for a read.
+    """Resolve an edge's series for a read in ONE round-trip.
 
-    Single PG round-trip: joins through the owner row(s) to also fetch the
-    materialized hierarchy path(s) — so the post-read attach step needs no
-    further PG calls. For ``owner_col="node_uuid"`` the result carries a
-    ``path`` column; for ``owner_col="edge_uuid"`` it carries
-    ``edge_type``, ``from_path`` and ``to_path``. UUIDs are returned as
-    ``Utf8`` so they join cleanly against the string-form ids the manifest
-    pipeline carries. Empty df if nothing matches.
+    The edge is addressed by ``edge_uuid`` OR by its
+    ``(from_path, to_path, edge_type)`` triple; the triple form collapses the
+    former three-step chain (paths → uuids, edge lookup, series scan) into a
+    single query. The endpoint paths and ``edge_type`` ride along on the join,
+    so the post-read attach step needs no further PG calls.
+
+    ``series`` is LEFT-JOINed so an existing edge with no (matching) series
+    still returns a row — distinguishing "edge not found" from "no series":
+
+    * triple-addressed + edge missing → raises ``ValueError`` (same contract
+      as the former ``resolve_edge_uuid`` lookup);
+    * uuid-addressed + edge missing → empty df (historical contract);
+    * edge exists, nothing matches → empty df.
     """
-    conditions = [f"s.{owner_col} = ANY(%s)"]
-    params: list[Any] = [owner_uuids]
-
+    join_conds = ["s.edge_uuid = e.uuid"]
+    join_params: list[Any] = []
     if data_type:
-        conditions.append("s.data_type = %s")
-        params.append(data_type)
+        join_conds.append("s.data_type = %s")
+        join_params.append(data_type)
     if name:
-        conditions.append("s.name = %s")
-        params.append(name)
+        join_conds.append("s.name = %s")
+        join_params.append(name)
 
-    if owner_col == "node_uuid":
-        select_extra = ", n.path AS path"
-        join_sql = "JOIN node n ON n.uuid = s.node_uuid"
+    if edge_uuid is not None:
+        where_sql = "e.uuid = %s"
+        where_params: list[Any] = [edge_uuid]
+    elif from_path is not None and to_path is not None and edge_type is not None:
+        where_sql = "fn.path = %s AND tn.path = %s AND e.edge_type = %s"
+        where_params = [from_path, to_path, edge_type]
     else:
-        select_extra = ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path"
-        join_sql = (
-            "JOIN edge e   ON e.uuid = s.edge_uuid "
-            "JOIN node fn  ON fn.uuid = e.from_node_uuid "
-            "JOIN node tn  ON tn.uuid = e.to_node_uuid"
-        )
+        raise ValueError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
 
-    # ``::text`` casts on the uuid columns: PG returns strings directly,
-    # skipping psycopg's per-row UUID-object parse — ~15ms cheaper at
-    # scale=200 on the 7-col SELECT compared to letting psycopg parse.
+    # ``::text`` cast on the uuid column: PG returns strings directly,
+    # skipping psycopg's per-row UUID-object parse.
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
-        "s.node_uuid::text, s.edge_uuid::text, s.data_type, s.name" + select_extra + " "
-        "FROM series s " + join_sql + " "
-        "WHERE " + " AND ".join(conditions)
+        "s.edge_uuid::text, s.data_type, s.name, "
+        "e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path "
+        "FROM edge e "
+        "JOIN node fn ON fn.uuid = e.from_node_uuid "
+        "JOIN node tn ON tn.uuid = e.to_node_uuid "
+        "LEFT JOIN series s ON " + " AND ".join(join_conds) + " "
+        "WHERE " + where_sql
     )
-    rows = await (await conn.execute(sql, params)).fetchall()
+    rows = await (await conn.execute(sql, [*join_params, *where_params])).fetchall()
 
-    if owner_col == "node_uuid":
-        return pl.DataFrame(
-            [
-                {
-                    "series_id": r[0],
-                    "canonical_unit": r[1],
-                    "timeseries_type": r[2],
-                    "retention": r[3],
-                    "node_uuid": r[4],
-                    "edge_uuid": r[5],
-                    "data_type": r[6],
-                    "name": r[7],
-                    "path": r[8],
-                }
-                for r in rows
-            ],
-            schema={
-                "series_id": pl.Int64,
-                "canonical_unit": pl.Utf8,
-                "timeseries_type": pl.Utf8,
-                "retention": pl.Utf8,
-                "node_uuid": pl.Utf8,
-                "edge_uuid": pl.Utf8,
-                "data_type": pl.Utf8,
-                "name": pl.Utf8,
-                "path": pl.Utf8,
-            },
-        )
+    if not rows and edge_uuid is None:
+        raise ValueError(f"Edge not found: type={edge_type!r} from={from_path!r} to={to_path!r}")
 
     return pl.DataFrame(
         [
@@ -324,22 +307,21 @@ async def resolve_for_read(
                 "canonical_unit": r[1],
                 "timeseries_type": r[2],
                 "retention": r[3],
-                "node_uuid": r[4],
-                "edge_uuid": r[5],
-                "data_type": r[6],
-                "name": r[7],
-                "edge_type": r[8],
-                "from_path": r[9],
-                "to_path": r[10],
+                "edge_uuid": r[4],
+                "data_type": r[5],
+                "name": r[6],
+                "edge_type": r[7],
+                "from_path": r[8],
+                "to_path": r[9],
             }
             for r in rows
+            if r[0] is not None  # LEFT-JOIN row for a series-less edge
         ],
         schema={
             "series_id": pl.Int64,
             "canonical_unit": pl.Utf8,
             "timeseries_type": pl.Utf8,
             "retention": pl.Utf8,
-            "node_uuid": pl.Utf8,
             "edge_uuid": pl.Utf8,
             "data_type": pl.Utf8,
             "name": pl.Utf8,

@@ -309,48 +309,15 @@ async def resolve_manifest(
             await upsert_run_row(conn, run)
         return resolved, summary
     if route == "path":
-        # Write pipelines (attach_path=False) collapse path → series (and the run
-        # upsert) into ONE round-trip. Read pipelines keep the two-step (resolve
-        # path→uuid, then the owner scan) because the post-read hierarchy attach
-        # needs ``node_uuid`` surfaced on the resolved frame.
-        if not attach_path:
-            return await _resolve_manifest_by_path(conn, manifest, run=run)
-        manifest = await _attach_node_uuid_from_path(conn, manifest)
+        # Path routes collapse to ONE round-trip for reads and writes alike:
+        # a single ``node ⋈ series`` query keyed by the materialized path.
+        # ``attach_path=True`` (reads) also surfaces ``node_uuid`` on the
+        # resolved frame for the post-read hierarchy attach.
+        return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path)
     resolved, summary = await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
     if run is not None:
         await upsert_run_row(conn, run)
     return resolved, summary
-
-
-async def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
-    """Resolve every ``path`` (Utf8, joined with ``/``) to a ``node_uuid`` and attach it.
-
-    The manifest ``path`` column must be ``Utf8`` — strings like ``"a/b/c"``.
-    List-shaped paths from earlier API versions are rejected explicitly so
-    callers see a clear migration message rather than an opaque type error.
-    """
-    dtype = manifest["path"].dtype
-    if dtype == pl.List(pl.Utf8):
-        raise ValueError(
-            "Manifest 'path' column must be Utf8 joined with '/'. "
-            "Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
-        )
-    if dtype != pl.Utf8:
-        raise ValueError(f"Manifest 'path' column must be Utf8 joined with '/'; got {dtype}.")
-
-    path_strs = manifest["path"].to_list()
-    unique_paths_str = list({p for p in path_strs if p is not None})
-    if not unique_paths_str:
-        return manifest.with_columns(pl.lit(None, dtype=pl.Utf8).cast(pl.Utf8).alias("node_uuid"))
-
-    miss_tuples = [tuple(p.split("/")) for p in unique_paths_str]
-    pg_map = await resolve_paths_to_uuids(conn, miss_tuples)
-    path_to_uuid_str: dict[str, str] = {
-        "/".join(path_tuple): str(node_uuid) for path_tuple, node_uuid in pg_map.items()
-    }
-
-    node_uuids = [path_to_uuid_str[p] if p is not None else None for p in path_strs]
-    return manifest.with_columns(pl.Series("node_uuid", node_uuids, dtype=pl.Utf8))
 
 
 def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -523,9 +490,9 @@ async def _resolve_manifest_by_owner(
 
 
 async def _resolve_manifest_by_path(
-    conn, manifest: pl.DataFrame, *, run: RunRow | None = None
+    conn, manifest: pl.DataFrame, *, run: RunRow | None = None, attach_path: bool = False
 ) -> tuple[pl.DataFrame, ResolveSummary]:
-    """Resolve a path-routed *write* manifest to series in ONE round-trip.
+    """Resolve a path-routed manifest to series in ONE round-trip.
 
     Collapses the former two-step path resolve (:func:`resolve_paths_to_uuids`,
     then a ``node_uuid``-keyed series scan, plus an intermediate per-row
@@ -533,10 +500,18 @@ async def _resolve_manifest_by_path(
     materialized ``path``. Mirrors :func:`_resolve_manifest_by_owner`: hash the
     ``(path, data_type, name)`` triple, dedupe, one indexed ``ANY()`` scan,
     attach ``series_id`` / ``retention`` / ``canonical_unit`` via a
-    ``_triple_k`` left-join. Write-only — ``node_uuid`` is not surfaced (writes
-    drop it before the CH insert); read pipelines that need it keep the
-    two-step path in :func:`resolve_manifest`.
+    ``_triple_k`` left-join.
+
+    ``attach_path=True`` (read pipelines) additionally surfaces ``node_uuid``
+    on the resolved frame for the post-read hierarchy attach. The manifest's
+    ``path`` column needs no re-attach: the resolve joins on ``n.path``
+    equality, so the manifest value IS the DB value.
     """
+    if manifest["path"].dtype == pl.List(pl.Utf8):
+        raise ValueError(
+            "Manifest 'path' column must be Utf8 joined with '/'. "
+            "Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
+        )
     if manifest["path"].dtype != pl.Utf8:
         raise ValueError(f"Manifest 'path' column must be Utf8 joined with '/'; got {manifest['path'].dtype}.")
     non_null = manifest.height - manifest["path"].null_count()
@@ -566,7 +541,8 @@ async def _resolve_manifest_by_path(
         await conn.execute(
             cte_sql
             + """
-        SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention
+        SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               s.node_uuid::text
         FROM node n
         JOIN series s ON s.node_uuid = n.uuid
         WHERE n.path = ANY(%s)
@@ -575,8 +551,8 @@ async def _resolve_manifest_by_path(
         )
     ).fetchall()
     triple_to_meta: dict[tuple[str, str, str], tuple] = {}
-    for path, dt, name, sid, unit, ts_type, retention in rows:
-        triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention)
+    for path, dt, name, sid, unit, ts_type, retention, node_uuid in rows:
+        triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention, node_uuid)
 
     for path, dt, name in miss_triples:
         if (path, dt, name) not in triple_to_meta:
@@ -586,15 +562,22 @@ async def _resolve_manifest_by_path(
         hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
     }
     metas = list(hash_to_meta.values())
-    lookup_df = pl.DataFrame(
-        {
-            "_triple_k": list(hash_to_meta.keys()),
-            "series_id": [m[0] for m in metas],
-            "retention": [m[3] for m in metas],
-            "canonical_unit": [m[1] for m in metas],
-        },
-        schema={"_triple_k": pl.UInt64, "series_id": pl.Int64, "retention": pl.Utf8, "canonical_unit": pl.Utf8},
-    )
+    lookup_data: dict[str, list] = {
+        "_triple_k": list(hash_to_meta.keys()),
+        "series_id": [m[0] for m in metas],
+        "retention": [m[3] for m in metas],
+        "canonical_unit": [m[1] for m in metas],
+    }
+    lookup_schema: dict[str, Any] = {
+        "_triple_k": pl.UInt64,
+        "series_id": pl.Int64,
+        "retention": pl.Utf8,
+        "canonical_unit": pl.Utf8,
+    }
+    if attach_path:
+        lookup_data["node_uuid"] = [m[4] for m in metas]
+        lookup_schema["node_uuid"] = pl.Utf8
+    lookup_df = pl.DataFrame(lookup_data, schema=lookup_schema)
     overlap = [c for c in lookup_df.columns if c != "_triple_k" and c in manifest.columns]
     if overlap:
         manifest = manifest.drop(overlap)
