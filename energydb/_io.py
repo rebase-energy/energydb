@@ -306,7 +306,7 @@ def _td_call(
     if relative:
 
         def _call(series_ids: list[int], retentions: list[str] | None) -> pl.DataFrame:
-            return td.read_relative(series_ids=series_ids, retention=retentions, **kwargs)
+            return td.read_relative(series_ids=series_ids, retention=retentions, meta_source=meta_source, **kwargs)
 
     else:
 

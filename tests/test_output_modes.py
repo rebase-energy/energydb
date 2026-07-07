@@ -384,3 +384,11 @@ def test_engine_read_matches_sequential(client, monkeypatch):
     base_m = seq(lambda: client.read(manifest))
     eng_m = client.read(manifest)
     assert_frame_equal(base_m.sort(base_m.columns), eng_m.sort(eng_m.columns))
+
+    # read_relative rides the same engine path; the huge issue_offset keeps every
+    # row inside its window even though the fixture's knowledge_time is now().
+    rel_kw = {"window_length": timedelta(hours=1), "issue_offset": timedelta(days=365), "start_window": BASE}
+    base_r = seq(lambda: scope.read_relative(data_type="actual", name="power", **rel_kw))
+    eng_r = scope.read_relative(data_type="actual", name="power", **rel_kw)
+    assert eng_r.height > 0  # the engine leg must self-resolve (guards the meta_source wiring)
+    assert_frame_equal(base_r.sort(base_r.columns), eng_r.sort(eng_r.columns))
