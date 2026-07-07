@@ -102,6 +102,16 @@ async def write_manifest(
     ``runs`` row is upserted regardless, so an all-skipped write still
     records a run (with no ``run_series`` mapping). Returns a :class:`WriteResult`
     — an ``int`` run_id carrying ``written`` / ``skipped`` counts.
+
+    PG round-trips: when ``knowledge_time`` is known (kwarg or manifest column)
+    the resolve statement runs on an autocommit connection — psycopg's implicit
+    ``BEGIN`` and the explicit ``COMMIT`` (one round-trip each) both disappear,
+    leaving a single round-trip on the path route. A client-side resolve
+    failure then compensates the already-committed folded runs row (auto-generated
+    run_ids only; an explicit ``run_id`` may reference earlier successful
+    batches, so its upserted row is left in place). Without ``knowledge_time``
+    the transactional path is kept, because the OVERLAPPING check below must
+    be able to roll back the run row.
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
     run = runs_mod.RunRow(
@@ -112,24 +122,45 @@ async def write_manifest(
         run_finish_time=run_finish_time,
         run_params=run_params,
     )
+    kt_known = knowledge_time is not None or "knowledge_time" in df.columns
 
     async with pool.connection() as conn:
-        with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            # Writes drop path / edge meta before the CH insert anyway, so skip the
-            # hierarchy JOIN. ``run`` folds the runs upsert into this same
-            # query (path route → one round-trip; owner routes → a second statement).
-            resolved, summary = await resolve_manifest(conn, df, attach_path=False, run=run)
+        if kt_known:
+            # The OVERLAPPING check cannot fail with knowledge_time known, so
+            # nothing after the resolve statement needs a rollback.
+            await conn.set_autocommit(True)
+            try:
+                with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                    try:
+                        # Writes drop path / edge meta before the CH insert anyway, so
+                        # skip the hierarchy JOIN. ``run`` folds the runs upsert into
+                        # the resolve statement on every route (one round-trip).
+                        resolved, summary = await resolve_manifest(conn, df, attach_path=False, run=run)
+                    except Exception:
+                        # The folded runs-upsert CTE committed with the statement;
+                        # don't leave the orphan row behind a client-side resolve
+                        # failure.
+                        if run_id is None:
+                            with contextlib.suppress(Exception):
+                                await conn.execute("DELETE FROM runs WHERE run_id = %s", (rid,))
+                        raise
+            finally:
+                await conn.set_autocommit(False)
+        else:
+            with profiling._phase(profiling.PHASE_EDB_RESOLVE):
+                resolved, summary = await resolve_manifest(conn, df, attach_path=False, run=run)
 
-        # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
-        # Raising here (before commit) rolls back the folded run upsert too — a bad
-        # call records no run, same as before the fold.
-        if summary.has_overlapping and knowledge_time is None and "knowledge_time" not in resolved.columns:
-            raise ValueError(
-                "knowledge_time is required for OVERLAPPING series; "
-                "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
-            )
+            # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
+            # Raising here (before commit) rolls back the folded run upsert too — a bad
+            # call records no run, same as before the fold.
+            if summary.has_overlapping:
+                raise ValueError(
+                    "knowledge_time is required for OVERLAPPING series; "
+                    "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
+                )
 
-        await conn.commit()
+            with profiling._phase(profiling.PHASE_EDB_COMMIT):
+                await conn.commit()
 
     if "unit" in resolved.columns:
         with profiling._phase(profiling.PHASE_EDB_UNIT_CONVERT):

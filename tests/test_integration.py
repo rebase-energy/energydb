@@ -266,3 +266,97 @@ def test_default_polars_empty_read(edb):
     result = edb.get_node("root").get_node("asset_a").read(data_type="actual", name="nonexistent")
     assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
+
+
+# ── write_manifest run-row semantics (autocommit fold, W2) ────────────────────
+
+
+def _runs_rows() -> list[int]:
+    import psycopg
+
+    with psycopg.connect(os.environ["TIMEDB_PG_DSN"]) as conn:
+        return [r[0] for r in conn.execute("SELECT run_id FROM energydb.runs").fetchall()]
+
+
+def _bad_manifest() -> pl.DataFrame:
+    """Routes to a series that was never registered."""
+    return _ts_df(2).with_columns(
+        pl.lit("root/asset_a").alias("path"),
+        pl.lit("actual").alias("data_type"),
+        pl.lit("never_registered").alias("name"),
+    )
+
+
+def test_failed_write_with_kt_leaves_no_runs_row(edb):
+    """kt-known writes run the resolve on an autocommit connection; a resolve
+    failure must compensate the folded runs-upsert, not orphan the row."""
+    with pytest.raises(ValueError, match="not registered"):
+        edb.write(_bad_manifest(), knowledge_time=KT_1)
+    assert _runs_rows() == []
+
+
+def test_failed_write_with_explicit_run_id_keeps_runs_row(edb):
+    """An explicit run_id may reference earlier successful batches, so the
+    upserted row is deliberately left in place on failure."""
+    with pytest.raises(ValueError, match="not registered"):
+        edb.write(_bad_manifest(), knowledge_time=KT_1, run_id=424242)
+    assert _runs_rows() == [424242]
+
+
+def test_overlapping_write_without_kt_records_no_run(edb):
+    """The kt-unknown path stays transactional: the OVERLAPPING error rolls
+    back the folded run row."""
+    edb.get_node("root").get_node("asset_a").register_series(
+        name="power",
+        canonical_unit="MW",
+        data_type="forecast",
+        timeseries_type="OVERLAPPING",
+        retention="medium",
+    )
+    manifest = _ts_df(2).with_columns(
+        pl.lit("root/asset_a").alias("path"),
+        pl.lit("forecast").alias("data_type"),
+        pl.lit("power").alias("name"),
+    )
+    with pytest.raises(ValueError, match="knowledge_time is required"):
+        edb.write(manifest)
+    assert _runs_rows() == []
+
+
+def _node_uuid(path: str) -> str:
+    import psycopg
+
+    with psycopg.connect(os.environ["TIMEDB_PG_DSN"]) as conn:
+        return conn.execute("SELECT uuid::text FROM energydb.node WHERE path = %s", (path,)).fetchone()[0]
+
+
+def test_uuid_routed_write_records_run_in_folded_statement(edb):
+    """Owner routes fold the runs upsert into the resolve statement (W3);
+    a successful node_uuid-routed write must still record its run row."""
+    edb.get_node("root").get_node("asset_a").register_series(
+        name="capacity",
+        canonical_unit="MW",
+        data_type="actual",
+        timeseries_type="FLAT",
+        retention="medium",
+    )
+    manifest = _ts_df(2).with_columns(
+        pl.lit(_node_uuid("root/asset_a")).alias("node_uuid"),
+        pl.lit("actual").alias("data_type"),
+        pl.lit("capacity").alias("name"),
+    )
+    run_id = edb.write(manifest, knowledge_time=KT_1)
+    assert _runs_rows() == [int(run_id)]
+
+
+def test_failed_uuid_routed_write_with_kt_leaves_no_runs_row(edb):
+    """The compensating delete also covers the owner route now that its
+    runs upsert commits with the folded resolve statement."""
+    manifest = _ts_df(2).with_columns(
+        pl.lit(_node_uuid("root/asset_a")).alias("node_uuid"),
+        pl.lit("actual").alias("data_type"),
+        pl.lit("never_registered").alias("name"),
+    )
+    with pytest.raises(ValueError, match="not registered"):
+        edb.write(manifest, knowledge_time=KT_1)
+    assert _runs_rows() == []

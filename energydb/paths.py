@@ -18,7 +18,7 @@ from uuid import UUID
 
 import polars as pl
 
-from energydb.runs import RunRow, run_upsert_cte, upsert_run_row
+from energydb.runs import RunRow, run_upsert_cte
 
 
 class ResolveSummary(NamedTuple):
@@ -299,25 +299,16 @@ async def resolve_manifest(
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     # ``run`` (write pipelines only) upserts the energydb.runs row in the same
-    # call: folded into the path resolve as a data-modifying CTE (one round-trip),
-    # or run standalone for the owner routes that can't fold it.
+    # call, folded into the resolve statement as a data-modifying CTE — every
+    # route resolves in ONE round-trip.
     if route == "edge_uuid":
-        resolved, summary = await _resolve_manifest_by_owner(
-            conn, manifest, owner_col="edge_uuid", attach_path=attach_path
-        )
-        if run is not None:
-            await upsert_run_row(conn, run)
-        return resolved, summary
+        return await _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path, run=run)
     if route == "path":
-        # Path routes collapse to ONE round-trip for reads and writes alike:
-        # a single ``node ⋈ series`` query keyed by the materialized path.
+        # A single ``node ⋈ series`` query keyed by the materialized path.
         # ``attach_path=True`` (reads) also surfaces ``node_uuid`` on the
         # resolved frame for the post-read hierarchy attach.
         return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path)
-    resolved, summary = await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
-    if run is not None:
-        await upsert_run_row(conn, run)
-    return resolved, summary
+    return await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path, run=run)
 
 
 def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -355,6 +346,7 @@ async def _resolve_manifest_by_owner(
     *,
     owner_col: str,
     attach_path: bool,
+    run: RunRow | None = None,
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
     against the series table.
@@ -415,19 +407,25 @@ async def _resolve_manifest_by_owner(
 
     # 3. Bulk-fetch every series owned by the affected owners — one indexed
     # scan on ``ix_series_{owner_col}``. ``::text`` cast skips psycopg's
-    # per-row UUID-object parse.
+    # per-row UUID-object parse. ``run`` (write pipelines) folds the runs
+    # upsert into this same statement as a leading data-modifying CTE, same
+    # as the path route; its params bind before the owner ANY().
     unique_owners = list({t[0] for t in miss_triples})
     extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
+    cte_sql, cte_params = ("", ())
+    if run is not None:
+        cte_sql, cte_params = run_upsert_cte(run)
     rows = await (
         await conn.execute(
-            f"""
+            cte_sql
+            + f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
         FROM series s
         {join_sql}
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,
-            (unique_owners,),
+            (*cte_params, unique_owners),
         )
     ).fetchall()
     # Meta tuple layout:

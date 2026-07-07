@@ -68,7 +68,7 @@ def run_upsert_cte(run: RunRow) -> tuple[str, tuple]:
 
 
 async def upsert_run_row(conn, run: RunRow) -> None:
-    """Standalone run upsert (the non-folded path, e.g. owner-routed writes)."""
+    """Standalone run upsert (run-metadata updates outside a write's folded resolve)."""
     await conn.execute(_RUN_UPSERT_BODY, _run_params(run))
 
 
