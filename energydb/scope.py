@@ -17,8 +17,6 @@ resolution query and execute.
 
 from __future__ import annotations
 
-import logging
-import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -29,11 +27,12 @@ import pandas as pd
 import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
-from timedb import UnchangedScope, profiling
+from timedb import PgEngineMeta, UnchangedScope, profiling
 
 from energydb import series as series_mod
+from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, execute_concurrent, execute_read
+from energydb._io import WriteResult, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -206,13 +205,6 @@ _SCOPE_IDENTITY_NODE = ("path", "data_type", "name")
 _SCOPE_IDENTITY_EDGE = ("from_path", "to_path", "edge_type", "data_type", "name")
 
 
-# Sentinel: a fast-read strategy could not run (gate miss / runtime error) -> defer to today's path.
-_FALLBACK = object()
-# When set, a fast-read runtime error re-raises instead of silently falling back -- for tests /
-# debugging, so a broken strategy is loud rather than masked by today's path.
-_STRICT_STRATEGY = os.environ.get("ENERGYDB_STRATEGY_STRICT") == "1"
-
-
 def _strip_scope_identity(result: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
     """Drop identity columns the scope caller already knows.
 
@@ -329,26 +321,11 @@ class _BaseScope:
         """
         raise NotImplementedError
 
-    async def _read_concurrent(
-        self,
-        *,
-        data_type: str | None,
-        name: str | None,
-        unit: str | None,
-        start_valid: datetime | None,
-        end_valid: datetime | None,
-        start_known: datetime | None,
-        end_known: datetime | None,
-        include_updates: bool,
-        include_knowledge_time: bool,
-        output: str,
-    ):
-        """Try the ``concurrent`` strategy, else return :data:`_FALLBACK` to defer to today's path.
-
-        Default is always-fallback; :class:`NodeScope` overrides it. Non-node scopes (edges)
-        never run concurrent.
+    def _engine_meta(self, *, data_type: str | None, name: str | None) -> PgEngineMeta | None:
+        """The engine-table predicate for this scope's read, or ``None`` when the scope
+        can't be expressed server-side (the read then runs sequentially).
         """
-        return _FALLBACK
+        raise NotImplementedError
 
     def _finalize_result(self, result, *, n_series: int, output: str, backend: Backend):
         """Shared tail of every scope read: single-series identity strip + backend convert.
@@ -518,7 +495,6 @@ class _BaseScope:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
-        strategy: str | None = None,
     ) -> (
         pl.DataFrame
         | pd.DataFrame
@@ -531,39 +507,20 @@ class _BaseScope:
 
         For :class:`NodeScope` the manifest spans the resolved subtree;
         for :class:`EdgeScope` it's the single edge. See :meth:`Client.read`
-        for the ``output`` / ``backend`` contract. ``strategy`` (``"today"`` |
-        ``"concurrent"``) overrides the client default; fast strategies fall back
-        to ``"today"`` on any gate-miss or runtime error.
+        for the ``output`` / ``backend`` contract. When the scope is
+        engine-expressible (see :meth:`_engine_meta`) the PG resolve runs in
+        parallel with the CH value read; otherwise — ``.where()`` filters,
+        uuid-addressed subtrees, engine unavailable — it runs sequentially.
+        Results are identical either way.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
-        strat = strategy if strategy is not None else self._client._strategy
-        if strat == "concurrent":
-            res = await self._read_concurrent(
-                data_type=data_type,
-                name=name,
-                unit=unit,
-                start_valid=start_valid,
-                end_valid=end_valid,
-                start_known=start_known,
-                end_known=end_known,
-                include_updates=include_updates,
-                include_knowledge_time=include_knowledge_time,
-                output=output,
-            )
-            if res is not _FALLBACK:
-                result, n_series = res
-                return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
-        meta = await self._build_resolved_meta(data_type=data_type, name=name)
-        if meta is None:
-            empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
-                {} if output == "by_path" else pl.DataFrame()
-            )
-            return to_backend(empty, backend)
-        result = await execute_read(
+        result, n_series = await execute_read(
             self._pool,
             self._td,
-            meta=meta,
+            self._client,
+            resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
+            engine_meta=self._engine_meta(data_type=data_type, name=name),
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -573,7 +530,7 @@ class _BaseScope:
             include_knowledge_time=include_knowledge_time,
             output=output,
         )
-        return self._finalize_result(result, n_series=meta.height, output=output, backend=backend)
+        return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
 
     async def read_relative(
         self,
@@ -600,22 +557,18 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read_relative")
-        meta = await self._build_resolved_meta(data_type=data_type, name=name)
-        if meta is None:
-            empty: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] = (
-                {} if output == "by_path" else pl.DataFrame()
-            )
-            return to_backend(empty, backend)
-        result = await execute_read(
+        result, n_series = await execute_read(
             self._pool,
             self._td,
-            meta=meta,
+            self._client,
+            resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
+            engine_meta=self._engine_meta(data_type=data_type, name=name),
             relative=True,
             unit=unit,
             output=output,
             td_kwargs=td_read_kwargs,
         )
-        return self._finalize_result(result, n_series=meta.height, output=output, backend=backend)
+        return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,59 +1054,22 @@ class NodeScope(_BaseScope):
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
 
-    async def _read_concurrent(
-        self,
-        *,
-        data_type: str | None,
-        name: str | None,
-        unit: str | None,
-        start_valid: datetime | None,
-        end_valid: datetime | None,
-        start_known: datetime | None,
-        end_known: datetime | None,
-        include_updates: bool,
-        include_knowledge_time: bool,
-        output: str,
-    ):
-        """``concurrent`` read for a node subtree: PG label-resolve ∥ CH engine value-read.
+    def _engine_meta(self, *, data_type: str | None, name: str | None) -> PgEngineMeta | None:
+        """Engine predicate for a node subtree: the path-prefix match.
 
-        Gated to path-based, filter-free subtrees (a node-column/JSONB filter or a uuid-only
-        scope can't push to the engine view without a pre-resolve). Any gate-miss or runtime
-        error returns :data:`_FALLBACK`, so :meth:`read` uses today's path. The first runtime
-        error also sets the client's engine-unavailable flag, so the rest of the session goes
-        sequential without re-trying the engine (``setup_ch_meta_engine()`` re-enables).
+        ``None`` (sequential read) when the scope can't be expressed server-side:
+        JSONB/node-column ``.where()`` filters don't push through the engine view,
+        and a uuid-addressed subtree's path prefix is unknown without the very
+        round-trip the engine read avoids.
         """
-        if self._client._engine_unavailable:
-            return _FALLBACK
         if self._where_filters or self._node_uuid is not None or not self._path:
-            return _FALLBACK
-        try:
-            return await execute_concurrent(
-                self._pool,
-                self._td,
-                self._build_resolved_meta(data_type=data_type, name=name),
-                root_path="/".join(self._path),
-                data_type=(str(data_type).lower() if data_type else None),
-                name=name,
-                unit=unit,
-                start_valid=start_valid,
-                end_valid=end_valid,
-                start_known=start_known,
-                end_known=end_known,
-                include_updates=include_updates,
-                include_knowledge_time=include_knowledge_time,
-                output=output,
-            )
-        except Exception:  # noqa: BLE001  -- fallback is load-bearing: engine/connectivity error -> today's path
-            if _STRICT_STRATEGY:
-                raise
-            self._client._engine_unavailable = True
-            logging.getLogger(__name__).warning(
-                "concurrent read failed; using the sequential path for the rest of the session "
-                "(setup_ch_meta_engine() re-enables)",
-                exc_info=True,
-            )
-            return _FALLBACK
+            return None
+        return PgEngineMeta(
+            table=CH_ENGINE_TABLE,
+            root_path="/".join(self._path),
+            data_type=(str(data_type).lower() if data_type else None),
+            name=name,
+        )
 
     async def _build_resolved_meta(
         self,
@@ -1402,6 +1318,25 @@ class EdgeScope(_BaseScope):
     # ------------------------------------------------------------------
     # Manifest builder for the shared _BaseScope read/read_relative
     # ------------------------------------------------------------------
+
+    def _engine_meta(self, *, data_type: str | None, name: str | None) -> PgEngineMeta | None:
+        """Engine predicate for an edge read: owner-uuid match or the exact triple.
+
+        Both edge addressings are expressible server-side (the view carries
+        ``edge_uuid`` / ``edge_type`` / ``from_path`` / ``to_path``), so edge
+        reads run the resolve and the value read in parallel too.
+        """
+        dt = str(data_type).lower() if data_type else None
+        if self._edge_uuid is not None:
+            return PgEngineMeta(table=CH_ENGINE_TABLE, edge_uuids=(str(self._edge_uuid),), data_type=dt, name=name)
+        if self._from_path is not None and self._to_path is not None and self._edge_type is not None:
+            return PgEngineMeta(
+                table=CH_ENGINE_TABLE,
+                edge_triple=("/".join(self._from_path), "/".join(self._to_path), self._edge_type),
+                data_type=dt,
+                name=name,
+            )
+        return None
 
     async def _build_resolved_meta(
         self,

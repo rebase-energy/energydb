@@ -11,7 +11,10 @@ read pipeline and one write pipeline in the library.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import contextlib
+import logging
+import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import polars as pl
@@ -192,8 +195,8 @@ def _finish_read(
     """Unit-convert then attach/partition the labelled hierarchy onto a CH value frame.
 
     The shared tail of every read: joins ``meta`` (path / data_type / name / canonical_unit)
-    onto ``result`` by ``series_id``. Pure polars — no DB round-trip. Used by the today path
-    (:func:`_execute_read`) and the ``concurrent`` path (:func:`execute_concurrent`).
+    onto ``result`` by ``series_id``. Pure polars — no DB round-trip. Both the sequential and
+    the engine-parallel branch of :func:`execute_read` converge here.
     """
     is_edge = "edge_uuid" in meta.columns
 
@@ -219,50 +222,20 @@ def _finish_read(
         return attach_node_hierarchy(pool, result, meta)
 
 
-async def execute_concurrent(
-    pool,
-    td,
-    meta_awaitable,
-    *,
-    root_path: str,
-    data_type: str | None,
-    name: str | None,
-    unit: str | None = None,
-    start_valid: datetime | None = None,
-    end_valid: datetime | None = None,
-    start_known: datetime | None = None,
-    end_known: datetime | None = None,
-    include_updates: bool = False,
-    include_knowledge_time: bool = False,
-    output: str = "frame",
-) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int]:
-    """The ``concurrent`` read: resolve labels in PG and read values from CH in parallel.
+logger = logging.getLogger(__name__)
 
-    ``meta_awaitable`` is the scope's PG label resolve; it runs concurrently with a CH value
-    read whose ``series_id`` set is resolved server-side via the PostgreSQL engine table
-    (:data:`CH_ENGINE_TABLE`). Joined on ``series_id`` client-side, so the result is
-    byte-identical to today's path. Returns ``(result, n_series)`` (``n_series`` lets the caller
-    apply the single-series identity strip).
+# Strict mode: an engine-read failure raises instead of degrading to the sequential
+# path -- for tests/debugging, so a broken engine is loud rather than masked.
+_ENGINE_STRICT = os.environ.get("ENERGYDB_ENGINE_STRICT") == "1"
+
+
+class _EngineReadError(RuntimeError):
+    """Wraps a failure of the engine-backed CH value read.
+
+    Lets :func:`execute_read` distinguish engine trouble (degrade the session +
+    fall back to the sequential path) from resolve/user errors raised by the
+    parallel PG leg (propagate unchanged -- e.g. unregistered series).
     """
-    ms = PgEngineMeta(table=CH_ENGINE_TABLE, root_path=root_path, data_type=data_type, name=name)
-    call = _td_call(
-        td,
-        relative=False,
-        meta_source=ms,
-        kwargs={
-            "start_valid": start_valid,
-            "end_valid": end_valid,
-            "start_known": start_known,
-            "end_known": end_known,
-            "include_updates": include_updates,
-            "include_knowledge_time": include_knowledge_time,
-        },
-    )
-    # series_ids/retention are unused when meta_source resolves them server-side.
-    meta, result = await asyncio.gather(meta_awaitable, asyncio.to_thread(call, [], None))
-    if meta is None or meta.height == 0:
-        return ({} if output == "by_path" else pl.DataFrame()), 0
-    return _finish_read(pool, result, meta, unit=unit, output=output), meta.height
 
 
 def _td_call(
@@ -316,12 +289,49 @@ def _project_meta(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
     return resolved.select(cols).unique()
 
 
+def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
+    """Superset engine predicate for a routing manifest, or ``None`` if inexpressible.
+
+    Built from the manifest's routing column plus the ``data_type`` / ``name``
+    value sets — single-column ``IN`` conditions only (guaranteed pushdown
+    through the PostgreSQL engine). The resulting series set is the cartesian
+    superset of the manifest's triples; :func:`execute_read` trims values
+    against the exactly-resolved meta, so correctness never depends on it.
+
+    Returns ``None`` for anything the engine can't cleanly express (missing or
+    null-carrying columns, non-Utf8 paths) — the read then runs sequentially
+    and ``resolve_manifest`` surfaces the proper error.
+    """
+    if "data_type" not in manifest.columns or "name" not in manifest.columns:
+        return None
+    routes = [c for c in ("path", "node_uuid", "edge_uuid") if c in manifest.columns]
+    if len(routes) != 1:
+        return None
+    route = routes[0]
+    col = manifest[route]
+    if col.null_count() or (route == "path" and col.dtype != pl.Utf8):
+        return None
+    if manifest["data_type"].null_count() or manifest["name"].null_count():
+        return None
+    owners = tuple(str(v) for v in col.unique().to_list())
+    # resolve_manifest lowercases data_type before matching; mirror it here.
+    dts = tuple(str(v).lower() for v in manifest["data_type"].unique().to_list())
+    names = tuple(str(v) for v in manifest["name"].unique().to_list())
+    if route == "path":
+        return PgEngineMeta(table=CH_ENGINE_TABLE, paths=owners, data_type=dts, name=names)
+    if route == "node_uuid":
+        return PgEngineMeta(table=CH_ENGINE_TABLE, node_uuids=owners, data_type=dts, name=names)
+    return PgEngineMeta(table=CH_ENGINE_TABLE, edge_uuids=owners, data_type=dts, name=names)
+
+
 async def execute_read(
     pool,
     td,
+    client,
     *,
-    meta: pl.DataFrame | None = None,
+    resolve: Callable[[], Awaitable[pl.DataFrame | None]] | None = None,
     manifest: pl.DataFrame | None = None,
+    engine_meta: PgEngineMeta | None = None,
     relative: bool = False,
     unit: str | None = None,
     output: str = "frame",
@@ -332,50 +342,114 @@ async def execute_read(
     include_updates: bool = False,
     include_knowledge_time: bool = False,
     td_kwargs: dict | None = None,
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
-    """The one sequential read pipeline: obtain meta → CH value read → finish.
+) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int]:
+    """The one read pipeline: resolve meta, read values from CH, finish.
 
     Callers hand in exactly one of:
 
-    * ``meta`` — pre-resolved per-series meta (scope reads, which resolve in a
-      single PG round-trip via ``resolve_subtree_series_for_read`` /
-      ``resolve_edge_series_for_read``), or
+    * ``resolve`` — a zero-arg factory for the scope's exact PG resolve
+      (single round-trip via ``resolve_subtree_series_for_read`` /
+      ``resolve_edge_series_for_read``; ``None`` result = nothing matched), or
     * ``manifest`` — a routing manifest (``Client.read`` /
-      ``Client.read_relative``), resolved here via :func:`resolve_manifest` +
+      ``Client.read_relative``), resolved via :func:`resolve_manifest` +
       :func:`_project_meta`.
 
-    ``relative=False`` reads values through ``td.read`` with the explicit
-    bitemporal args; ``relative=True`` routes through ``td.read_relative`` with
-    ``td_kwargs`` (see :meth:`timedb.TimeDBClient.read_relative` for accepted
-    window arguments). All paths converge on :func:`_execute_read` →
-    :func:`_finish_read`.
+    When ``engine_meta`` is given and the session's engine is healthy, the PG
+    resolve runs **in parallel** with a CH value read that self-resolves its
+    ``series_id`` set through the PostgreSQL engine table; values are then
+    trimmed against the exact resolve (engine predicates may be supersets) and
+    joined client-side — byte-identical to the sequential path. On an engine
+    failure the session degrades (``client._engine_unavailable``) and the read
+    falls back to the sequential path; resolve/user errors propagate unchanged.
+
+    ``relative`` picks ``td.read_relative`` (window args in ``td_kwargs``) over
+    ``td.read`` (explicit bitemporal args). Returns ``(result, n_series)``.
     """
-    if (meta is None) == (manifest is None):
-        raise ValueError("execute_read requires exactly one of meta= or manifest=.")
-    if manifest is not None:
+    if (resolve is None) == (manifest is None):
+        raise ValueError("execute_read requires exactly one of resolve= or manifest=.")
+    if output not in {"frame", "by_path"}:
+        raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")
+
+    kwargs = (
+        dict(td_kwargs or {})
+        if relative
+        else {
+            "start_valid": start_valid,
+            "end_valid": end_valid,
+            "start_known": start_known,
+            "end_known": end_known,
+            "include_updates": include_updates,
+            "include_knowledge_time": include_knowledge_time,
+        }
+    )
+
+    async def _resolve_meta() -> pl.DataFrame | None:
+        if resolve is not None:
+            return await resolve()
+        assert manifest is not None
         is_edge = "edge_uuid" in manifest.columns
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             async with pool.connection() as conn:
                 resolved, _summary = await resolve_manifest(conn, manifest)
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
-            meta = _project_meta(resolved, is_edge=is_edge)
-    assert meta is not None  # narrowed by the exactly-one guard above
-    if relative:
-        call = _td_call(td, relative=True, kwargs=td_kwargs or {})
-    else:
-        call = _td_call(
-            td,
-            relative=False,
-            kwargs={
-                "start_valid": start_valid,
-                "end_valid": end_valid,
-                "start_known": start_known,
-                "end_known": end_known,
-                "include_updates": include_updates,
-                "include_knowledge_time": include_knowledge_time,
-            },
-        )
-    return await _execute_read(pool, meta, call, unit=unit, output=output)
+            return _project_meta(resolved, is_edge=is_edge)
+
+    def _empty() -> tuple[pl.DataFrame | dict, int]:
+        return ({} if output == "by_path" else pl.DataFrame()), 0
+
+    if engine_meta is not None and not client._engine_unavailable:
+        call = _td_call(td, relative=relative, kwargs=kwargs, meta_source=engine_meta)
+
+        def _engine_call() -> pl.DataFrame:
+            # series_ids/retention are unused when meta_source resolves them server-side.
+            try:
+                return call([], None)
+            except Exception as exc:
+                raise _EngineReadError() from exc
+
+        engine_task = asyncio.create_task(asyncio.to_thread(_engine_call))
+        try:
+            meta = await _resolve_meta()
+        except BaseException:
+            # A to_thread CH call is not cancellable and shares the clickhouse-connect
+            # session; let it finish before propagating, or the next CH call collides
+            # ("concurrent queries within the same session").
+            with contextlib.suppress(BaseException):
+                await engine_task
+            raise
+
+        try:
+            values = await engine_task
+        except _EngineReadError as err:
+            if _ENGINE_STRICT:
+                raise (err.__cause__ or err) from None
+            client._engine_unavailable = True
+            logger.warning(
+                "engine-backed read failed; using the sequential path for the rest of the "
+                "session (setup_ch_meta_engine() re-enables)",
+                exc_info=err.__cause__,
+            )
+            # The parallel leg already resolved meta exactly -- fall back to the
+            # sequential CH read without paying the resolve again.
+        else:
+            if meta is None or meta.height == 0:
+                return _empty()
+            # Engine predicates may resolve a superset (set-valued filters); trim to
+            # the exact PG resolve before unit conversion / label attach.
+            trim = meta.select(pl.col("series_id").cast(pl.UInt64)).unique()
+            values = values.join(trim, on="series_id", how="semi")
+            return _finish_read(pool, values, meta, unit=unit, output=output), meta.height
+
+        if meta is None or meta.height == 0:
+            return _empty()
+        call = _td_call(td, relative=relative, kwargs=kwargs)
+        return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height
+
+    meta = await _resolve_meta()
+    if meta is None or meta.height == 0:
+        return _empty()
+    call = _td_call(td, relative=relative, kwargs=kwargs)
+    return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height
 
 
 def apply_per_series_unit(

@@ -43,7 +43,7 @@ from timedb import TimeDBClient, UnchangedScope, profiling
 from energydb import runs as runs_mod
 from energydb._ch_meta_engine import DROP_ENGINE_TABLE, engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, execute_read, write_manifest
+from energydb._io import WriteResult, engine_meta_for_manifest, execute_read, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
@@ -78,15 +78,16 @@ class AsyncClient:
         *,
         pg_conninfo: str | None = None,
         ch_url: str | None = None,
-        strategy: str = "today",
     ):
         """Construct a client.
 
-        ``strategy`` is the default read strategy (``"today"`` | ``"concurrent"``);
-        a per-read ``strategy=`` overrides it. ``concurrent`` requires the ClickHouse
-        engine table (provisioned by :meth:`create` for fresh DBs, or explicitly by
-        :meth:`setup_ch_meta_engine`), and falls back to ``"today"`` on any gate-miss
-        or error.
+        Reads run the PG meta-resolve and the CH value read **in parallel**
+        whenever the read is expressible over the ClickHouse engine table
+        (provisioned by :meth:`create` for fresh DBs, or explicitly by
+        :meth:`setup_ch_meta_engine`); anything else — and any engine failure —
+        uses the sequential path, with identical results. Set
+        ``ENERGYDB_DISABLE_ENGINE=1`` to force sequential reads for the whole
+        session (ops kill-switch; also what benchmarks use for before/after).
         """
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
@@ -116,10 +117,10 @@ class AsyncClient:
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
-        self._strategy = strategy
-        # Set on the first concurrent-path failure; the rest of the session uses the
-        # sequential resolve without re-trying the engine. setup_ch_meta_engine() resets it.
-        self._engine_unavailable = False
+        # Set on the first engine-read failure (or by the env kill-switch): the rest of the
+        # session uses the sequential resolve without re-trying the engine.
+        # setup_ch_meta_engine() resets it.
+        self._engine_unavailable = os.environ.get("ENERGYDB_DISABLE_ENGINE") == "1"
 
     async def open(self) -> None:
         """Open the async connection pool. Await once before first use."""
@@ -162,13 +163,18 @@ class AsyncClient:
         """
         await asyncio.to_thread(self._create_blocking)
         try:
-            await asyncio.to_thread(self.td._ch.command, engine_table_ddl(self._dsn, SCHEMA or "public"))
-        except Exception:  # noqa: BLE001  -- best-effort; concurrent reads degrade to sequential
+            await asyncio.to_thread(self._provision_engine_table_blocking)
+        except Exception:  # noqa: BLE001  -- best-effort; engine reads degrade to sequential
             logger.warning(
-                "could not provision the ClickHouse meta engine table; "
-                "'concurrent' reads will fall back to the sequential path",
+                "could not provision the ClickHouse meta engine table; reads will use the sequential path",
                 exc_info=True,
             )
+
+    def _provision_engine_table_blocking(self) -> None:
+        # DROP + CREATE (not IF NOT EXISTS alone): the engine table is stateless, and
+        # recreating it picks up view/column upgrades on existing deployments.
+        self.td._ch.command(DROP_ENGINE_TABLE)
+        self.td._ch.command(engine_table_ddl(self._dsn, SCHEMA or "public"))
 
     def _create_blocking(self) -> None:
         engine = create_engine(self._sqlalchemy_url())
@@ -208,7 +214,7 @@ class AsyncClient:
         async with self._pool.connection() as conn:
             await conn.execute(CREATE_SERIES_META_VIEW)
             await conn.commit()
-        await asyncio.to_thread(self.td._ch.command, engine_table_ddl(self._dsn, SCHEMA or "public"))
+        await asyncio.to_thread(self._provision_engine_table_blocking)
         self._engine_unavailable = False
 
     async def close(self) -> None:
@@ -790,10 +796,12 @@ class AsyncClient:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = await execute_read(
+        result, _n_series = await execute_read(
             self._pool,
             self.td,
+            self,
             manifest=manifest,
+            engine_meta=engine_meta_for_manifest(manifest),
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -830,10 +838,12 @@ class AsyncClient:
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = await execute_read(
+        result, _n_series = await execute_read(
             self._pool,
             self.td,
+            self,
             manifest=manifest,
+            engine_meta=engine_meta_for_manifest(manifest),
             relative=True,
             unit=unit,
             output=output,

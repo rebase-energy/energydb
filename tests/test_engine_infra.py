@@ -118,33 +118,54 @@ def test_create_provisions_engine_table_and_delete_drops_it(client):
 
 
 @pytestmark_live
+def test_disable_engine_env_kill_switch(monkeypatch):
+    """ENERGYDB_DISABLE_ENGINE=1 seeds the session flag: every read runs sequentially."""
+    monkeypatch.setenv("ENERGYDB_DISABLE_ENGINE", "1")
+    c = Client()
+    try:
+        assert c._async._engine_unavailable is True
+    finally:
+        c.close()
+
+
+@pytestmark_live
 def test_engine_failure_degrades_once_per_session(client, monkeypatch):
-    """The first concurrent-path failure flips the session flag: the read still returns the
+    """The first engine-read failure flips the session flag: the read still returns the
     correct (sequential) result, and later reads skip the engine entirely.
     setup_ch_meta_engine() re-enables."""
-    import energydb.scope as _scope
+    import energydb._io as _io
 
     calls = {"n": 0}
+    orig = _io._td_call
 
-    async def _boom(*args, **kwargs):
-        calls["n"] += 1
-        raise RuntimeError("engine down")
+    def fake_td_call(td, *, relative, kwargs, meta_source=None):
+        if meta_source is None:
+            return orig(td, relative=relative, kwargs=kwargs)
 
-    monkeypatch.setattr(_scope, "execute_concurrent", _boom)
-    monkeypatch.setattr(_scope, "_STRICT_STRATEGY", False)
+        def boom(*args, **kw):
+            calls["n"] += 1
+            raise RuntimeError("engine down")
 
-    expected = client.get_node("P").read(data_type="actual", name="power", strategy="today")
+        return boom
 
-    out1 = client.get_node("P").read(data_type="actual", name="power", strategy="concurrent")
+    monkeypatch.setattr(_io, "_td_call", fake_td_call)
+    monkeypatch.setattr(_io, "_ENGINE_STRICT", False)
+
+    client._async._engine_unavailable = True  # sequential baseline
+    expected = client.get_node("P").read(data_type="actual", name="power")
+    client._async._engine_unavailable = False
+
+    out1 = client.get_node("P").read(data_type="actual", name="power")
     assert out1.equals(expected)  # fell back to the sequential path, correct result
     assert calls["n"] == 1
     assert client._async._engine_unavailable is True
 
-    out2 = client.get_node("P").read(data_type="actual", name="power", strategy="concurrent")
+    out2 = client.get_node("P").read(data_type="actual", name="power")
     assert out2.equals(expected)
-    assert calls["n"] == 1  # engine not re-tried: the session flag short-circuits the gate
+    assert calls["n"] == 1  # engine not re-tried: the session flag short-circuits
 
     client.setup_ch_meta_engine()  # explicit re-enable resets the flag
     assert client._async._engine_unavailable is False
-    client.get_node("P").read(data_type="actual", name="power", strategy="concurrent")
-    assert calls["n"] == 2  # concurrent attempted again after the reset
+    out3 = client.get_node("P").read(data_type="actual", name="power")
+    assert out3.equals(expected)
+    assert calls["n"] == 2  # the engine was attempted again after the reset
