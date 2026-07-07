@@ -189,6 +189,25 @@ async def write_manifest(
 # ---------------------------------------------------------------------------
 
 
+@contextlib.asynccontextmanager
+async def autocommit_read_conn(pool):
+    """A pooled connection in autocommit mode, for read-only resolves.
+
+    psycopg opens the implicit transaction with a separate ``BEGIN`` command
+    (one round-trip) and the pool rolls it back when the connection returns
+    (another). Read resolves are pure SELECTs under READ COMMITTED — each
+    statement gets its own snapshot with or without the wrapping transaction —
+    so autocommit drops both round-trips without changing visibility.
+    Autocommit is switched back off before the connection returns to the pool.
+    """
+    async with pool.connection() as conn:
+        await conn.set_autocommit(True)
+        try:
+            yield conn
+        finally:
+            await conn.set_autocommit(False)
+
+
 async def _execute_read(
     pool,
     meta: pl.DataFrame,
@@ -420,7 +439,7 @@ async def execute_read(
         assert manifest is not None
         is_edge = "edge_uuid" in manifest.columns
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-            async with pool.connection() as conn:
+            async with autocommit_read_conn(pool) as conn:
                 resolved, _summary = await resolve_manifest(conn, manifest)
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
             return _project_meta(resolved, is_edge=is_edge)

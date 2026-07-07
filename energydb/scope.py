@@ -32,7 +32,7 @@ from timedb import PgEngineMeta, UnchangedScope, profiling
 from energydb import series as series_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, execute_read
+from energydb._io import WriteResult, autocommit_read_conn, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -1092,7 +1092,10 @@ class NodeScope(_BaseScope):
             )
         else:
             where_conds, where_params = [], []
-        async with self._use_conn() as conn:
+        # Reads are guarded against txn-bound scopes upstream, so this always
+        # borrows from the pool; autocommit skips psycopg's implicit BEGIN
+        # round-trip (and the pool's rollback-on-return).
+        async with autocommit_read_conn(self._pool) as conn:
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
                 if self._path and self._node_uuid is None:
                     meta = await series_mod.resolve_subtree_series_for_read(
@@ -1351,7 +1354,8 @@ class EdgeScope(_BaseScope):
         chain (3 round-trips) into a single query. ``None`` if no series match.
         """
         data_type_str = str(data_type).lower() if data_type else None
-        async with self._use_conn() as conn:
+        # Reads are guarded against txn-bound scopes upstream; see NodeScope.
+        async with autocommit_read_conn(self._pool) as conn:
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
                 if self._edge_uuid is not None:
                     meta = await series_mod.resolve_edge_series_for_read(
