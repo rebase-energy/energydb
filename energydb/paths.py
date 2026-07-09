@@ -51,6 +51,19 @@ def _like_escape(s: str) -> str:
     return s.translate(_LIKE_TRANS)
 
 
+def derived_prefix_like(expr: str) -> str:
+    r"""SQL fragment: the LIKE pattern ``<expr-escaped>/%`` for a server-side path.
+
+    The single-round-trip hierarchy queries derive the subtree prefix inside
+    the statement (e.g. from a joined root row), so it can't be escaped
+    Python-side with :func:`_like_escape` — the LIKE metacharacter escape is
+    inlined in SQL instead. Combine as
+    ``path LIKE {derived_prefix_like('r.path')} ESCAPE '\'`` and pair with an
+    explicit ``path = r.path`` term when the root row itself should match.
+    """
+    return rf"replace(replace(replace({expr}, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_') || '/%%'"
+
+
 # ---------------------------------------------------------------------------
 # Node resolution: path -> uuid
 # ---------------------------------------------------------------------------

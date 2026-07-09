@@ -43,7 +43,7 @@ from timedb import TimeDBClient, UnchangedScope, profiling
 from energydb import runs as runs_mod
 from energydb._ch_meta_engine import DROP_ENGINE_TABLE, engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, engine_meta_for_manifest, execute_read, write_manifest
+from energydb._io import WriteResult, autocommit_read_conn, engine_meta_for_manifest, execute_read, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
@@ -52,8 +52,8 @@ from energydb.paths import (
     Path,
     _like_escape,
     build_filter_conditions,
+    derived_prefix_like,
     resolve_node_uuid,
-    resolve_subtree_uuids,
 )
 from energydb.scope import EdgeScope, NodeScope, _coerce_path
 from energydb.serialization import reconstruct_edge, reconstruct_node
@@ -350,6 +350,33 @@ class AsyncClient:
             return diff
         return root_uuid
 
+    @staticmethod
+    def _within_match(within) -> tuple[str, Any, str | None]:
+        """``(addr_sql, param, joined_path|None)`` for a ``within=`` root row ``r``.
+
+        ``joined_path`` is ``None`` for the UUID form — a missing UUID root
+        yields an empty result (historical contract), while a missing path
+        raises, so callers need to know which form they got.
+        """
+        if isinstance(within, UUID):
+            return "r.uuid = %s", within, None
+        joined = "/".join(_coerce_path((), kwarg=within))
+        return "r.path = %s", joined, joined
+
+    @staticmethod
+    def _subtree_on(alias: str, joined: str | None) -> tuple[str, list[Any]]:
+        """ON-clause fragment matching ``alias`` rows in root ``r``'s subtree (incl. ``r``).
+
+        With ``joined`` (path-addressed root) the escaped prefix is a bind
+        param, so PG extracts the literal prefix at plan time and Index Scans
+        ``ix_node_path_prefix``. The uuid form derives the prefix from the
+        root row inside the statement — a catalog-wide scan, kept only where
+        the root path is unknown client-side.
+        """
+        if joined is not None:
+            return rf"({alias}.path = r.path OR {alias}.path LIKE %s || '/%%' ESCAPE '\')", [_like_escape(joined)]
+        return rf"({alias}.path = r.path OR {alias}.path LIKE {derived_prefix_like('r.path')} ESCAPE '\')", []
+
     async def query_nodes(
         self,
         *,
@@ -360,33 +387,46 @@ class AsyncClient:
         """Return matching nodes as a flat list of EDM objects.
 
         ``within`` accepts a ``/``-joined string (``"P/Site"``), a path
-        tuple/list of segments, or a :class:`UUID`.
+        tuple/list of segments, or a :class:`UUID`. One round-trip either
+        way: the ``within`` subtree is matched by path prefix inside the
+        statement (filters ride on the join), not resolved separately.
         """
         where_filters: dict[str, Any] = dict(property_filters)
         if type is not None:
             where_filters["node_type"] = type
 
-        async with self._pool.connection() as conn:
-            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
-            conditions: list[str] = list(filter_conds)
-            params: list[Any] = list(filter_params)
-
-            if within is not None:
-                within_uuid = (
-                    within
-                    if isinstance(within, UUID)
-                    else await resolve_node_uuid(conn, _coerce_path((), kwarg=within))
+        async with autocommit_read_conn(self._pool) as conn:
+            if within is None:
+                filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
+                where = " AND ".join(filter_conds) if filter_conds else "TRUE"
+                rows = await (
+                    await conn.execute(
+                        f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
+                        list(filter_params),
+                    )
+                ).fetchall()
+            else:
+                filter_conds, filter_params = build_filter_conditions(
+                    where_filters, type_col="node_type", table_alias="n"
                 )
-                conditions.append("uuid = ANY(%s)")
-                params.append(await resolve_subtree_uuids(conn, within_uuid))
-
-            where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = await (
-                await conn.execute(
-                    f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
-                    params,
-                )
-            ).fetchall()
+                extra = ("".join(f" AND {c}" for c in filter_conds)) if filter_conds else ""
+                addr, addr_param, joined = self._within_match(within)
+                subtree_on, prefix_params = self._subtree_on("n", joined)
+                rows = await (
+                    await conn.execute(
+                        f"""
+                    SELECT n.uuid, n.node_type, n.name, n.data
+                    FROM node r LEFT JOIN node n
+                      ON {subtree_on}{extra}
+                    WHERE {addr}
+                    ORDER BY n.name
+                    """,
+                        [*prefix_params, *filter_params, addr_param],
+                    )
+                ).fetchall()
+                if not rows and joined is not None:
+                    raise ValueError(f"Node not found: {joined}")
+                rows = [r for r in rows if r[0] is not None]  # LEFT-JOIN row when nothing matches
 
         return [reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]}) for r in rows]
 
@@ -455,7 +495,7 @@ class AsyncClient:
         the node does not exist. Safe for any ``node_type`` string, unlike
         :meth:`get_node` / :meth:`get_tree`.
         """
-        async with self._pool.connection() as conn:
+        async with autocommit_read_conn(self._pool) as conn:
             row = await (
                 await conn.execute(
                     "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
@@ -479,29 +519,22 @@ class AsyncClient:
     async def get_subtree_raw(self, root_uuid: UUID) -> list[dict]:
         """Return the node + every descendant as raw dicts (no EDM reconstruction).
 
-        Indexed materialized-path prefix scan (``ix_node_path_prefix``). Each
-        dict is ``{uuid, node_type, name, data, parent_uuid, path}``. Includes
-        the root itself; empty list if the root does not exist.
+        One round-trip: materialized-path prefix scan with the prefix derived
+        from the root row inside the statement. Each dict is ``{uuid,
+        node_type, name, data, parent_uuid, path}``. Includes the root
+        itself; empty list if the root does not exist.
         """
-        async with self._pool.connection() as conn:
-            root = await (
-                await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
-                    (root_uuid,),
-                )
-            ).fetchone()
-            if root is None:
-                return []
-            root_path = root[0]
+        async with autocommit_read_conn(self._pool) as conn:
             rows = await (
                 await conn.execute(
-                    r"""
-                SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at
-                FROM node
-                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
-                ORDER BY path
+                    rf"""
+                SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid, c.path, c.created_at, c.updated_at
+                FROM node r JOIN node c
+                  ON (c.path = r.path OR c.path LIKE {derived_prefix_like("r.path")} ESCAPE '\')
+                WHERE r.uuid = %s
+                ORDER BY c.path
                 """,
-                    (root_path, _like_escape(root_path)),
+                    (root_uuid,),
                 )
             ).fetchall()
         return [
@@ -527,7 +560,7 @@ class AsyncClient:
         """
         if owner_col not in ("node_uuid", "edge_uuid"):
             raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
-        async with self._pool.connection() as conn:
+        async with autocommit_read_conn(self._pool) as conn:
             rows = await (
                 await conn.execute(
                     f"SELECT name, data_type, canonical_unit, timeseries_type, description "
@@ -557,36 +590,50 @@ class AsyncClient:
 
         ``within`` (``/``-joined string ``"P/Site"``, path tuple/list of
         segments, or a :class:`UUID`) restricts to edges where either
-        endpoint is in that subtree.
+        endpoint is in that subtree. One round-trip either way: the subtree
+        is matched by path prefix inside the statement (DISTINCT collapses
+        edges reached via both endpoints).
         """
         where_filters: dict[str, Any] = dict(property_filters)
         if type is not None:
             where_filters["edge_type"] = type
 
-        async with self._pool.connection() as conn:
-            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
-            conditions: list[str] = list(filter_conds)
-            params: list[Any] = list(filter_params)
-
-            if within is not None:
-                within_uuid = (
-                    within
-                    if isinstance(within, UUID)
-                    else await resolve_node_uuid(conn, _coerce_path((), kwarg=within))
+        async with autocommit_read_conn(self._pool) as conn:
+            if within is None:
+                filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
+                where = " AND ".join(filter_conds) if filter_conds else "TRUE"
+                rows = await (
+                    await conn.execute(
+                        f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
+                        f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
+                        list(filter_params),
+                    )
+                ).fetchall()
+            else:
+                filter_conds, filter_params = build_filter_conditions(
+                    where_filters, type_col="edge_type", table_alias="e"
                 )
-                subtree = await resolve_subtree_uuids(conn, within_uuid)
-                conditions.append("(from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s))")
-                params.append(subtree)
-                params.append(subtree)
-
-            where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = await (
-                await conn.execute(
-                    f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
-                    f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
-                    params,
-                )
-            ).fetchall()
+                extra = ("".join(f" AND {c}" for c in filter_conds)) if filter_conds else ""
+                addr, addr_param, joined = self._within_match(within)
+                subtree_on, prefix_params = self._subtree_on("m", joined)
+                rows = await (
+                    await conn.execute(
+                        f"""
+                    SELECT DISTINCT e.uuid, e.edge_type, e.name, e.data, e.from_node_uuid, e.to_node_uuid
+                    FROM node r
+                    LEFT JOIN node m
+                      ON {subtree_on}
+                    LEFT JOIN edge e
+                      ON (e.from_node_uuid = m.uuid OR e.to_node_uuid = m.uuid){extra}
+                    WHERE {addr}
+                    ORDER BY e.name NULLS LAST
+                    """,
+                        [*prefix_params, *filter_params, addr_param],
+                    )
+                ).fetchall()
+                if not rows and joined is not None:
+                    raise ValueError(f"Node not found: {joined}")
+                rows = [r for r in rows if r[0] is not None]  # LEFT-JOIN rows when nothing matches
             if not rows:
                 return []
 
@@ -626,67 +673,65 @@ class AsyncClient:
         outside the tree shape — query them separately with
         :meth:`get_edge` or :meth:`query_edges`.
         """
-        async with self._pool.connection() as conn:
-            if uuid is not None:
-                root_uuid = uuid
-            elif names_or_path:
-                root_uuid = await resolve_node_uuid(conn, _coerce_path(names_or_path))
-            else:
-                raise ValueError("Provide a path or uuid=.")
+        if uuid is not None:
+            addr, addr_param, joined = "r.uuid = %s", uuid, None
+            missing_msg = f"Node not found: uuid={uuid}"
+        elif names_or_path:
+            joined = "/".join(_coerce_path(names_or_path))
+            addr, addr_param = "r.path = %s", joined
+            missing_msg = f"Node not found: {joined}"
+        else:
+            raise ValueError("Provide a path or uuid=.")
 
-            # Two-step: fetch the root's path, then LIKE with the escaped
-            # prefix as a bind param so PG picks Index Scan on
-            # ``ix_node_path_prefix``. A column-source LIKE would Seq Scan.
-            root_path_row = await (
-                await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
-                    (root_uuid,),
-                )
-            ).fetchone()
-            if root_path_row is None:
-                raise ValueError(f"Node not found: uuid={root_uuid}")
-            root_path = root_path_row[0]
-            rows = await (
-                await conn.execute(
-                    r"""
-                SELECT uuid, node_type, name, data, parent_uuid
-                FROM node
-                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
-                """,
-                    (root_path, _like_escape(root_path)),
-                )
-            ).fetchall()
-
-            nodes: dict[UUID, Any] = {}
-            parent_map: dict[UUID, UUID | None] = {}
-            for r in rows:
-                node_uuid = r[0]
-                parent_map[node_uuid] = r[4]
-                nodes[node_uuid] = reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]})
-
+        # One statement for the subtree (the root resolve and the prefix
+        # scan are inlined); with ``include_series`` a second, independent
+        # statement joins the series — both ride ONE pipeline flush.
+        subtree_on, prefix_params = self._subtree_on("n", joined)
+        subtree_from = f"FROM node r JOIN node n ON {subtree_on}"
+        params = [*prefix_params, addr_param]
+        nodes_sql = f"SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid, r.uuid {subtree_from} WHERE {addr}"
+        series_sql = (
+            f"SELECT s.node_uuid, s.data_type, s.name, s.canonical_unit, s.timeseries_type, s.description "
+            f"{subtree_from} JOIN series s ON s.node_uuid = n.uuid WHERE {addr}"
+        )
+        async with autocommit_read_conn(self._pool) as conn:
             if include_series:
-                series_rows = await (
-                    await conn.execute(
-                        "SELECT node_uuid, data_type, name, canonical_unit, timeseries_type, description "
-                        "FROM series WHERE node_uuid = ANY(%s)",
-                        (list(nodes.keys()),),
-                    )
-                ).fetchall()
-                for nid, dt, sname, unit, tstype, desc in series_rows:
-                    node_obj = nodes.get(nid)
-                    if node_obj is None:
-                        continue
-                    series = TimeSeries(
-                        df=None,
-                        name=sname,
-                        unit=unit or "dimensionless",
-                        data_type=DataType(dt.upper()) if dt else None,
-                        timeseries_type=TimeSeriesType(tstype) if tstype else TimeSeriesType.FLAT,
-                        description=desc,
-                    )
-                    if node_obj.timeseries is None:
-                        node_obj.timeseries = []
-                    node_obj.timeseries.append(series)
+                async with conn.pipeline():
+                    nodes_cur = await conn.execute(nodes_sql, params)
+                    series_cur = await conn.execute(series_sql, params)
+                rows = await nodes_cur.fetchall()
+                series_rows = await series_cur.fetchall()
+            else:
+                rows = await (await conn.execute(nodes_sql, params)).fetchall()
+                series_rows = []
+
+        if not rows:
+            raise ValueError(missing_msg)
+        root_uuid = rows[0][5]  # r.uuid rides along on every subtree row
+
+        nodes: dict[UUID, Any] = {}
+        parent_map: dict[UUID, UUID | None] = {}
+        for r in rows:
+            node_uuid = r[0]
+            parent_map[node_uuid] = r[4]
+            nodes[node_uuid] = reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]})
+
+        if include_series:
+            for nid, dt, sname, unit, tstype, desc in series_rows:
+                node_obj = nodes.get(nid)
+                if node_obj is None:
+                    continue
+                series = TimeSeries(
+                    df=None,
+                    name=sname,
+                    unit=unit or "dimensionless",
+                    data_type=DataType(dt.upper()) if dt else None,
+                    timeseries_type=TimeSeriesType(tstype) if tstype else TimeSeriesType.FLAT,
+                    description=desc,
+                )
+                if node_obj.timeseries is None:
+                    node_obj.timeseries = []
+                node_obj.timeseries.append(series)
 
         # Attach children to their parents (flat pass — uuid-based, order-agnostic).
         for node_uuid, parent_uuid in parent_map.items():
@@ -861,7 +906,7 @@ class AsyncClient:
         run_ids = await asyncio.to_thread(self.td.read_run_series, series_id=series_id)
         if not run_ids:
             return []
-        async with self._pool.connection() as conn:
+        async with autocommit_read_conn(self._pool) as conn:
             return await runs_mod.get_runs(conn, run_ids)
 
     # ------------------------------------------------------------------

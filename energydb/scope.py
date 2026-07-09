@@ -40,9 +40,9 @@ from energydb.paths import (
     Path,
     _like_escape,
     build_filter_conditions,
+    derived_prefix_like,
     resolve_edge_uuid,
     resolve_node_uuid,
-    resolve_path,
     resolve_subtree_uuids,
 )
 from energydb.serialization import reconstruct_edge, reconstruct_node
@@ -281,6 +281,20 @@ class _BaseScope:
             yield self._txn._conn
             return
         async with self._pool.connection() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def _use_read_conn(self):
+        """Yield a connection for a pure read. Inside a txn, the txn's
+        connection — reads must see the transaction's uncommitted mutations.
+        Otherwise a pooled autocommit connection: SELECTs under READ
+        COMMITTED see the same data either way, and autocommit skips
+        psycopg's implicit-BEGIN round-trip and the pool's rollback-on-return.
+        """
+        if self._txn is not None:
+            yield self._txn._conn
+            return
+        async with autocommit_read_conn(self._pool) as conn:
             yield conn
 
     # -- subclass contract (overridden in NodeScope / EdgeScope) -------
@@ -729,6 +743,38 @@ class NodeScope(_BaseScope):
             return self._node_uuid
         raise ValueError("NodeScope has no path or uuid to resolve.")
 
+    def _node_match(self) -> tuple[str, list[Any], str, list[Any]]:
+        """SQL pieces matching exactly this scope's node as alias ``n``.
+
+        Returns ``(from_sql, from_params, where_sql, where_params)`` for the
+        three addressings (absolute path / uuid / uuid + relative path), so
+        the single-round-trip reads inline the resolve instead of paying a
+        separate ``resolve_node_uuid`` query. Params are split per segment
+        because psycopg fills placeholders in textual order.
+        """
+        if self._path:
+            joined = "/".join(self._path)
+            if self._node_uuid is None:
+                return "node n", [], "n.path = %s", [joined]
+            return (
+                "node n JOIN node s ON n.path = s.path || '/' || %s",
+                [joined],
+                "s.uuid = %s",
+                [self._node_uuid],
+            )
+        if self._node_uuid is not None:
+            return "node n", [], "n.uuid = %s", [self._node_uuid]
+        raise ValueError("NodeScope has no path or uuid to resolve.")
+
+    def _missing_msg(self) -> str:
+        """The not-found message ``resolve_node_uuid`` / ``get`` would raise."""
+        if self._path:
+            joined = "/".join(self._path)
+            if self._node_uuid is not None:
+                return f"Node not found: {joined} (relative to {self._node_uuid})"
+            return f"Node not found: {joined}"
+        return f"Node not found: uuid={self._node_uuid}"
+
     async def _resolve_target_node_uuids(self, conn) -> list[UUID]:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE_SUBTREE):
             root_uuid = await self._resolve_node_uuid(conn)
@@ -763,34 +809,38 @@ class NodeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     async def get(self):
-        async with self._use_conn() as conn:
-            node_uuid = await self._resolve_node_uuid(conn)
+        frm, frm_params, where, where_params = self._node_match()
+        async with self._use_read_conn() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT uuid, node_type, name, data FROM node WHERE uuid = %s",
-                    (node_uuid,),
+                    f"SELECT n.uuid, n.node_type, n.name, n.data FROM {frm} WHERE {where}",
+                    [*frm_params, *where_params],
                 )
             ).fetchone()
-            if row is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
-            return reconstruct_node({"uuid": row[0], "node_type": row[1], "name": row[2], "data": row[3]})
+        if row is None:
+            raise ValueError(self._missing_msg())
+        return reconstruct_node({"uuid": row[0], "node_type": row[1], "name": row[2], "data": row[3]})
 
     async def get_raw(self) -> dict | None:
         """Fetch this node as a raw dict, without EDM reconstruction.
 
         Returns ``{uuid, node_type, name, data, parent_uuid, path}`` or ``None``
-        if the node does not exist. Use for generic node types (any ``node_type``
-        string), where :meth:`get` would raise on an unregistered EDM type.
+        if the uuid-addressed node does not exist (a path-addressed miss raises,
+        matching the resolve contract). Use for generic node types (any
+        ``node_type`` string), where :meth:`get` would raise on an
+        unregistered EDM type.
         """
-        async with self._use_conn() as conn:
-            node_uuid = await self._resolve_node_uuid(conn)
+        frm, frm_params, where, where_params = self._node_match()
+        async with self._use_read_conn() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT uuid, node_type, name, data, parent_uuid, path FROM node WHERE uuid = %s",
-                    (node_uuid,),
+                    f"SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid, n.path FROM {frm} WHERE {where}",
+                    [*frm_params, *where_params],
                 )
             ).fetchone()
         if row is None:
+            if self._path:
+                raise ValueError(self._missing_msg())
             return None
         return {
             "uuid": row[0],
@@ -802,66 +852,80 @@ class NodeScope(_BaseScope):
         }
 
     async def children(self, *, type: str | None = None) -> list[dict]:
-        """Direct children of this node only (one level). Optional type filter."""
-        async with self._use_conn() as conn:
-            node_uuid = await self._resolve_node_uuid(conn)
-            if type:
-                rows = await (
-                    await conn.execute(
-                        "SELECT uuid, node_type, name, data, parent_uuid "
-                        "FROM node WHERE parent_uuid = %s AND node_type = %s "
-                        "ORDER BY name",
-                        (node_uuid, type),
-                    )
-                ).fetchall()
-            else:
-                rows = await (
-                    await conn.execute(
-                        "SELECT uuid, node_type, name, data, parent_uuid "
-                        "FROM node WHERE parent_uuid = %s ORDER BY name",
-                        (node_uuid,),
-                    )
-                ).fetchall()
-            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]} for r in rows]
+        """Direct children of this node only (one level). Optional type filter.
+
+        One round-trip: the scope resolve rides the same statement, and the
+        LEFT JOIN keeps the root row so a missing node (raise / empty per
+        addressing) is distinguishable from a childless one (empty).
+        """
+        frm, frm_params, where, where_params = self._node_match()
+        type_cond = " AND c.node_type = %s" if type else ""
+        type_params = [type] if type else []
+        async with self._use_read_conn() as conn:
+            rows = await (
+                await conn.execute(
+                    f"SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid "
+                    f"FROM {frm} LEFT JOIN node c ON c.parent_uuid = n.uuid{type_cond} "
+                    f"WHERE {where} ORDER BY c.name",
+                    [*frm_params, *type_params, *where_params],
+                )
+            ).fetchall()
+        if not rows and self._path:
+            raise ValueError(self._missing_msg())
+        return [
+            {"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]}
+            for r in rows
+            if r[0] is not None  # the LEFT-JOIN row of a childless root
+        ]
 
     async def descendants(self, *, type: str | None = None) -> list[dict]:
         """Every node in the subtree rooted at this node, excluding the node
         itself (recursive). Optional type filter.
 
-        Materialized-path prefix scan against ``ix_node_path_prefix`` —
-        one indexed lookup, no recursive CTE.
+        One round-trip; the LEFT JOIN keeps the root so a missing node is
+        distinguishable from a childless one. An absolute-path scope knows
+        the prefix client-side, so it goes in as an escaped bind param and PG
+        extracts the literal prefix at plan time (Index Scan on
+        ``ix_node_path_prefix``); uuid-addressed scopes derive the prefix
+        from the root row inside the statement (catalog-wide scan).
         """
-        async with self._use_conn() as conn:
-            node_uuid = await self._resolve_node_uuid(conn)
-            # Two-step: fetch root path, then LIKE with escaped prefix as
-            # bind param so PG Index Scans on ``ix_node_path_prefix``.
-            root_path_row = await (
-                await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
-                    (node_uuid,),
-                )
-            ).fetchone()
-            if root_path_row is None:
-                return []
-            root_path = root_path_row[0]
+        frm, frm_params, where, where_params = self._node_match()
+        if self._path and self._node_uuid is None:
+            prefix, prefix_params = "%s || '/%%'", ["/".join(_like_escape(p) for p in self._path)]
+        else:
+            prefix, prefix_params = derived_prefix_like("n.path"), []
+        async with self._use_read_conn() as conn:
             rows = await (
                 await conn.execute(
-                    r"""
-                SELECT uuid, node_type, name, data, parent_uuid FROM node
-                WHERE path LIKE %s || '/%%' ESCAPE '\'
-                  AND (%s::text IS NULL OR node_type = %s::text)
-                ORDER BY name
+                    rf"""
+                SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid
+                FROM {frm} LEFT JOIN node c
+                  ON c.path LIKE {prefix} ESCAPE '\'
+                 AND (%s::text IS NULL OR c.node_type = %s::text)
+                WHERE {where}
+                ORDER BY c.name
                 """,
-                    (_like_escape(root_path), type, type),
+                    [*frm_params, *prefix_params, type, type, *where_params],
                 )
             ).fetchall()
-            return [{"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]} for r in rows]
+        if not rows and self._path:
+            raise ValueError(self._missing_msg())
+        return [
+            {"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]}
+            for r in rows
+            if r[0] is not None  # the LEFT-JOIN row of a leaf root
+        ]
 
     async def path(self) -> Path:
         """Return the resolved path of the scope's node."""
-        async with self._use_conn() as conn:
-            node_uuid = await self._resolve_node_uuid(conn)
-            return await resolve_path(conn, node_uuid)
+        frm, frm_params, where, where_params = self._node_match()
+        async with self._use_read_conn() as conn:
+            row = await (
+                await conn.execute(f"SELECT n.path FROM {frm} WHERE {where}", [*frm_params, *where_params])
+            ).fetchone()
+        if row is None:
+            raise ValueError(self._missing_msg())
+        return tuple(row[0].split("/"))
 
     # ------------------------------------------------------------------
     # Single-element mutations
@@ -1207,52 +1271,79 @@ class EdgeScope(_BaseScope):
             return await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
         raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
 
+    async def _fetch_edge_row(self, conn):
+        """Fetch this edge's full row in ONE statement, or ``None``.
+
+        The triple addressing joins the endpoint nodes by path inline —
+        no separate ``resolve_edge_uuid`` round-trip. Columns:
+        ``(uuid, edge_type, name, data, from_node_uuid, to_node_uuid)``.
+        """
+        if self._edge_uuid is not None:
+            sql = "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s"
+            params: list[Any] = [self._edge_uuid]
+        elif self._from_path is not None and self._to_path is not None and self._edge_type is not None:
+            sql = (
+                "SELECT e.uuid, e.edge_type, e.name, e.data, e.from_node_uuid, e.to_node_uuid "
+                "FROM edge e "
+                "JOIN node fn ON fn.uuid = e.from_node_uuid "
+                "JOIN node tn ON tn.uuid = e.to_node_uuid "
+                "WHERE fn.path = %s AND tn.path = %s AND e.edge_type = %s"
+            )
+            params = ["/".join(self._from_path), "/".join(self._to_path), self._edge_type]
+        else:
+            raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
+        return await (await conn.execute(sql, params)).fetchone()
+
+    async def _edge_not_found(self, conn):
+        """Raise the pre-collapse not-found error for this addressing.
+
+        Error path only: the triple form re-runs ``resolve_edge_uuid`` so a
+        missing endpoint path keeps its own message (distinct from a missing
+        edge), exactly as before the single-statement fetch.
+        """
+        if self._edge_uuid is not None:
+            raise ValueError(f"Edge not found: uuid={self._edge_uuid}")
+        assert self._from_path is not None and self._to_path is not None and self._edge_type is not None
+        await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
+        raise ValueError(
+            f"Edge not found: type={self._edge_type!r} "
+            f"from={'/'.join(self._from_path)!r} to={'/'.join(self._to_path)!r}"
+        )
+
     async def _endpoints(self, conn) -> tuple[UUID, UUID]:
         """Fetch ``(from_node_uuid, to_node_uuid)`` for this edge in one query."""
-        edge_uuid = await self._resolve_edge_uuid(conn)
-        row = await (
-            await conn.execute(
-                "SELECT from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s",
-                (edge_uuid,),
-            )
-        ).fetchone()
+        row = await self._fetch_edge_row(conn)
         if row is None:
-            raise ValueError(f"Edge not found: uuid={edge_uuid}")
-        return row[0], row[1]
+            await self._edge_not_found(conn)
+        return row[4], row[5]
 
     # ------------------------------------------------------------------
     # get / navigation
     # ------------------------------------------------------------------
 
     async def get(self):
-        async with self._use_conn() as conn:
-            edge_uuid = await self._resolve_edge_uuid(conn)
-            row = await (
-                await conn.execute(
-                    "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s",
-                    (edge_uuid,),
-                )
-            ).fetchone()
+        async with self._use_read_conn() as conn:
+            row = await self._fetch_edge_row(conn)
             if row is None:
-                raise ValueError(f"Edge not found: uuid={edge_uuid}")
-            return reconstruct_edge(
-                {
-                    "uuid": row[0],
-                    "edge_type": row[1],
-                    "name": row[2],
-                    "data": row[3],
-                    "from_node_uuid": row[4],
-                    "to_node_uuid": row[5],
-                }
-            )
+                await self._edge_not_found(conn)
+        return reconstruct_edge(
+            {
+                "uuid": row[0],
+                "edge_type": row[1],
+                "name": row[2],
+                "data": row[3],
+                "from_node_uuid": row[4],
+                "to_node_uuid": row[5],
+            }
+        )
 
     async def from_node(self) -> NodeScope:
-        async with self._use_conn() as conn:
+        async with self._use_read_conn() as conn:
             from_uuid, _ = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=from_uuid, txn=self._txn)
 
     async def to_node(self) -> NodeScope:
-        async with self._use_conn() as conn:
+        async with self._use_read_conn() as conn:
             _, to_uuid = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=to_uuid, txn=self._txn)
 
