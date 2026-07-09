@@ -40,6 +40,10 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
     ``commit``/``rollback`` are awaitable; ``execute`` returns a cursor whose
     ``fetchall``/``fetchone`` are awaitable. Pass ``execute_side_effect`` to
     dispatch cursors per-SQL (e.g. path resolution vs existence checks).
+
+    ``conn.cursor()`` is an async context manager yielding a cursor whose
+    ``executemany`` is awaitable — the batched ``register_tree`` insert path.
+    The cursor is exposed as ``conn._batch_cursor`` for assertions.
     """
     conn = MagicMock()
     conn.commit = AsyncMock()
@@ -51,7 +55,26 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
         cursor.fetchall = AsyncMock(return_value=fetchall if fetchall is not None else [])
         cursor.fetchone = AsyncMock(return_value=None)
         conn.execute = AsyncMock(return_value=cursor)
+    batch_cursor = MagicMock()
+    batch_cursor.executemany = AsyncMock()
+    cursor_cm = conn.cursor.return_value
+    cursor_cm.__aenter__ = AsyncMock(return_value=batch_cursor)
+    cursor_cm.__aexit__ = AsyncMock(return_value=None)
+    pipeline_cm = conn.pipeline.return_value
+    pipeline_cm.__aenter__ = AsyncMock(return_value=None)
+    pipeline_cm.__aexit__ = AsyncMock(return_value=None)
+    conn._batch_cursor = batch_cursor
     return conn
+
+
+def _batches(conn: MagicMock) -> dict[str, list[tuple]]:
+    """The rows passed to each batched INSERT, keyed by target table."""
+    out: dict[str, list[tuple]] = {}
+    for call in conn._batch_cursor.executemany.call_args_list:
+        sql, rows = call.args
+        table = sql.split("INSERT INTO ")[1].split(" ")[0]
+        out[table] = list(rows)
+    return out
 
 
 def _async_pool(conn: MagicMock) -> MagicMock:
@@ -148,22 +171,12 @@ class TestRegisterSeriesShapeDefault:
 
 
 class TestRegisterTree:
-    def test_visits_every_node_with_correct_parent(self, monkeypatch):
-        """``register_tree`` calls ``create_node`` once per node, with the
-        uuid of the previous level as ``parent_uuid``."""
+    def test_batches_every_node_with_correct_parent_and_path(self, monkeypatch):
+        """``register_tree`` inserts all nodes in ONE batched statement, in DFS
+        order (parent before child), with client-side materialized paths."""
         client = _mock_client(monkeypatch)
-
-        calls: list[tuple[str, UUID | None]] = []
-
-        async def fake_create_node(_pool, edm_obj, *, parent_uuid=None):
-            calls.append((edm_obj.name, parent_uuid))
-            return edm_obj.id
-
-        monkeypatch.setattr("energydb._persist.create_node", fake_create_node)
-        monkeypatch.setattr(
-            "energydb._persist.create_edge",
-            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("edges shouldn't be visited")),
-        )
+        conn = _make_conn()
+        client._pool = _async_pool(conn)
 
         portfolio = edb.Portfolio(name="P")
         s1 = edb.Site(name="S1")
@@ -178,23 +191,24 @@ class TestRegisterTree:
         root_uuid = asyncio.run(client.register_tree(portfolio))
 
         assert root_uuid == portfolio.id
-        assert calls == [
-            ("P", None),
-            ("S1", portfolio.id),
-            ("T1", s1.id),
-            ("T2", s1.id),
-            ("S2", portfolio.id),
-            ("B1", s2.id),
+        batches = _batches(conn)
+        assert "edge" not in batches  # no edges in this tree
+        # (uuid, node_type, name, parent_uuid, path, data)
+        assert [(r[2], r[3], r[4]) for r in batches["node"]] == [
+            ("P", None, "P"),
+            ("S1", portfolio.id, "P/S1"),
+            ("T1", s1.id, "P/S1/T1"),
+            ("T2", s1.id, "P/S1/T2"),
+            ("S2", portfolio.id, "P/S2"),
+            ("B1", s2.id, "P/S2/B1"),
         ]
         client.td.write.assert_not_called()
 
-    def test_metadata_only_tree_registers_no_data(self, monkeypatch):
-        """Metadata-only TimeSeries are fine for register_tree; td.write is never called."""
+    def test_metadata_only_tree_registers_series_no_data(self, monkeypatch):
+        """Metadata-only TimeSeries land in the series batch; td.write is never called."""
         client = _mock_client(monkeypatch)
-        monkeypatch.setattr(
-            "energydb._persist.create_node",
-            AsyncMock(side_effect=lambda _pool, obj, *, parent_uuid=None: obj.id),
-        )
+        conn = _make_conn()
+        client._pool = _async_pool(conn)
 
         tree = edb.wind.WindTurbine(
             name="T",
@@ -203,14 +217,15 @@ class TestRegisterTree:
         )
         asyncio.run(client.register_tree(tree))
         client.td.write.assert_not_called()
+        series = _batches(conn)["series"]
+        # (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description)
+        assert series == [(tree.id, None, "actual", "power", "MW", "FLAT", "forever", None)]
 
     def test_inline_data_rejected(self, monkeypatch):
-        """register_tree raises if any TimeSeries has non-empty data."""
+        """register_tree raises if any TimeSeries has non-empty data; nothing is inserted."""
         client = _mock_client(monkeypatch)
-        monkeypatch.setattr(
-            "energydb._persist.create_node",
-            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not be called")),
-        )
+        conn = _make_conn()
+        client._pool = _async_pool(conn)
 
         tree = edb.wind.WindTurbine(
             name="T",
@@ -219,9 +234,11 @@ class TestRegisterTree:
         )
         with pytest.raises(ValueError, match="register_tree"):
             asyncio.run(client.register_tree(tree))
+        conn._batch_cursor.executemany.assert_not_called()
 
     def test_under_resolves_parent_path(self, monkeypatch):
-        """``under=`` resolves to a parent_uuid and the tree is grafted there."""
+        """``under=`` resolves to a parent_uuid; the grafted rows carry that
+        parent_uuid and paths prefixed with the parent's materialized path."""
         from uuid import uuid4
 
         client = _mock_client(monkeypatch)
@@ -229,8 +246,9 @@ class TestRegisterTree:
         parent_uuid = uuid4()
 
         # Different SQL queries fire during register_tree_under:
-        #   1. resolve_node_uuid("Region/Site") (path = %s)   → returns 1-col row
-        #   2. _fetch_nodes_by_uuids([turbine.id])             → returns []
+        #   1. resolve_node_uuid("Region/Site") (path = %s)      → returns 1-col row
+        #   2. the create-only existence pre-check                → returns []
+        #   3. graft parent path lookup (path FROM node ... uuid) → returns its path
         # Use side_effect to dispatch based on the SQL substring.
         def execute_side_effect(sql, *args, **kwargs):
             res = MagicMock()
@@ -238,8 +256,11 @@ class TestRegisterTree:
                 # resolve_node_uuid materialized-path lookup uses fetchone.
                 res.fetchone = AsyncMock(return_value=(parent_uuid,))
                 res.fetchall = AsyncMock(return_value=[])
+            elif "SELECT path FROM node WHERE uuid" in sql:
+                res.fetchone = AsyncMock(return_value=("Region/Site",))
+                res.fetchall = AsyncMock(return_value=[])
             else:
-                # New target node — not yet in DB (existence pre-check).
+                # New target uuids — not yet in DB (existence pre-check).
                 res.fetchone = AsyncMock(return_value=None)
                 res.fetchall = AsyncMock(return_value=[])
             return res
@@ -247,35 +268,17 @@ class TestRegisterTree:
         conn = _make_conn(execute_side_effect=execute_side_effect)
         client._pool = _async_pool(conn)
 
-        captured_parent: list[UUID | None] = []
-
-        async def fake_create_node(_pool, obj, *, parent_uuid=None):
-            captured_parent.append(parent_uuid)
-            return obj.id
-
-        monkeypatch.setattr("energydb._persist.create_node", fake_create_node)
-
-        asyncio.run(client.register_tree(edb.wind.WindTurbine(name="T", capacity=3.5), under=("Region", "Site")))
-        assert captured_parent == [parent_uuid]
+        turbine = edb.wind.WindTurbine(name="T", capacity=3.5)
+        asyncio.run(client.register_tree(turbine, under=("Region", "Site")))
+        rows = _batches(conn)["node"]
+        assert [(r[0], r[3], r[4]) for r in rows] == [(turbine.id, parent_uuid, "Region/Site/T")]
 
 
 class TestTwoPassWalk:
-    def test_edges_skipped_in_node_pass_then_visited(self, monkeypatch):
+    def test_edges_batched_after_nodes(self, monkeypatch):
         client = _mock_client(monkeypatch)
-
-        node_calls: list[str] = []
-        edge_calls: list[str] = []
-
-        async def fake_create_node(_pool, obj, *, parent_uuid=None):
-            node_calls.append(obj.name)
-            return obj.id
-
-        async def fake_create_edge(_pool, obj, *, tree_root=None):
-            edge_calls.append(obj.name)
-            return obj.id
-
-        monkeypatch.setattr("energydb._persist.create_node", fake_create_node)
-        monkeypatch.setattr("energydb._persist.create_edge", fake_create_edge)
+        conn = _make_conn()
+        client._pool = _async_pool(conn)
 
         bus_a = edb.grid.JunctionPoint(name="BusA")
         bus_b = edb.grid.JunctionPoint(name="BusB")
@@ -283,11 +286,69 @@ class TestTwoPassWalk:
         tree = edb.Portfolio(name="Grid", members=[bus_a, bus_b, line])
         asyncio.run(client.register_tree(tree))
 
-        assert "Grid" in node_calls
-        assert "BusA" in node_calls
-        assert "BusB" in node_calls
-        assert "L1" not in node_calls
-        assert "L1" in edge_calls
+        batches = _batches(conn)
+        node_names = [r[2] for r in batches["node"]]
+        assert node_names == ["Grid", "BusA", "BusB"]  # the edge is not a node row
+        # (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
+        assert [(r[0], r[2], r[3], r[4]) for r in batches["edge"]] == [(line.id, "L1", bus_a.id, bus_b.id)]
+        # nodes are inserted before edges (FK on the endpoints)
+        calls = conn._batch_cursor.executemany.call_args_list
+        tables = [c.args[0].split("INSERT INTO ")[1].split(" ")[0] for c in calls]
+        assert tables.index("node") < tables.index("edge")
+
+
+class TestBatchedSeriesRows:
+    """Payload-internal duplicate handling in ``_collect_series_rows`` mirrors
+    the DB-driven contract of ``register_series``."""
+
+    def test_identical_duplicates_collapse(self):
+        from energydb._persist import _collect_series_rows
+
+        t = edb.wind.WindTurbine(
+            name="T",
+            capacity=1.0,
+            timeseries=[
+                edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+                edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+            ],
+        )
+        rows = _collect_series_rows({t.id: t}, {})
+        assert len(rows) == 1
+
+    def test_conflicting_immutables_raise(self):
+        from energydb._persist import _collect_series_rows
+
+        t = edb.wind.WindTurbine(
+            name="T",
+            capacity=1.0,
+            timeseries=[
+                edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL),
+                edb.TimeSeries(name="power", unit="kW", data_type=edb.DataType.ACTUAL),
+            ],
+        )
+        with pytest.raises(ValueError, match="conflicting immutable"):
+            _collect_series_rows({t.id: t}, {})
+
+    def test_node_and_edge_owners_both_collected(self):
+        from energydb._persist import _collect_series_rows
+
+        t = edb.wind.WindTurbine(
+            name="T",
+            capacity=1.0,
+            timeseries=[edb.TimeSeries(name="power", unit="MW", data_type=edb.DataType.ACTUAL)],
+        )
+        a = edb.grid.JunctionPoint(name="A")
+        b = edb.grid.JunctionPoint(name="B")
+        line = edb.grid.Line(
+            name="L",
+            capacity=1,
+            from_element=Reference(a),
+            to_element=Reference(b),
+            timeseries=[edb.TimeSeries(name="flow", unit="MW", data_type=edb.DataType.ACTUAL)],
+        )
+        rows = _collect_series_rows({t.id: t}, {line.id: line})
+        owners = {(r[0], r[1]) for r in rows}
+        assert owners == {(t.id, None), (None, line.id)}
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,50 @@ def validate_name(name: str, *, kind: str) -> None:
         )
 
 
+# Column order of SERIES_INSERT_SQL params -- shared by the single-row upsert
+# below and the batched register_tree path in ``_persist``.
+SERIES_INSERT_COLUMNS = (
+    "node_uuid",
+    "edge_uuid",
+    "data_type",
+    "name",
+    "canonical_unit",
+    "timeseries_type",
+    "retention",
+    "description",
+)
+
+
+def prepare_series_row(
+    *,
+    owner_col: OwnerCol,
+    owner_uuid: UUID,
+    data_type: str,
+    name: str,
+    canonical_unit: str,
+    timeseries_type: str,
+    retention: str | None = None,
+    description: str | None = None,
+) -> tuple:
+    """Validate + normalize one series declaration; return the INSERT param tuple.
+
+    Pure (no I/O): validation and the shape-derived retention default
+    (FLAT → ``"forever"``, OVERLAPPING → ``"medium"``) live here so the
+    single-row upsert and the batched ``register_tree`` insert agree exactly.
+    Param order is :data:`SERIES_INSERT_COLUMNS`.
+    """
+    _validate_timeseries_type(timeseries_type)
+    validate_name(name, kind="series")
+    if retention is None:
+        retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
+    _validate_retention(retention)
+
+    # Populate the right column based on owner_col; the other stays NULL.
+    node_uuid = owner_uuid if owner_col == "node_uuid" else None
+    edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
+    return (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description)
+
+
 async def register_series(
     conn,
     *,
@@ -90,15 +134,17 @@ async def register_series(
     If ``retention`` is omitted, it is derived from ``timeseries_type``:
     FLAT (actuals) → ``"forever"``, OVERLAPPING (forecasts) → ``"medium"``.
     """
-    _validate_timeseries_type(timeseries_type)
-    validate_name(name, kind="series")
-    if retention is None:
-        retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
-    _validate_retention(retention)
-
-    # Populate the right column based on owner_col; the other stays NULL.
-    node_uuid = owner_uuid if owner_col == "node_uuid" else None
-    edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
+    params = prepare_series_row(
+        owner_col=owner_col,
+        owner_uuid=owner_uuid,
+        data_type=data_type,
+        name=name,
+        canonical_unit=canonical_unit,
+        timeseries_type=timeseries_type,
+        retention=retention,
+        description=description,
+    )
+    retention = params[SERIES_INSERT_COLUMNS.index("retention")]
     conflict_constraint = _CONFLICT_CONSTRAINT_BY_OWNER[owner_col]
 
     row = await (
@@ -111,7 +157,7 @@ async def register_series(
             ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
             RETURNING series_id
             """,
-            (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
+            params,
         )
     ).fetchone()
 
