@@ -499,6 +499,71 @@ class _BaseScope:
             result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
         return to_backend(result, backend)
 
+    async def resolve(
+        self,
+        *,
+        data_type: str | None = None,
+        name: str | None = None,
+    ) -> pl.DataFrame | None:
+        """Resolve this scope to per-series read metadata in one PG round-trip,
+        *without* reading any timeseries data.
+
+        Returns the frame :meth:`read_from_meta` consumes — one row per series
+        with ``series_id``, ``canonical_unit``, ``timeseries_type``,
+        ``data_type``, ``name`` and (for node scopes) the materialized ``path`` —
+        or ``None`` if nothing matches. Splitting resolve from the read lets a
+        caller authorize or inspect (e.g. by ``path``) before paying for the
+        ClickHouse read; ``resolve()`` then :meth:`read_from_meta` is exactly
+        what :meth:`read` does in one call.
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("resolve")
+        return await self._build_resolved_meta(data_type=data_type, name=name)
+
+    async def read_from_meta(
+        self,
+        meta: pl.DataFrame,
+        *,
+        unit: str | None = None,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        start_known: datetime | None = None,
+        end_known: datetime | None = None,
+        include_updates: bool = False,
+        include_knowledge_time: bool = False,
+        output: Output = "frame",
+        backend: Backend = "polars",
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+    ):
+        """Read timeseries data for a ``meta`` frame from :meth:`resolve` — the
+        ClickHouse leg only, no further PG round-trip. ``output`` / ``backend``
+        follow the :meth:`read` contract. Mirrors :meth:`read`'s post-resolve body.
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("read_from_meta")
+        result = await read_resolved(
+            self._pool,
+            self._td,
+            meta,
+            unit=unit,
+            start_valid=start_valid,
+            end_valid=end_valid,
+            start_known=start_known,
+            end_known=end_known,
+            include_updates=include_updates,
+            include_knowledge_time=include_knowledge_time,
+            output=output,
+        )
+        if output == "frame" and meta.height == 1 and isinstance(result, pl.DataFrame):
+            result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
+        return to_backend(result, backend)
+
     async def read_relative(
         self,
         *,
