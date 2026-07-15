@@ -13,10 +13,31 @@ from __future__ import annotations
 import os
 from urllib.parse import unquote, urlparse
 
-# Overridable so a deployment can point at its own table name.
-CH_ENGINE_TABLE = os.environ.get("ENERGYDB_CH_ENGINE_TABLE", "energydb_series_meta_pg")
+
+def _engine_table_name(base: str, schema: str) -> str:
+    """ClickHouse engine-table name for a PostgreSQL ``schema``.
+
+    The engine table's PG-schema target is fixed at CREATE time, so the name must
+    encode the schema: a client with ``ENERGYDB_SCHEMA=X`` then only ever references
+    a table provisioned for ``X``, which makes cross-schema mis-targeting impossible
+    by construction. ``public`` keeps the bare (historical) name so existing default
+    deployments are undisturbed; a named schema gets a ``__<schema>`` suffix.
+    """
+    return base if schema == "public" else f"{base}__{schema}"
+
+
+# Overridable base so a deployment can point at its own table name.
+_ENGINE_TABLE_BASE = os.environ.get("ENERGYDB_CH_ENGINE_TABLE", "energydb_series_meta_pg")
+_ENGINE_SCHEMA = os.environ.get("ENERGYDB_SCHEMA", "public") or "public"
+CH_ENGINE_TABLE = _engine_table_name(_ENGINE_TABLE_BASE, _ENGINE_SCHEMA)
 
 DROP_ENGINE_TABLE = f"DROP TABLE IF EXISTS {CH_ENGINE_TABLE}"
+# A deployment on a named schema before this fix left a bare-named table targeting
+# that schema. Drop it on (re)provision so it can't later mislead a ``public`` client
+# (which expects the bare name to mean public). ``None`` when we already ARE the bare name.
+DROP_LEGACY_ENGINE_TABLE = (
+    None if CH_ENGINE_TABLE == _ENGINE_TABLE_BASE else f"DROP TABLE IF EXISTS {_ENGINE_TABLE_BASE}"
+)
 
 # The engine table mirrors the view. LEFT-JOIN-sourced columns are Nullable: ``path`` /
 # ``node_uuid`` are NULL for edge-owned series, the edge columns for node-owned ones.
@@ -75,7 +96,10 @@ def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
     """
     named_collection = os.environ.get("ENERGYDB_CH_PG_COLLECTION")
     if named_collection:
-        source = f"{named_collection}, table = 'series_meta'"
+        # `schema` must be passed explicitly: without it the engine table inherits
+        # whatever schema the named collection encodes (default `public`), so a
+        # deployment on a named schema would resolve against the wrong `series_meta`.
+        source = f"{named_collection}, table = 'series_meta', schema = '{pg_schema}'"
     else:
         u = urlparse(pg_dsn)
         host = os.environ.get("ENERGYDB_CH_PG_HOST") or f"{u.hostname}:{u.port or 5432}"

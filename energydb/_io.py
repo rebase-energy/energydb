@@ -475,8 +475,14 @@ async def execute_read(
                 raise (err.__cause__ or err) from None
             client._engine_unavailable = True
             logger.warning(
-                "engine-backed read failed; using the sequential path for the rest of the "
-                "session (setup_ch_meta_engine() re-enables)",
+                "energydb: engine-backed read failed for meta-engine table %r "
+                "(ENERGYDB_SCHEMA=%r); falling back to the slower sequential read path "
+                "(higher latency and an extra PostgreSQL round-trip per read) for the rest "
+                "of this session. The usual cause after an upgrade or an ENERGYDB_SCHEMA "
+                "change is a missing or mis-targeted meta-engine table -- (re)provision it "
+                "once with `await client.setup_ch_meta_engine()` (or `create()`).",
+                CH_ENGINE_TABLE,
+                os.environ.get("ENERGYDB_SCHEMA", "public"),
                 exc_info=err.__cause__,
             )
             # The parallel leg already resolved meta exactly -- fall back to the

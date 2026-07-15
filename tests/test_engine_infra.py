@@ -18,7 +18,12 @@ import energydb as edb
 import polars as pl
 import pytest
 from energydb import Client
-from energydb._ch_meta_engine import CH_ENGINE_TABLE, engine_table_ddl, series_meta_view_ddl
+from energydb._ch_meta_engine import (
+    CH_ENGINE_TABLE,
+    _engine_table_name,
+    engine_table_ddl,
+    series_meta_view_ddl,
+)
 
 DSN = "postgresql://app_user:s3cret@db.example.com:6543/proddb"
 
@@ -54,9 +59,25 @@ def test_engine_ddl_ch_vantage_host_override(monkeypatch):
 def test_engine_ddl_named_collection_keeps_password_out(monkeypatch):
     monkeypatch.setenv("ENERGYDB_CH_PG_COLLECTION", "energydb_pg")
     monkeypatch.setenv("ENERGYDB_CH_PG_HOST", "postgres:5432")  # must be irrelevant here
-    ddl = engine_table_ddl(DSN, "public")
-    assert "ENGINE = PostgreSQL(energydb_pg, table = 'series_meta')" in ddl
+    ddl = engine_table_ddl(DSN, "energydb")
+    # schema is passed explicitly so the engine table targets the active schema,
+    # not whatever the named collection encodes.
+    assert "ENGINE = PostgreSQL(energydb_pg, table = 'series_meta', schema = 'energydb')" in ddl
     assert "s3cret" not in ddl and "postgres:5432" not in ddl
+
+
+def test_engine_ddl_inlined_carries_schema(monkeypatch):
+    monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    # schema is the final positional arg of the inlined PostgreSQL() source.
+    assert engine_table_ddl(DSN, "energydb").rstrip().endswith("'energydb')")
+
+
+def test_engine_table_name_scoped_by_schema():
+    # public keeps the bare (historical) name; a named schema gets a suffix, so a
+    # table name can only ever map to one schema (no cross-schema mis-target).
+    assert _engine_table_name("energydb_series_meta_pg", "public") == "energydb_series_meta_pg"
+    assert _engine_table_name("energydb_series_meta_pg", "energydb") == "energydb_series_meta_pg__energydb"
 
 
 def test_series_meta_view_ddl_qualifier():

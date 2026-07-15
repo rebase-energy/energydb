@@ -41,7 +41,7 @@ from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
-from energydb._ch_meta_engine import DROP_ENGINE_TABLE, engine_table_ddl
+from energydb._ch_meta_engine import DROP_ENGINE_TABLE, DROP_LEGACY_ENGINE_TABLE, engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import WriteResult, autocommit_read_conn, engine_meta_for_manifest, execute_read, write_manifest
 from energydb._join import EdgeSeriesKey, SeriesKey
@@ -174,6 +174,9 @@ class AsyncClient:
         # DROP + CREATE (not IF NOT EXISTS alone): the engine table is stateless, and
         # recreating it picks up view/column upgrades on existing deployments.
         self.td._ch.command(DROP_ENGINE_TABLE)
+        if DROP_LEGACY_ENGINE_TABLE:
+            # Remove a stale bare-named table left by a pre-fix named-schema deployment.
+            self.td._ch.command(DROP_LEGACY_ENGINE_TABLE)
         self.td._ch.command(engine_table_ddl(self._dsn, SCHEMA or "public"))
 
     def _create_blocking(self) -> None:
