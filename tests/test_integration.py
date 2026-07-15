@@ -4,13 +4,14 @@ Skipped if TIMEDB_PG_DSN or TIMEDB_CH_URL are not set. Tests run against a
 fresh schema and clean up after themselves.
 """
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import polars as pl
 import pytest
-from energydb import Client
+from energydb import AsyncClient, Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
@@ -360,3 +361,47 @@ def test_failed_uuid_routed_write_with_kt_leaves_no_runs_row(edb):
     with pytest.raises(ValueError, match="not registered"):
         edb.write(manifest, knowledge_time=KT_1)
     assert _runs_rows() == []
+
+
+def test_concurrent_reads_on_one_async_client(edb):
+    """Regression for issue #88: independent reads gathered on a single
+    ``AsyncClient`` must overlap instead of raising ``ProgrammingError``
+    ("concurrent queries within the same session")."""
+    for name, offset in (("capacity", 0), ("power", 100)):
+        edb.get_node("root").get_node("asset_a").register_series(
+            name=name,
+            canonical_unit="MW",
+            data_type="actual",
+            timeseries_type="FLAT",
+            retention="medium",
+        )
+        edb.get_node("root").get_node("asset_a").write(
+            _ts_df(3).with_columns(pl.col("value") + offset),
+            data_type="actual",
+            name=name,
+        )
+
+    manifest = pl.DataFrame(
+        {
+            "path": ["root/asset_a"] * 2,
+            "data_type": ["actual"] * 2,
+            "name": ["capacity", "power"],
+        }
+    )
+
+    async def _gathered():
+        client = AsyncClient()
+        await client.open()
+        try:
+            return await asyncio.gather(
+                client.get_node("root").get_node("asset_a").read(data_type="actual", name="capacity"),
+                client.get_node("root").get_node("asset_a").read(data_type="actual", name="power"),
+                client.read(manifest),
+            )
+        finally:
+            await client.close()
+
+    capacity, power, both = asyncio.run(_gathered())
+    assert capacity["value"].to_list() == [0.0, 1.0, 2.0]
+    assert power["value"].to_list() == [100.0, 101.0, 102.0]
+    assert sorted(both["value"].to_list()) == [0.0, 1.0, 2.0, 100.0, 101.0, 102.0]

@@ -461,9 +461,8 @@ async def execute_read(
         try:
             meta = await _resolve_meta()
         except BaseException:
-            # A to_thread CH call is not cancellable and shares the clickhouse-connect
-            # session; let it finish before propagating, or the next CH call collides
-            # ("concurrent queries within the same session").
+            # A to_thread CH call is not cancellable; await it so the query
+            # thread doesn't outlive the read call that started it.
             with contextlib.suppress(BaseException):
                 await engine_task
             raise
