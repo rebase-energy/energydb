@@ -445,6 +445,57 @@ def test_live_create_edge_with_series(live_edb):
 
 
 @pytestmark_live
+def test_live_edge_triple_manifest_read_matches_uuid(live_edb):
+    """Reading an edge series by (from_path, to_path, edge_type) is byte-identical
+    to reading it by edge_uuid, for both output modes; get_raw returns the uuid."""
+    bus_a = edb.grid.JunctionPoint(name="BusA")
+    bus_b = edb.grid.JunctionPoint(name="BusB")
+    live_edb.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b]))
+    line = edb.grid.Line(name="L1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))
+    edge_uuid = live_edb.create_edge(line)
+
+    scope = live_edb.get_edge(uuid=edge_uuid)
+    scope.register_series(
+        name="power_flow", canonical_unit="MW", data_type="actual", timeseries_type="FLAT", retention="medium"
+    )
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    flow = pl.DataFrame({"valid_time": [base + timedelta(hours=i) for i in range(3)], "value": [10.0, 20.0, 30.0]})
+    scope.write(flow, data_type="actual", name="power_flow")
+
+    by_uuid = pl.DataFrame({"edge_uuid": [str(edge_uuid)], "data_type": ["actual"], "name": ["power_flow"]})
+    by_triple = pl.DataFrame(
+        {
+            "from_path": ["Grid/BusA"],
+            "to_path": ["Grid/BusB"],
+            "edge_type": ["Line"],
+            "data_type": ["actual"],
+            "name": ["power_flow"],
+        }
+    )
+
+    out_uuid = live_edb.read(by_uuid).sort("valid_time")
+    out_triple = live_edb.read(by_triple).sort("valid_time")
+    # edge_uuid never leaks; the customer-facing edge identity is present on both.
+    assert "edge_uuid" not in out_triple.columns
+    assert set(out_triple.columns) == set(out_uuid.columns)
+    assert out_triple.select(sorted(out_triple.columns)).equals(out_uuid.select(sorted(out_uuid.columns)))
+    assert out_triple["value"].to_list() == [10.0, 20.0, 30.0]
+    assert out_triple["from_path"].unique().to_list() == ["Grid/BusA"]
+
+    # by_path output is keyed by the same EdgeSeriesKey for both routes.
+    kp_uuid = live_edb.read(by_uuid, output="by_path")
+    kp_triple = live_edb.read(by_triple, output="by_path")
+    assert set(kp_triple.keys()) == set(kp_uuid.keys())
+    key = next(iter(kp_triple))
+    assert (key.from_path, key.to_path, key.edge_type) == ("Grid/BusA", "Grid/BusB", "Line")
+
+    # get_raw is the light uuid fetch — no EDM reconstruction.
+    raw = live_edb.get_edge("Grid/BusA", "Grid/BusB", type="Line").get_raw()
+    assert str(raw["uuid"]) == str(edge_uuid)
+    assert raw["edge_type"] == "Line"
+
+
+@pytestmark_live
 def test_live_manifest_read(live_edb):
     base = datetime(2026, 3, 1, tzinfo=UTC)
     tree = edb.Portfolio(

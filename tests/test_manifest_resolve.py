@@ -180,3 +180,82 @@ def test_path_manifest_missing_path_raises_series_not_registered():
 
     with pytest.raises(ValueError, match="Series not registered for path="):
         asyncio.run(resolve_manifest(conn, manifest))
+
+
+def test_edge_triple_manifest_resolves_in_one_round_trip():
+    """(from_path, to_path, edge_type) routing is a single PG statement and
+    attaches edge_uuid so the read pipeline detects/projects it as an edge."""
+    edge_uuid = str(uuid4())
+    # Edge-triple row layout: from_path, to_path, edge_type, data_type, name,
+    # series_id, canonical_unit, timeseries_type, retention, edge_uuid::text.
+    rows = [("Grid/A", "Grid/B", "Line", "actual", "flow", 11, "MW", "FLAT", "forever", edge_uuid)]
+    conn = _mock_conn_with_series(rows)
+
+    manifest = pl.DataFrame(
+        {
+            "from_path": ["Grid/A"],
+            "to_path": ["Grid/B"],
+            "edge_type": ["Line"],
+            "data_type": ["actual"],
+            "name": ["flow"],
+        }
+    )
+    resolved, summary = asyncio.run(resolve_manifest(conn, manifest))
+
+    assert conn.execute.await_count == 1  # one edge⋈node⋈node⋈series statement
+    assert "_triple_k" not in resolved.columns
+    assert resolved["edge_uuid"].to_list() == [edge_uuid]  # needed by is_edge detection / projection
+    assert resolved["series_id"].to_list() == [11]
+    # Endpoint paths + type kept (== DB values by the join equality).
+    assert resolved["from_path"].to_list() == ["Grid/A"]
+    assert resolved["to_path"].to_list() == ["Grid/B"]
+    assert resolved["edge_type"].to_list() == ["Line"]
+    assert summary.has_overlapping is False
+
+
+def test_edge_triple_partial_columns_raises():
+    """A strict subset of the triple columns is a usage error, not another route."""
+    import pytest
+
+    conn = _mock_conn_with_series([])
+    manifest = pl.DataFrame({"from_path": ["Grid/A"], "to_path": ["Grid/B"], "data_type": ["actual"], "name": ["flow"]})
+
+    with pytest.raises(ValueError, match=r"Edge-triple routing requires all of .*missing \['edge_type'\]"):
+        asyncio.run(resolve_manifest(conn, manifest))
+
+
+def test_edge_triple_plus_edge_uuid_is_ambiguous():
+    import pytest
+
+    conn = _mock_conn_with_series([])
+    manifest = pl.DataFrame(
+        {
+            "edge_uuid": [str(uuid4())],
+            "from_path": ["Grid/A"],
+            "to_path": ["Grid/B"],
+            "edge_type": ["Line"],
+            "data_type": ["actual"],
+            "name": ["flow"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="ambiguous routing columns"):
+        asyncio.run(resolve_manifest(conn, manifest))
+
+
+def test_edge_triple_unresolved_raises_with_quintuple_message():
+    import pytest
+
+    conn = _mock_conn_with_series([])  # PG matches nothing
+    manifest = pl.DataFrame(
+        {
+            "from_path": ["Grid/A"],
+            "to_path": ["Grid/NOPE"],
+            "edge_type": ["Line"],
+            "data_type": ["actual"],
+            "name": ["flow"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="Series not registered for from_path='Grid/A', to_path='Grid/NOPE'"):
+        asyncio.run(resolve_manifest(conn, manifest))

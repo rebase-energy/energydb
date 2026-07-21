@@ -24,8 +24,53 @@ from energydb._ch_meta_engine import (
     engine_table_ddl,
     series_meta_view_ddl,
 )
+from energydb._io import engine_meta_for_manifest
 
 DSN = "postgresql://app_user:s3cret@db.example.com:6543/proddb"
+
+
+# ---------------------------------------------------------------------------
+# engine_meta_for_manifest: superset predicate builder (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_meta_edge_triple_manifest():
+    """A (from_path, to_path, edge_type) manifest yields a set-valued edge_triples
+    predicate with lowercased data_type — the fast-path parity with path routing."""
+    manifest = pl.DataFrame(
+        {
+            "from_path": ["Grid/A", "Grid/A"],
+            "to_path": ["Grid/B", "Grid/C"],
+            "edge_type": ["Line", "Line"],
+            "data_type": ["Actual", "actual"],
+            "name": ["flow", "flow"],
+        }
+    )
+    ms = engine_meta_for_manifest(manifest)
+    assert ms is not None
+    assert ms.table == CH_ENGINE_TABLE
+    assert set(ms.edge_triples) == {("Grid/A", "Grid/B", "Line"), ("Grid/A", "Grid/C", "Line")}
+    assert ms.edge_uuids is None and ms.paths is None
+    assert set(ms.data_type) == {"actual"}  # lowercased + deduped
+
+
+def test_engine_meta_edge_triple_falls_back_when_incomplete_or_null():
+    """Missing a triple column, or a null in one, is inexpressible → None (the
+    read then resolves sequentially and surfaces the proper error)."""
+    partial = pl.DataFrame({"from_path": ["Grid/A"], "to_path": ["Grid/B"], "data_type": ["actual"], "name": ["flow"]})
+    # partial triple is not a valid route at all → None
+    assert engine_meta_for_manifest(partial) is None
+
+    with_null = pl.DataFrame(
+        {
+            "from_path": ["Grid/A"],
+            "to_path": [None],
+            "edge_type": ["Line"],
+            "data_type": ["actual"],
+            "name": ["flow"],
+        }
+    )
+    assert engine_meta_for_manifest(with_null) is None
 
 
 # ---------------------------------------------------------------------------

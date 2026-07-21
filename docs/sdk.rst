@@ -375,7 +375,8 @@ via the scope's path or uuid before any data reaches the database.
      - ETL pipelines, scheduled loads, cross-portfolio reads
    * - **Routing**
      - Implicit (the scope's resolved uuid)
-     - Manifest column: ``node_uuid``, ``edge_uuid``, or ``path``
+     - Manifest column: ``node_uuid``, ``edge_uuid``, ``path``, or
+       ``from_path`` + ``to_path`` + ``edge_type``
 
 Writing
 ~~~~~~~
@@ -502,6 +503,12 @@ the data columns. The routing column is autodetected from the column names
   separator; names containing ``/`` are rejected at registration. The
   manifest must use ``Utf8`` — ``List(Utf8)`` from earlier API versions
   is rejected with an explicit migration message.
+- ``from_path`` + ``to_path`` + ``edge_type`` — human-readable routing for
+  edge-attached series (all three columns required together), the edge
+  analogue of ``path``. Each is ``Utf8`` joined with ``/``; the edge is
+  resolved server-side via its endpoint nodes' paths and type. Symmetric
+  with the edge read output columns, so an edge read's frame can be fed
+  back in as a manifest without resolving ``edge_uuid`` first.
 
 write() — long-format multi-series ingestion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -545,8 +552,20 @@ The other two routing forms are equivalent:
        "value":      [200.0 + h for h in range(24)],
    })
 
+   # By edge triple (human-readable; all three columns required)
+   pl.DataFrame({
+       "from_path":  ["my-grid/BusA"] * 24,
+       "to_path":    ["my-grid/BusB"] * 24,
+       "edge_type":  ["Line"] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power_flow"] * 24,
+       "valid_time": hours,
+       "value":      [200.0 + h for h in range(24)],
+   })
+
 Routing modes are mutually exclusive — passing more than one routing column
-raises ``ValueError``.
+raises ``ValueError``. Supplying only part of the edge triple (e.g.
+``from_path`` + ``to_path`` without ``edge_type``) is likewise a ``ValueError``.
 
 Series must already be registered (typically via
 :meth:`~energydb.Client.register_tree`) — unresolved

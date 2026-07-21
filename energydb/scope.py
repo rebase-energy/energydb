@@ -1337,6 +1337,31 @@ class EdgeScope(_BaseScope):
             }
         )
 
+    async def get_raw(self) -> dict | None:
+        """Fetch this edge as a raw dict, without EDM reconstruction.
+
+        Returns ``{uuid, edge_type, name, data, from_node_uuid, to_node_uuid}``
+        or ``None`` if the uuid-addressed edge does not exist (a triple-addressed
+        miss raises, matching the resolve contract). The light way to fetch an
+        edge's uuid, mirroring :meth:`NodeScope.get_raw`: no EDM reconstruction,
+        so it works for any ``edge_type`` string where :meth:`get` would raise on
+        an unregistered EDM type.
+        """
+        async with self._use_read_conn() as conn:
+            row = await self._fetch_edge_row(conn)
+            if row is None:
+                if self._edge_uuid is None:
+                    await self._edge_not_found(conn)
+                return None
+        return {
+            "uuid": row[0],
+            "edge_type": row[1],
+            "name": row[2],
+            "data": row[3],
+            "from_node_uuid": row[4],
+            "to_node_uuid": row[5],
+        }
+
     async def from_node(self) -> NodeScope:
         async with self._use_read_conn() as conn:
             from_uuid, _ = await self._endpoints(conn)
