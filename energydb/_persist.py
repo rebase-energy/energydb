@@ -32,6 +32,7 @@ from uuid6 import uuid7
 
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
+from energydb.errors import AlreadyExistsError, NodeNotFoundError, ValidationError
 from energydb.serialization import serialize_edge, serialize_node
 from energydb.series import SERIES_INSERT_COLUMNS, prepare_series_row, validate_name
 from energydb.units import compute_unit_factor
@@ -71,7 +72,7 @@ async def create_node_raw(
             )
         ).fetchone()
         if parent_row is None:
-            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
+            raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
         path = f"{parent_row[0]}/{name}"
 
     await conn.execute(
@@ -136,7 +137,7 @@ async def create_edge(
         if existing is None:
             raise RuntimeError("edge upsert returned no row and follow-up SELECT found nothing")
         if existing[0] != row_data["edge_type"]:
-            raise ValueError(
+            raise AlreadyExistsError(
                 f"Cannot persist {row_data['edge_type']!r} with id={uuid_val}: a "
                 f"{existing[0]!r} with the same id already exists. "
                 f"Edge type is immutable for a given id."
@@ -157,7 +158,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     """
     ref = getattr(edm_obj, attr, None)
     if ref is None:
-        raise ValueError(f"Edge {attr} is unset; cannot persist edge.")
+        raise ValidationError(f"Edge {attr} is unset; cannot persist edge.")
     if not isinstance(ref, Reference):
         raise TypeError(f"Edge {attr} must be a Reference, got {type(ref).__name__}.")
     uuid_val = ref.id
@@ -165,7 +166,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     if tree_root is not None:
         index = tree_root.index()
         if uuid_val not in index:
-            raise ValueError(
+            raise ValidationError(
                 f"Edge {attr} refers to {uuid_val} which is not in the tree rooted at "
                 f"{type(tree_root).__name__}({getattr(tree_root, 'name', None)!r}). "
                 f"Cross-tree edges are not supported."
@@ -216,7 +217,7 @@ async def register_tree_under(
             parts.append(f"node uuid(s): {', '.join(str(u) for u in existing_node_uuids)}")
         if existing_edge_uuids:
             parts.append(f"edge uuid(s): {', '.join(str(u) for u in existing_edge_uuids)}")
-        raise ValueError(
+        raise AlreadyExistsError(
             f"register_tree is create-only; the payload contains "
             f"{len(existing_node_uuids)} node(s) and {len(existing_edge_uuids)} "
             f"edge(s) whose UUIDs already exist ({'; '.join(parts)}). "
@@ -243,7 +244,7 @@ async def register_tree_under(
     if parent_uuid is not None:
         parent_row = await (await conn.execute("SELECT path FROM node WHERE uuid = %s", (parent_uuid,))).fetchone()
         if parent_row is None:
-            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
+            raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
         parent_path = parent_row[0]
 
     paths: dict[UUID, str] = {}
@@ -322,7 +323,7 @@ def _collect_series_rows(node_objs: dict[UUID, Any], edge_objs: dict[UUID, Any])
                 if prev is None:
                     rows[key] = row
                 elif (prev[_S_UNIT], prev[_S_RET]) != (row[_S_UNIT], row[_S_RET]):
-                    raise ValueError(
+                    raise AlreadyExistsError(
                         f"Series ({owner_col}={uid}, data_type={row[_S_DT]!r}, name={row[_S_NAME]!r}) "
                         f"is declared twice on the tree with conflicting immutable fields: "
                         f"canonical_unit={prev[_S_UNIT]!r} vs {row[_S_UNIT]!r}, "
@@ -363,7 +364,7 @@ def _collect_target_state(
             edge_queue.append(obj)
             return
         if obj.id in node_snaps:
-            raise ValueError(
+            raise AlreadyExistsError(
                 f"Duplicate UUID {obj.id} on two distinct nodes in the tree. Each Element must have a unique id."
             )
         row = serialize_node(obj)
@@ -384,14 +385,14 @@ def _collect_target_state(
     edge_objs: dict[UUID, Any] = {}
     for child in edge_queue:
         if child.id in edge_snaps:
-            raise ValueError(f"Duplicate UUID {child.id} on two distinct edges in the tree.")
+            raise AlreadyExistsError(f"Duplicate UUID {child.id} on two distinct edges in the tree.")
         row = serialize_edge(child)
         from_uuid = _endpoint_uuid(child, "from_element", edm_obj)
         to_uuid = _endpoint_uuid(child, "to_element", edm_obj)
         if from_uuid not in node_snaps:
-            raise ValueError(f"Edge {child.id} from_element {from_uuid} is not in the tree.")
+            raise ValidationError(f"Edge {child.id} from_element {from_uuid} is not in the tree.")
         if to_uuid not in node_snaps:
-            raise ValueError(f"Edge {child.id} to_element {to_uuid} is not in the tree.")
+            raise ValidationError(f"Edge {child.id} to_element {to_uuid} is not in the tree.")
         edge_snaps[child.id] = EdgeSnapshot(
             uuid=child.id,
             edge_type=row["edge_type"],
@@ -477,7 +478,7 @@ def _validate_no_inline_data(edm_obj) -> None:
         for ts in ts_list:
             if ts.df is not None and ts.df.height > 0:
                 obj_name = getattr(obj, "name", "<unnamed>")
-                raise ValueError(
+                raise ValidationError(
                     f"register_tree() received {obj_name!r} with inline timeseries data "
                     f"(name={ts.name!r}, rows={ts.df.height}). register_tree() is "
                     f"structure-only — write data separately with client.write(df)."
@@ -518,11 +519,11 @@ def _ts_register_args(ts: TimeSeries) -> dict[str, Any]:
     timeseries_type = ts_type.value if isinstance(ts_type, TimeSeriesType) else (str(ts_type) if ts_type else None)
 
     if name is None:
-        raise ValueError("ts.name is required")
+        raise ValidationError("ts.name is required")
     if data_type is None:
-        raise ValueError(f"ts.data_type is required for {name!r}")
+        raise ValidationError(f"ts.data_type is required for {name!r}")
     if timeseries_type is None:
-        raise ValueError(f"ts.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
+        raise ValidationError(f"ts.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
 
     return {
         "data_type": data_type,

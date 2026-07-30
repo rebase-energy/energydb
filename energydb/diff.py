@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import IO, Any
 from uuid import UUID
 
+from energydb.errors import ValidationError
+
 # ---------------------------------------------------------------------------
 # Snapshots — the canonical content of one row at one point in time.
 # ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ class _BaseChange[SnapshotT]:
 
     def __post_init__(self):
         if self.old is None and self.new is None:
-            raise ValueError(f"{type(self).__name__} must have at least one of old/new set.")
+            raise ValidationError(f"{type(self).__name__} must have at least one of old/new set.")
 
     def _present(self) -> SnapshotT:
         """Return whichever of ``new`` / ``old`` is non-null. For inserts

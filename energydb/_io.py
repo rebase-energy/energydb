@@ -31,6 +31,7 @@ from energydb._join import (
     partition_node_by_path,
 )
 from energydb._persist import apply_manifest_unit_conversion
+from energydb.errors import ValidationError
 from energydb.paths import resolve_manifest
 from energydb.units import compute_unit_factor
 
@@ -154,7 +155,7 @@ async def write_manifest(
             # Raising here (before commit) rolls back the folded run upsert too — a bad
             # call records no run, same as before the fold.
             if summary.has_overlapping:
-                raise ValueError(
+                raise ValidationError(
                     "knowledge_time is required for OVERLAPPING series; "
                     "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
                 )
@@ -225,7 +226,7 @@ async def _execute_read(
     (``attach_path=True``), so no second PG round-trip is needed.
     """
     if output not in {"frame", "by_path"}:
-        raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")
+        raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
     series_ids = meta["series_id"].unique().to_list()
     retentions = meta["retention"].unique().to_list()
     # TimeDB (clickhouse-connect) is synchronous — offload the CH read so the
@@ -416,9 +417,9 @@ async def execute_read(
     ``td.read`` (explicit bitemporal args). Returns ``(result, n_series)``.
     """
     if (resolve is None) == (manifest is None):
-        raise ValueError("execute_read requires exactly one of resolve= or manifest=.")
+        raise ValidationError("execute_read requires exactly one of resolve= or manifest=.")
     if output not in {"frame", "by_path"}:
-        raise ValueError(f"output must be 'frame' or 'by_path', got {output!r}")
+        raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
 
     kwargs = (
         dict(td_kwargs or {})

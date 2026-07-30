@@ -22,6 +22,8 @@ from uuid import UUID
 import polars as pl
 from timedb import RETENTION_TIERS
 
+from energydb.errors import AlreadyExistsError, EdgeNotFoundError, ValidationError
+
 OwnerCol = Literal["node_uuid", "edge_uuid"]
 
 _VALID_TIMESERIES_TYPES = {"FLAT", "OVERLAPPING"}
@@ -41,12 +43,12 @@ _CONFLICT_CONSTRAINT_BY_OWNER = {
 
 def _validate_timeseries_type(ts_type: str) -> None:
     if ts_type not in _VALID_TIMESERIES_TYPES:
-        raise ValueError(f"Unknown timeseries_type {ts_type!r}. Valid values: {sorted(_VALID_TIMESERIES_TYPES)}")
+        raise ValidationError(f"Unknown timeseries_type {ts_type!r}. Valid values: {sorted(_VALID_TIMESERIES_TYPES)}")
 
 
 def _validate_retention(retention: str) -> None:
     if retention not in RETENTION_TIERS:
-        raise ValueError(f"Unknown retention {retention!r}. Valid values: {sorted(RETENTION_TIERS)}")
+        raise ValidationError(f"Unknown retention {retention!r}. Valid values: {sorted(RETENTION_TIERS)}")
 
 
 def validate_name(name: str, *, kind: str) -> None:
@@ -60,9 +62,9 @@ def validate_name(name: str, *, kind: str) -> None:
     if not isinstance(name, str):
         raise TypeError(f"{kind} name must be a string, got {type(name).__name__}")
     if len(name) == 0:
-        raise ValueError(f"{kind} name must be non-empty.")
+        raise ValidationError(f"{kind} name must be non-empty.")
     if "/" in name:
-        raise ValueError(
+        raise ValidationError(
             f"{kind} name {name!r} contains '/'. '/' is reserved as the path "
             f"separator and may not appear inside a node, edge, or series name."
         )
@@ -177,7 +179,7 @@ async def register_series(
         raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
     existing_sid, existing_unit, existing_retention = existing
     if existing_unit != canonical_unit or existing_retention != retention:
-        raise ValueError(
+        raise AlreadyExistsError(
             f"Series ({owner_col}={owner_uuid}, data_type={data_type!r}, name={name!r}) "
             f"already exists with canonical_unit={existing_unit!r}, "
             f"retention={existing_retention!r}; cannot re-register with "
@@ -227,7 +229,7 @@ async def resolve_subtree_series_for_read(
         root_cte = "SELECT path AS rp FROM node WHERE uuid = %s"
         cte_params.append(start_uuid)
     else:
-        raise ValueError("resolve_subtree_series_for_read needs root_path or start_uuid.")
+        raise ValidationError("resolve_subtree_series_for_read needs root_path or start_uuid.")
 
     where_parts = list(where_conds or [])
     where_vals: list[Any] = list(where_params or [])
@@ -327,7 +329,7 @@ async def resolve_edge_series_for_read(
         where_sql = "fn.path = %s AND tn.path = %s AND e.edge_type = %s"
         where_params = [from_path, to_path, edge_type]
     else:
-        raise ValueError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
+        raise ValidationError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
 
     # ``::text`` cast on the uuid column: PG returns strings directly,
     # skipping psycopg's per-row UUID-object parse.
@@ -344,7 +346,12 @@ async def resolve_edge_series_for_read(
     rows = await (await conn.execute(sql, [*join_params, *where_params])).fetchall()
 
     if not rows and edge_uuid is None:
-        raise ValueError(f"Edge not found: type={edge_type!r} from={from_path!r} to={to_path!r}")
+        raise EdgeNotFoundError(
+            f"Edge not found: type={edge_type!r} from={from_path!r} to={to_path!r}",
+            from_path=from_path,
+            to_path=to_path,
+            edge_type=edge_type,
+        )
 
     return pl.DataFrame(
         [

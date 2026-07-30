@@ -18,6 +18,13 @@ from uuid import UUID
 
 import polars as pl
 
+from energydb.errors import (
+    EdgeNotFoundError,
+    ManifestError,
+    NodeNotFoundError,
+    SeriesNotFoundError,
+    ValidationError,
+)
 from energydb.runs import RunRow, run_upsert_cte
 
 
@@ -80,7 +87,7 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
     if not path:
         if start_uuid is not None:
             return start_uuid
-        raise ValueError("Empty path cannot be resolved.")
+        raise ValidationError("Empty path cannot be resolved.")
 
     joined = "/".join(path)
     if start_uuid is None:
@@ -104,8 +111,8 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
 
     if row is None:
         if start_uuid is None:
-            raise ValueError(f"Node not found: {joined}")
-        raise ValueError(f"Node not found: {joined} (relative to {start_uuid})")
+            raise NodeNotFoundError(f"Node not found: {joined}", path=joined)
+        raise NodeNotFoundError(f"Node not found: {joined} (relative to {start_uuid})", path=joined)
     return row[0]
 
 
@@ -114,8 +121,8 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
 
     Joins each tuple with ``/`` and hits the unique ``node.path`` index in
     one ``ANY()`` scan. Input may contain duplicates; the returned dict is
-    keyed by deduplicated path tuples. Raises ``ValueError`` if any path
-    fails to resolve.
+    keyed by deduplicated path tuples. Raises
+    :class:`~energydb.errors.NodeNotFoundError` if any path fails to resolve.
     """
     if not paths:
         return {}
@@ -146,7 +153,12 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
     missing = [p for p in unique if p not in out]
     if missing:
         rendered = ", ".join("/".join(p) for p in missing)
-        raise ValueError(f"Could not resolve path(s): {rendered}")
+        # ``path`` only when a single path missed — with several, no one value
+        # identifies the failure, so leave it unset rather than pick a winner.
+        raise NodeNotFoundError(
+            f"Could not resolve path(s): {rendered}",
+            path="/".join(missing[0]) if len(missing) == 1 else None,
+        )
     return out
 
 
@@ -239,7 +251,7 @@ async def resolve_path(conn, node_uuid: UUID) -> Path:
         )
     ).fetchone()
     if row is None:
-        raise ValueError(f"Node not found: uuid={node_uuid}")
+        raise NodeNotFoundError(f"Node not found: uuid={node_uuid}", uuid=node_uuid)
     return tuple(row[0].split("/"))
 
 
@@ -260,7 +272,12 @@ async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str
         )
     ).fetchall()
     if not rows:
-        raise ValueError(f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}")
+        raise EdgeNotFoundError(
+            f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}",
+            from_path="/".join(from_path),
+            to_path="/".join(to_path),
+            edge_type=edge_type,
+        )
     return rows[0][0]
 
 
@@ -300,14 +317,14 @@ async def resolve_manifest(
     """
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
     if len(present_routes) == 0:
-        raise ValueError(f"Manifest must include one of {list(_MANIFEST_ROUTES)} as a routing column.")
+        raise ManifestError(f"Manifest must include one of {list(_MANIFEST_ROUTES)} as a routing column.")
     if len(present_routes) > 1:
-        raise ValueError(f"Manifest has ambiguous routing columns {present_routes}; provide exactly one.")
+        raise ManifestError(f"Manifest has ambiguous routing columns {present_routes}; provide exactly one.")
     route = present_routes[0]
 
     missing_required = [c for c in _MANIFEST_REQUIRED if c not in manifest.columns]
     if missing_required:
-        raise ValueError(f"Manifest is missing required columns: {sorted(missing_required)}")
+        raise ManifestError(f"Manifest is missing required columns: {sorted(missing_required)}")
 
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
@@ -399,10 +416,10 @@ async def _resolve_manifest_by_owner(
     # contract; per-row null check second.
     non_null = manifest.height - manifest[owner_col].null_count()
     if non_null == 0:
-        raise ValueError(f"No {owner_col} values to resolve in manifest.")
+        raise ManifestError(f"No {owner_col} values to resolve in manifest.")
     if manifest[owner_col].null_count() > 0:
         null_row = manifest.filter(pl.col(owner_col).is_null()).row(0, named=True)
-        raise ValueError(
+        raise ManifestError(
             f"Series not registered for {owner_col}=None, "
             f"data_type={null_row['data_type']!r}, name={null_row['name']!r}."
         )
@@ -451,9 +468,14 @@ async def _resolve_manifest_by_owner(
         owner, dt, name, sid, unit, ts_type, retention, *paths = row
         triple_to_meta[(owner, dt, name)] = (sid, unit, ts_type, retention, *paths)
 
-    for owner, dt, name in miss_triples:
-        if (owner, dt, name) not in triple_to_meta:
-            raise ValueError(f"Series not registered for {owner_col}={owner!r}, data_type={dt!r}, name={name!r}.")
+    unresolved = [t for t in miss_triples if t not in triple_to_meta]
+    if unresolved:
+        owner, dt, name = unresolved[0]
+        raise SeriesNotFoundError(
+            f"Series not registered for {owner_col}={owner!r}, data_type={dt!r}, name={name!r}.",
+            route=owner_col,
+            missing=unresolved,
+        )
 
     hash_to_meta: dict[int, tuple] = {
         hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
@@ -519,18 +541,18 @@ async def _resolve_manifest_by_path(
     equality, so the manifest value IS the DB value.
     """
     if manifest["path"].dtype == pl.List(pl.Utf8):
-        raise ValueError(
+        raise ManifestError(
             "Manifest 'path' column must be Utf8 joined with '/'. "
             "Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
         )
     if manifest["path"].dtype != pl.Utf8:
-        raise ValueError(f"Manifest 'path' column must be Utf8 joined with '/'; got {manifest['path'].dtype}.")
+        raise ManifestError(f"Manifest 'path' column must be Utf8 joined with '/'; got {manifest['path'].dtype}.")
     non_null = manifest.height - manifest["path"].null_count()
     if non_null == 0:
-        raise ValueError("No path values to resolve in manifest.")
+        raise ManifestError("No path values to resolve in manifest.")
     if manifest["path"].null_count() > 0:
         null_row = manifest.filter(pl.col("path").is_null()).row(0, named=True)
-        raise ValueError(
+        raise ManifestError(
             f"Series not registered for path=None, data_type={null_row['data_type']!r}, name={null_row['name']!r}."
         )
 
@@ -565,9 +587,14 @@ async def _resolve_manifest_by_path(
     for path, dt, name, sid, unit, ts_type, retention, node_uuid in rows:
         triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention, node_uuid)
 
-    for path, dt, name in miss_triples:
-        if (path, dt, name) not in triple_to_meta:
-            raise ValueError(f"Series not registered for path={path!r}, data_type={dt!r}, name={name!r}.")
+    unresolved = [t for t in miss_triples if t not in triple_to_meta]
+    if unresolved:
+        path, dt, name = unresolved[0]
+        raise SeriesNotFoundError(
+            f"Series not registered for path={path!r}, data_type={dt!r}, name={name!r}.",
+            route="path",
+            missing=unresolved,
+        )
 
     hash_to_meta: dict[int, tuple] = {
         hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)

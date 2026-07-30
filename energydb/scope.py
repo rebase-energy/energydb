@@ -36,6 +36,7 @@ from energydb._io import WriteResult, autocommit_read_conn, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
+from energydb.errors import EdgeNotFoundError, NodeNotFoundError, NotFoundError, ValidationError
 from energydb.paths import (
     Path,
     _like_escape,
@@ -58,7 +59,7 @@ if TYPE_CHECKING:
 
 
 def _dry_run_unsupported_in_txn() -> None:
-    raise ValueError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
+    raise ValidationError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
 
 
 def _ts_io_unsupported_in_txn(op: str) -> None:
@@ -87,10 +88,10 @@ def _split_path_string(s: str) -> Path:
     is unambiguous.
     """
     if not s:
-        raise ValueError("Path string must be non-empty; got ''.")
+        raise ValidationError("Path string must be non-empty; got ''.")
     segments = s.split("/")
     if any(seg == "" for seg in segments):
-        raise ValueError(
+        raise ValidationError(
             f"Path {s!r} has an empty segment (leading/trailing/double '/'). "
             f"Pass non-empty names separated by single '/'."
         )
@@ -145,7 +146,7 @@ async def _resolve_endpoint(conn, target: NodeScope | Path | list[str] | str) ->
         return await target._resolve_node_uuid(conn)
     path = _coerce_path((), kwarg=target)
     if not path:
-        raise ValueError("Endpoint path cannot be empty.")
+        raise ValidationError("Endpoint path cannot be empty.")
     return await resolve_node_uuid(conn, path)
 
 
@@ -184,13 +185,13 @@ def _normalize_series_register_args(
         name = ts_or_name
 
     if name is None:
-        raise ValueError("name is required")
+        raise ValidationError("name is required")
     if data_type is None:
-        raise ValueError("data_type is required")
+        raise ValidationError("data_type is required")
     if canonical_unit is None:
-        raise ValueError("canonical_unit is required")
+        raise ValidationError("canonical_unit is required")
     if timeseries_type is None:
-        raise ValueError("timeseries_type is required (FLAT | OVERLAPPING)")
+        raise ValidationError("timeseries_type is required (FLAT | OVERLAPPING)")
 
     return {
         "data_type": str(data_type).lower(),
@@ -322,7 +323,8 @@ class _BaseScope:
     def _wrap_in_diff(self, before, after) -> TreeDiff:
         raise NotImplementedError
 
-    def _not_found_msg(self, uuid_: UUID) -> str:
+    def _not_found_error(self, uuid_: UUID) -> NotFoundError:
+        """The typed not-found error for this scope's target, addressed by uuid."""
         raise NotImplementedError
 
     async def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
@@ -381,7 +383,7 @@ class _BaseScope:
             uuid_ = await self._resolve_uuid(conn)
             before = await self._fetch_snapshot(conn, uuid_)
             if before is None:
-                raise ValueError(self._not_found_msg(uuid_))
+                raise self._not_found_error(uuid_)
             (await exec_fn(conn, uuid_))
             after = (await self._fetch_snapshot(conn, uuid_)) if fetch_after else None
             if self._txn is not None:
@@ -678,8 +680,8 @@ class NodeScope(_BaseScope):
     def _wrap_in_diff(self, before, after) -> TreeDiff:
         return TreeDiff(node_changes=[NodeChange(old=before, new=after)])
 
-    def _not_found_msg(self, uuid_: UUID) -> str:
-        return f"Node not found: uuid={uuid_}"
+    def _not_found_error(self, uuid_: UUID) -> NotFoundError:
+        return NodeNotFoundError(f"Node not found: uuid={uuid_}", uuid=uuid_)
 
     # ------------------------------------------------------------------
     # Navigation (lazy)
@@ -696,10 +698,10 @@ class NodeScope(_BaseScope):
         """
         if uuid is not None:
             if names_or_path:
-                raise ValueError("Pass either uuid= or names, not both.")
+                raise ValidationError("Pass either uuid= or names, not both.")
             return NodeScope(self._client, node_uuid=uuid, txn=self._txn)
         if not names_or_path:
-            raise ValueError("Must provide names or uuid.")
+            raise ValidationError("Must provide names or uuid.")
         extra = _coerce_path(names_or_path)
         return NodeScope(
             self._client,
@@ -741,7 +743,7 @@ class NodeScope(_BaseScope):
             return await resolve_node_uuid(conn, self._path, start_uuid=self._node_uuid)
         if self._node_uuid is not None:
             return self._node_uuid
-        raise ValueError("NodeScope has no path or uuid to resolve.")
+        raise ValidationError("NodeScope has no path or uuid to resolve.")
 
     def _node_match(self) -> tuple[str, list[Any], str, list[Any]]:
         """SQL pieces matching exactly this scope's node as alias ``n``.
@@ -764,16 +766,19 @@ class NodeScope(_BaseScope):
             )
         if self._node_uuid is not None:
             return "node n", [], "n.uuid = %s", [self._node_uuid]
-        raise ValueError("NodeScope has no path or uuid to resolve.")
+        raise ValidationError("NodeScope has no path or uuid to resolve.")
 
-    def _missing_msg(self) -> str:
-        """The not-found message ``resolve_node_uuid`` / ``get`` would raise."""
+    def _missing_error(self) -> NodeNotFoundError:
+        """The not-found error ``resolve_node_uuid`` / ``get`` would raise."""
         if self._path:
             joined = "/".join(self._path)
             if self._node_uuid is not None:
-                return f"Node not found: {joined} (relative to {self._node_uuid})"
-            return f"Node not found: {joined}"
-        return f"Node not found: uuid={self._node_uuid}"
+                return NodeNotFoundError(
+                    f"Node not found: {joined} (relative to {self._node_uuid})",
+                    path=joined,
+                )
+            return NodeNotFoundError(f"Node not found: {joined}", path=joined)
+        return NodeNotFoundError(f"Node not found: uuid={self._node_uuid}", uuid=self._node_uuid)
 
     async def _resolve_target_node_uuids(self, conn) -> list[UUID]:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE_SUBTREE):
@@ -818,7 +823,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchone()
         if row is None:
-            raise ValueError(self._missing_msg())
+            raise self._missing_error()
         return reconstruct_node({"uuid": row[0], "node_type": row[1], "name": row[2], "data": row[3]})
 
     async def get_raw(self) -> dict | None:
@@ -840,7 +845,7 @@ class NodeScope(_BaseScope):
             ).fetchone()
         if row is None:
             if self._path:
-                raise ValueError(self._missing_msg())
+                raise self._missing_error()
             return None
         return {
             "uuid": row[0],
@@ -871,7 +876,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchall()
         if not rows and self._path:
-            raise ValueError(self._missing_msg())
+            raise self._missing_error()
         return [
             {"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]}
             for r in rows
@@ -909,7 +914,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchall()
         if not rows and self._path:
-            raise ValueError(self._missing_msg())
+            raise self._missing_error()
         return [
             {"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3], "parent_uuid": r[4]}
             for r in rows
@@ -924,7 +929,7 @@ class NodeScope(_BaseScope):
                 await conn.execute(f"SELECT n.path FROM {frm} WHERE {where}", [*frm_params, *where_params])
             ).fetchone()
         if row is None:
-            raise ValueError(self._missing_msg())
+            raise self._missing_error()
         return tuple(row[0].split("/"))
 
     # ------------------------------------------------------------------
@@ -949,7 +954,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchone()
             if row is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+                raise NodeNotFoundError(f"Node not found: uuid={node_uuid}", uuid=node_uuid)
             old_path, parent_path = row
             new_path = f"{parent_path}/{new_name}" if parent_path else new_name
 
@@ -1015,10 +1020,10 @@ class NodeScope(_BaseScope):
             elif target_node_uuid is not None:
                 new_parent_uuid = target_node_uuid
             else:
-                raise ValueError("move_to requires a non-root target.")
+                raise ValidationError("move_to requires a non-root target.")
 
             if new_parent_uuid == node_uuid:
-                raise ValueError("Cannot move a node into itself.")
+                raise ValidationError("Cannot move a node into itself.")
 
             # Cycle iff the prospective new parent is at or under the moving
             # node's own path. Fetch the moving node's path to Python and use
@@ -1030,7 +1035,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchone()
             if subj_row is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+                raise NodeNotFoundError(f"Node not found: uuid={node_uuid}", uuid=node_uuid)
             subj_path = subj_row[0]
             cycle_row = await (
                 await conn.execute(
@@ -1045,7 +1050,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchone()
             if cycle_row and cycle_row[0]:
-                raise ValueError("Cannot move a node into its own subtree (would create a cycle).")
+                raise ValidationError("Cannot move a node into its own subtree (would create a cycle).")
 
             # Fetch old path, the new parent's path, and the moving node's own
             # name. ``LEFT JOIN`` against the new parent so a move-to-root
@@ -1064,7 +1069,7 @@ class NodeScope(_BaseScope):
                 )
             ).fetchone()
             if row is None:
-                raise ValueError(f"Node not found: uuid={node_uuid}")
+                raise NodeNotFoundError(f"Node not found: uuid={node_uuid}", uuid=node_uuid)
             old_path, new_parent_path, own_name = row
             new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
 
@@ -1181,7 +1186,7 @@ class NodeScope(_BaseScope):
                         name=name,
                     )
                 else:
-                    raise ValueError("NodeScope has no path or uuid to resolve.")
+                    raise ValidationError("NodeScope has no path or uuid to resolve.")
         return None if meta.is_empty() else meta
 
 
@@ -1257,8 +1262,8 @@ class EdgeScope(_BaseScope):
     def _wrap_in_diff(self, before, after) -> TreeDiff:
         return TreeDiff(edge_changes=[EdgeChange(old=before, new=after)])
 
-    def _not_found_msg(self, uuid_: UUID) -> str:
-        return f"Edge not found: uuid={uuid_}"
+    def _not_found_error(self, uuid_: UUID) -> NotFoundError:
+        return EdgeNotFoundError(f"Edge not found: uuid={uuid_}", uuid=uuid_)
 
     # ------------------------------------------------------------------
     # Internal: identity resolution + endpoint helpers
@@ -1269,7 +1274,7 @@ class EdgeScope(_BaseScope):
             return self._edge_uuid
         if self._from_path is not None and self._to_path is not None and self._edge_type is not None:
             return await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
-        raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
+        raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
 
     async def _fetch_edge_row(self, conn):
         """Fetch this edge's full row in ONE statement, or ``None``.
@@ -1291,7 +1296,7 @@ class EdgeScope(_BaseScope):
             )
             params = ["/".join(self._from_path), "/".join(self._to_path), self._edge_type]
         else:
-            raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
+            raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
         return await (await conn.execute(sql, params)).fetchone()
 
     async def _edge_not_found(self, conn):
@@ -1302,12 +1307,15 @@ class EdgeScope(_BaseScope):
         edge), exactly as before the single-statement fetch.
         """
         if self._edge_uuid is not None:
-            raise ValueError(f"Edge not found: uuid={self._edge_uuid}")
+            raise EdgeNotFoundError(f"Edge not found: uuid={self._edge_uuid}", uuid=self._edge_uuid)
         assert self._from_path is not None and self._to_path is not None and self._edge_type is not None
         await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
-        raise ValueError(
+        raise EdgeNotFoundError(
             f"Edge not found: type={self._edge_type!r} "
-            f"from={'/'.join(self._from_path)!r} to={'/'.join(self._to_path)!r}"
+            f"from={'/'.join(self._from_path)!r} to={'/'.join(self._to_path)!r}",
+            from_path="/".join(self._from_path),
+            to_path="/".join(self._to_path),
+            edge_type=self._edge_type,
         )
 
     async def _endpoints(self, conn) -> tuple[UUID, UUID]:
@@ -1395,7 +1403,7 @@ class EdgeScope(_BaseScope):
             new_from_uuid = await _resolve_endpoint(conn, from_node)
             new_to_uuid = await _resolve_endpoint(conn, to_node)
             if new_from_uuid == new_to_uuid:
-                raise ValueError("Edge endpoints must be distinct nodes.")
+                raise ValidationError("Edge endpoints must be distinct nodes.")
             await conn.execute(
                 "UPDATE edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_from_uuid, new_to_uuid, edge_uuid),
@@ -1465,5 +1473,5 @@ class EdgeScope(_BaseScope):
                         name=name,
                     )
                 else:
-                    raise ValueError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
+                    raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
         return None if meta.is_empty() else meta

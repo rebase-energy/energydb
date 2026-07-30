@@ -74,6 +74,17 @@ from energydb._sync import Client  # noqa: E402
 from energydb._transaction import Transaction  # noqa: E402
 from energydb.client import AsyncClient  # noqa: E402
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff  # noqa: E402
+from energydb.errors import (  # noqa: E402
+    AlreadyExistsError,
+    ConfigurationError,
+    EdgeNotFoundError,
+    EnergyDBError,
+    ManifestError,
+    NodeNotFoundError,
+    NotFoundError,
+    SeriesNotFoundError,
+    ValidationError,
+)
 from energydb.scope import EdgeScope, NodeScope  # noqa: E402
 from energydb.units import IncompatibleUnitError  # noqa: E402
 
@@ -81,7 +92,6 @@ __all__ = [
     # Client
     "AsyncClient",
     "Client",
-    "IncompatibleUnitError",
     "NodeScope",
     "EdgeScope",
     "Transaction",
@@ -96,6 +106,17 @@ __all__ = [
     "EdgeChange",
     "NodeSnapshot",
     "EdgeSnapshot",
+    # Errors
+    "EnergyDBError",
+    "NotFoundError",
+    "NodeNotFoundError",
+    "EdgeNotFoundError",
+    "SeriesNotFoundError",
+    "AlreadyExistsError",
+    "ValidationError",
+    "ManifestError",
+    "ConfigurationError",
+    "IncompatibleUnitError",
     # Core hierarchy
     "Element",
     "Node",

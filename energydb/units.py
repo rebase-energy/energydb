@@ -10,8 +10,10 @@ from functools import lru_cache
 import pint
 import polars as pl
 
+from energydb.errors import EnergyDBError
 
-class IncompatibleUnitError(ValueError):
+
+class IncompatibleUnitError(EnergyDBError, ValueError):
     """Raised when units cannot be converted to each other."""
 
 

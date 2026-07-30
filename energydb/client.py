@@ -47,6 +47,7 @@ from energydb._io import WriteResult, autocommit_read_conn, engine_meta_for_mani
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
+from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
 from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
 from energydb.paths import (
     Path,
@@ -91,9 +92,9 @@ class AsyncClient:
         """
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
-            raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
+            raise ConfigurationError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
         if "://" not in conninfo:
-            raise ValueError(
+            raise ConfigurationError(
                 "pg_conninfo must be a URI (e.g. postgresql://user:pass@host/db); "
                 "key=value DSNs are not supported here because the schema-create path "
                 "needs a SQLAlchemy URL."
@@ -245,10 +246,10 @@ class AsyncClient:
         """
         if uuid is not None:
             if names_or_path:
-                raise ValueError("Pass either uuid= or names, not both.")
+                raise ValidationError("Pass either uuid= or names, not both.")
             return NodeScope(self, node_uuid=uuid)
         if not names_or_path:
-            raise ValueError("Provide a path or uuid=.")
+            raise ValidationError("Provide a path or uuid=.")
         return NodeScope(self, path=_coerce_path(names_or_path))
 
     def get_edge(
@@ -267,10 +268,10 @@ class AsyncClient:
         """
         if uuid is not None:
             if from_path is not None or to_path is not None or type is not None:
-                raise ValueError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
+                raise ValidationError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
             return EdgeScope(self, edge_uuid=uuid)
         if from_path is None or to_path is None or type is None:
-            raise ValueError("Provide uuid= or (from_path, to_path, type=).")
+            raise ValidationError("Provide uuid= or (from_path, to_path, type=).")
         return EdgeScope(
             self,
             from_path=_coerce_path((), kwarg=from_path),
@@ -428,7 +429,7 @@ class AsyncClient:
                     )
                 ).fetchall()
                 if not rows and joined is not None:
-                    raise ValueError(f"Node not found: {joined}")
+                    raise NodeNotFoundError(f"Node not found: {joined}", path=joined)
                 rows = [r for r in rows if r[0] is not None]  # LEFT-JOIN row when nothing matches
 
         return [reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]}) for r in rows]
@@ -562,7 +563,7 @@ class AsyncClient:
         or ``"edge_uuid"``.
         """
         if owner_col not in ("node_uuid", "edge_uuid"):
-            raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
+            raise ValidationError("owner_col must be 'node_uuid' or 'edge_uuid'")
         async with autocommit_read_conn(self._pool) as conn:
             rows = await (
                 await conn.execute(
@@ -635,7 +636,7 @@ class AsyncClient:
                     )
                 ).fetchall()
                 if not rows and joined is not None:
-                    raise ValueError(f"Node not found: {joined}")
+                    raise NodeNotFoundError(f"Node not found: {joined}", path=joined)
                 rows = [r for r in rows if r[0] is not None]  # LEFT-JOIN rows when nothing matches
             if not rows:
                 return []
@@ -678,13 +679,13 @@ class AsyncClient:
         """
         if uuid is not None:
             addr, addr_param, joined = "r.uuid = %s", uuid, None
-            missing_msg = f"Node not found: uuid={uuid}"
+            missing_err = NodeNotFoundError(f"Node not found: uuid={uuid}", uuid=uuid)
         elif names_or_path:
             joined = "/".join(_coerce_path(names_or_path))
             addr, addr_param = "r.path = %s", joined
-            missing_msg = f"Node not found: {joined}"
+            missing_err = NodeNotFoundError(f"Node not found: {joined}", path=joined)
         else:
-            raise ValueError("Provide a path or uuid=.")
+            raise ValidationError("Provide a path or uuid=.")
 
         # One statement for the subtree (the root resolve and the prefix
         # scan are inlined); with ``include_series`` a second, independent
@@ -709,7 +710,7 @@ class AsyncClient:
                 series_rows = []
 
         if not rows:
-            raise ValueError(missing_msg)
+            raise missing_err
         root_uuid = rows[0][5]  # r.uuid rides along on every subtree row
 
         nodes: dict[UUID, Any] = {}

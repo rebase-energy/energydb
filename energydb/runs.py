@@ -13,6 +13,8 @@ from typing import Any, NamedTuple
 from psycopg.types.json import Jsonb
 from uuid6 import uuid7
 
+from energydb.errors import ValidationError
+
 
 class RunRow(NamedTuple):
     """The columns of a ``runs`` upsert, carried as one value.
@@ -44,9 +46,9 @@ _RUN_UPSERT_BODY = """INSERT INTO runs
 
 def _run_params(run: RunRow) -> tuple:
     if run.run_start_time is not None and run.run_start_time.tzinfo is None:
-        raise ValueError("run_start_time must be timezone-aware")
+        raise ValidationError("run_start_time must be timezone-aware")
     if run.run_finish_time is not None and run.run_finish_time.tzinfo is None:
-        raise ValueError("run_finish_time must be timezone-aware")
+        raise ValidationError("run_finish_time must be timezone-aware")
     return (
         run.run_id,
         run.workflow_id,
