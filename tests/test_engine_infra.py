@@ -394,7 +394,19 @@ def test_uuid_object_routed_read_takes_the_engine_path(client, monkeypatch):
     monkeypatch.setattr(_io, "_td_call", spy_td_call)
     monkeypatch.setattr(_io, "_ENGINE_STRICT", True)  # an engine failure raises instead of degrading
 
-    out_obj = client.read(_uuid_manifest(node_uuid, stringify=False))
+    try:
+        out_obj = client.read(_uuid_manifest(node_uuid, stringify=False))
+    except Exception as exc:  # noqa: BLE001 -- re-raised below with a diagnosis
+        if "POSTGRESQL_CONNECTION_FAILURE" in str(exc):
+            pytest.fail(
+                "ClickHouse could not reach PostgreSQL through the meta-engine table, so this "
+                "test's strict engine read failed. This is an environment problem, not a code "
+                "one: the engine table inlines PG's address from *ClickHouse's* network vantage, "
+                "which is not the DSN the app uses. Set ENERGYDB_CH_PG_HOST to PG's host:port as "
+                "ClickHouse sees it (e.g. 'postgres:5432' on a compose/CI network) and "
+                f"re-provision with setup_ch_meta_engine(). Underlying error: {exc}"
+            )
+        raise
     assert any(used_engine), "the uuid-routed read did not take the engine path"
     assert out_obj.height == 2
     assert client._async._engine_unavailable is False  # no degrade happened
