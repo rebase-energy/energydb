@@ -593,27 +593,34 @@ class AsyncClient:
     async def list_series(self, owner_uuid: UUID, *, owner_col: str = "node_uuid") -> list[dict]:
         """List the series catalog owned by a node (or edge).
 
-        Returns ``{name, data_type, canonical_unit, timeseries_type,
+        Returns ``{series_id, name, data_type, canonical_unit, timeseries_type,
         description}`` per series. ``owner_col`` is ``"node_uuid"`` (default)
         or ``"edge_uuid"``.
+
+        ``series_id`` is the timedb-internal handle (the same value
+        :meth:`NodeScope.register_series` returns) and makes this the reverse
+        lookup from ``(owner, data_type, name)``. It is an *input* to lower-level
+        timedb APIs, not a secret; read **results** still never carry it.
         """
         if owner_col not in ("node_uuid", "edge_uuid"):
             raise ValidationError("owner_col must be 'node_uuid' or 'edge_uuid'")
         async with autocommit_read_conn(self._pool) as conn:
             rows = await (
                 await conn.execute(
-                    f"SELECT name, data_type, canonical_unit, timeseries_type, description "
+                    f"SELECT series_id, name, data_type, canonical_unit, timeseries_type, description "
                     f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
                     (owner_uuid,),
                 )
             ).fetchall()
         return [
             {
-                "name": r[0],
-                "data_type": r[1],
-                "canonical_unit": r[2],
-                "timeseries_type": r[3],
-                "description": r[4],
+                # First: it reads as the row identity.
+                "series_id": r[0],
+                "name": r[1],
+                "data_type": r[2],
+                "canonical_unit": r[3],
+                "timeseries_type": r[4],
+                "description": r[5],
             }
             for r in rows
         ]
