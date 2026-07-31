@@ -26,7 +26,7 @@ Why EnergyDB?
 Most time-series systems are agnostic about what their series represent — they treat data as opaque ``(series_id, timestamp, value)`` triples. EnergyDB knows it is a portfolio, and links every series back to the asset or grid edge it describes.
 
 - 🔁 **Round-trip persistence**: every ``Element`` keeps its UUID7 from in-memory object to row primary key — renames, moves, and property edits become silent ``UPDATE``\ s, never delete-then-insert.
-- 📋 **Diffable structural changes**: ``dry_run=True`` previews every insert, rename, move, and delete before you apply — no surprise data loss on ``replace_subtree``.
+- 📋 **Diffable structural changes**: ``dry_run=True`` previews every insert, rename, move, and delete as a ``TreeDiff`` before you apply — no surprise mutations.
 - ⏱️ **Time-of-knowledge queries**: forecast revisions, corrections, and as-of backtests, powered by TimeDB.
 - 🧭 **Lazy fluent navigation**: ``client.get_node("Portfolio", "Site", "T01").read(...)`` resolves to one indexed SQL query, regardless of subtree size.
 - ⚖️ **Unit conversion at the boundary**: declare canonical units once; pint rescales every read and write automatically.

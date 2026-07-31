@@ -23,6 +23,7 @@ module-level re-export would be a cycle.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -80,10 +81,15 @@ class EdgeNotFoundError(NotFoundError):
 class SeriesNotFoundError(NotFoundError):
     """One or more addressed series are not registered.
 
-    ``route`` names the manifest routing column the lookup went through
-    (``"path"``, ``"node_uuid"`` or ``"edge_uuid"``). ``missing`` carries
-    *every* unresolved ``(owner, data_type, name)`` triple, not just the one
-    named in the message.
+    ``route`` names the manifest route the lookup went through: ``"path"``,
+    ``"node_uuid"``, ``"edge_uuid"``, or ``"edge_triple"``.
+
+    ``missing`` carries *every* unresolved key, not just the one named in the
+    message. Each entry is the route's owner identity followed by
+    ``(data_type, name)`` — a 3-tuple for the single-column routes
+    (``(owner, data_type, name)``), and a 5-tuple for ``"edge_triple"``, whose
+    owner is itself the ``(from_path, to_path, edge_type)`` triple. Read the
+    last two elements for the series, and the leading ones for the owner.
     """
 
     def __init__(
@@ -91,11 +97,14 @@ class SeriesNotFoundError(NotFoundError):
         message: str,
         *,
         route: str | None = None,
-        missing: list[tuple[str, str, str]] | None = None,
+        missing: Sequence[tuple[str, ...]] | None = None,
     ):
         super().__init__(message)
         self.route = route
-        self.missing = missing
+        # ``Sequence`` on the way in (``list`` is invariant, so a caller's
+        # ``list[tuple[str, str, str]]`` would not be assignable); normalized to
+        # a list on the way out so consumers get one predictable type.
+        self.missing: list[tuple[str, ...]] | None = None if missing is None else list(missing)
 
 
 # ---------------------------------------------------------------------------

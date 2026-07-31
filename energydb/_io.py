@@ -44,11 +44,18 @@ _ROUTING_AND_META_COLS = (
     "node_uuid",
     "edge_uuid",
     "path",
+    "from_path",
+    "to_path",
+    "edge_type",
     "data_type",
     "name",
     "canonical_unit",
     "unit",
 )
+
+# Edge-triple routing columns; their joint presence marks an edge-routed manifest
+# even before ``edge_uuid`` is attached during resolution.
+_EDGE_TRIPLE_COLS = ("from_path", "to_path", "edge_type")
 
 
 class WriteResult(int):
@@ -332,6 +339,9 @@ def _project_meta(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
     cols = ["series_id", "data_type", "name", "canonical_unit", "retention"]
     if is_edge:
         cols += ["edge_uuid", "edge_type", "from_path", "to_path"]
+        if "edge_uuid" not in resolved.columns:
+            # edge-triple-routed manifest: edge_uuid is attached during resolve_manifest.
+            raise RuntimeError("resolve_manifest did not attach edge_uuid for an edge-routed manifest")
     else:
         cols += ["node_uuid", "path"]
         if "node_uuid" not in resolved.columns:
@@ -355,6 +365,23 @@ def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
     """
     if "data_type" not in manifest.columns or "name" not in manifest.columns:
         return None
+    if manifest["data_type"].null_count() or manifest["name"].null_count():
+        return None
+    # resolve_manifest lowercases data_type before matching; mirror it here.
+    dts = tuple(str(v).lower() for v in manifest["data_type"].unique().to_list())
+    names = tuple(str(v) for v in manifest["name"].unique().to_list())
+
+    # Edge-triple route: all three columns present, Utf8, no nulls. Pushed down
+    # as three single-column INs over the (superset) unique triples.
+    if all(c in manifest.columns for c in _EDGE_TRIPLE_COLS):
+        cols = [manifest[c] for c in _EDGE_TRIPLE_COLS]
+        if any(c.null_count() or c.dtype != pl.Utf8 for c in cols):
+            return None
+        triples = tuple(
+            (str(fp), str(tp), str(et)) for fp, tp, et in manifest.select(_EDGE_TRIPLE_COLS).unique().iter_rows()
+        )
+        return PgEngineMeta(table=CH_ENGINE_TABLE, edge_triples=triples, data_type=dts, name=names)
+
     routes = [c for c in ("path", "node_uuid", "edge_uuid") if c in manifest.columns]
     if len(routes) != 1:
         return None
@@ -362,12 +389,7 @@ def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
     col = manifest[route]
     if col.null_count() or (route == "path" and col.dtype != pl.Utf8):
         return None
-    if manifest["data_type"].null_count() or manifest["name"].null_count():
-        return None
     owners = tuple(str(v) for v in col.unique().to_list())
-    # resolve_manifest lowercases data_type before matching; mirror it here.
-    dts = tuple(str(v).lower() for v in manifest["data_type"].unique().to_list())
-    names = tuple(str(v) for v in manifest["name"].unique().to_list())
     if route == "path":
         return PgEngineMeta(table=CH_ENGINE_TABLE, paths=owners, data_type=dts, name=names)
     if route == "node_uuid":
@@ -438,7 +460,7 @@ async def execute_read(
         if resolve is not None:
             return await resolve()
         assert manifest is not None
-        is_edge = "edge_uuid" in manifest.columns
+        is_edge = "edge_uuid" in manifest.columns or all(c in manifest.columns for c in _EDGE_TRIPLE_COLS)
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             async with autocommit_read_conn(pool) as conn:
                 resolved, _summary = await resolve_manifest(conn, manifest)

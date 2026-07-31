@@ -232,6 +232,29 @@ def test_unregistered_series_by_path_reports_every_missing_triple():
     ]
 
 
+def test_unregistered_series_by_edge_triple_reports_the_quintuple():
+    """The edge-triple route's owner is itself a triple, so ``missing`` holds 5-tuples."""
+    manifest = pl.DataFrame(
+        {
+            "from_path": ["Grid/BusA"],
+            "to_path": ["Grid/BusB"],
+            "edge_type": ["Line"],
+            "data_type": ["actual"],
+            "name": ["flow"],
+        }
+    )
+    with pytest.raises(SeriesNotFoundError) as excinfo:
+        asyncio.run(resolve_manifest(_mock_conn([]), manifest))
+    assert excinfo.value.route == "edge_triple"
+    assert excinfo.value.missing == [("Grid/BusA", "Grid/BusB", "Line", "actual", "flow")]
+
+
+def test_partial_edge_triple_raises_manifest_error():
+    manifest = pl.DataFrame({"from_path": ["A"], "edge_type": ["Line"], "data_type": ["actual"], "name": ["flow"]})
+    with pytest.raises(ManifestError, match="requires all of"):
+        asyncio.run(resolve_manifest(MagicMock(), manifest))
+
+
 def test_duplicate_uuid_in_tree_raises_already_exists():
     turbine = edb.wind.WindTurbine(name="T1", capacity=1.0)
     tree = edb.Portfolio(name="P", members=[turbine, turbine])

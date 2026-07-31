@@ -818,6 +818,16 @@ class AsyncClient:
     ):
         """Bulk read via manifest. Detects edge vs node routing automatically.
 
+        Routing is chosen from the columns present (exactly one route):
+
+        * ``path`` — node series by materialized path (``Utf8`` joined with ``/``).
+        * ``node_uuid`` / ``edge_uuid`` — series by owner uuid.
+        * ``from_path`` + ``to_path`` + ``edge_type`` — edge series by their
+          endpoint paths and type (all three required together), resolved
+          server-side the same way node ``path`` is. Symmetric with the edge
+          output columns below, so an edge read's own output can be fed back in
+          as a manifest without a UUID-resolution round-trip.
+
         Accepts pandas or polars on input. Output shape:
 
         * ``output="frame"`` (default): a single DataFrame with columns

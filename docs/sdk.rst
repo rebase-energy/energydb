@@ -1,17 +1,27 @@
 SDK Usage
 =========
 
-The energydb SDK is a single class — :class:`~energydb.Client` — that owns a
-PostgreSQL connection pool and constructs a :class:`timedb.TimeDBClient` for
-ClickHouse I/O. Around it sit two fluent scopes (:class:`~energydb.NodeScope`
-and :class:`~energydb.EdgeScope`) that let you navigate the hierarchy and
-operate on a single node or edge in idiomatic Python.
+The energydb SDK is built around one client that owns a PostgreSQL connection
+pool and constructs a :class:`timedb.TimeDBClient` for ClickHouse I/O. It ships
+in two flavors:
+
+- :class:`~energydb.Client` — the synchronous facade. Every method blocks; the
+  connection pool is opened eagerly on construction. This is what the examples
+  below use.
+- :class:`~energydb.AsyncClient` — the ``async``/``await`` client the sync
+  facade wraps. ``await client.open()`` once before use (or use it as an async
+  context manager). Every ``Client`` method shown here has an identical
+  ``AsyncClient`` coroutine.
+
+Around either client sit two fluent scopes (:class:`~energydb.NodeScope` and
+:class:`~energydb.EdgeScope`) that let you navigate the hierarchy and operate
+on a single node or edge in idiomatic Python.
 
 Overview
 --------
 
-energydb stores three kinds of objects, all in the same PostgreSQL ``energydb``
-schema:
+energydb stores three kinds of objects, all in one PostgreSQL schema — named by
+the ``ENERGYDB_SCHEMA`` environment variable, defaulting to ``public``:
 
 - **Nodes** — Portfolio, Site, WindTurbine, Battery, JunctionPoint, …
   Identified by a UUID7 generated when the ``Element`` is constructed in
@@ -45,7 +55,11 @@ Import the package and instantiate the client:
    client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
 
 The constructor accepts explicit ``pg_conninfo=`` and ``ch_url=`` kwargs for
-custom connections; environment variables are the default.
+custom connections; environment variables are the default. Both are
+keyword-only. The synchronous ``Client`` opens its pool on construction and
+should be closed with ``client.close()`` (or used as a ``with`` block); the
+:class:`~energydb.AsyncClient` requires ``await client.open()`` before its
+first call.
 
 energydb re-exports the EnergyDataModel public API under ``edb.*`` (see
 ``edb.wind``, ``edb.solar``, ``edb.battery``, ``edb.grid``, ``edb.Site``,
@@ -59,11 +73,14 @@ Database Connection
 
 The client reads its connection settings from environment variables by default:
 
-- ``TIMEDB_PG_DSN`` (or ``DATABASE_URL``) — PostgreSQL DSN
+- ``TIMEDB_PG_DSN`` (or ``DATABASE_URL``) — PostgreSQL DSN (must be a URI)
 - ``TIMEDB_CH_URL`` — ClickHouse HTTP URL
+- ``ENERGYDB_SCHEMA`` — PostgreSQL schema for energydb's tables (default
+  ``public``)
 
 You can also use a ``.env`` file in your project root (see
-:doc:`installation`).
+:doc:`installation`). The ClickHouse client honors TimeDB's own
+``TIMEDB_CH_TIMEOUT`` / ``TIMEDB_CH_CONNECT_TIMEOUT`` tunables.
 
 For programmatic use, instantiate the client with explicit settings:
 
@@ -87,21 +104,36 @@ Before using the client, create the database schema:
 
    client.create()
 
-This runs ``CREATE SCHEMA energydb`` and ``Base.metadata.create_all`` against
-PostgreSQL, then delegates to TimeDB to create the ClickHouse
-``series_values`` table. Safe to run repeatedly.
+This runs ``Base.metadata.create_all`` against PostgreSQL — creating the
+``node``, ``edge``, ``series``, and ``runs`` tables plus the ``series_meta``
+view — then delegates to TimeDB to create the ClickHouse ``series_values`` and
+``run_series`` tables. When ``ENERGYDB_SCHEMA`` names a non-default schema, it
+also issues ``CREATE SCHEMA IF NOT EXISTS`` first; the default ``public``
+schema is used as-is. Finally it *best-effort* provisions the ClickHouse
+``PostgreSQL()`` meta-engine table used by the concurrent read path — a failure
+there is logged, not raised (reads fall back to the sequential path). Safe to
+run repeatedly.
+
+Use :meth:`~energydb.Client.setup_ch_meta_engine` as the explicit, *raising*
+alternative that (re)creates the ``series_meta`` view and the engine table and
+clears the session's engine-degraded flag — call it to re-enable ``concurrent``
+reads after fixing engine infrastructure.
 
 Deleting the Schema
 ~~~~~~~~~~~~~~~~~~~
 
-To drop both databases (use with caution):
+To drop energydb's tables and all ClickHouse values (use with caution):
 
 .. code-block:: python
 
    client.delete()
 
-**WARNING**: ``DROP SCHEMA energydb CASCADE`` removes every node, edge, series
-declaration, and run; ``td.delete()`` removes every value in ClickHouse.
+**WARNING**: this is destructive. With a named ``ENERGYDB_SCHEMA`` it runs
+``DROP SCHEMA … CASCADE``, removing every node, edge, series declaration, and
+run. With the default ``public`` schema it drops only energydb's own four
+tables (``series``, ``runs``, ``edge``, ``node``) — never the shared ``public``
+schema, which would take the host application's tables with it. Either way it
+then drops every value in ClickHouse.
 
 
 Hierarchies and Topology
@@ -229,7 +261,28 @@ With ``include_series=True``, every reconstructed node carries its registered
 series as metadata-only :class:`~timedatamodel.TimeSeries` entries (``df=None``)
 on ``timeseries``.
 
-Flat queries by type / subtree / properties:
+When you want the raw row rather than a reconstructed EDM object — any
+``node_type`` / ``edge_type`` string, no class lookup — use ``get_raw()`` and
+the lazy navigation helpers on a scope:
+
+.. code-block:: python
+
+   scope = client.get_node("my-portfolio", "Offshore-1", "T01")
+
+   scope.get_raw()      # {uuid, node_type, name, data, parent_uuid, path} — None if uuid-addressed & missing
+   scope.children()     # direct children, one level: list of {uuid, node_type, name, data, parent_uuid}
+   scope.descendants()  # whole subtree below (excludes self), same dict shape
+   scope.path()         # resolved path tuple
+
+   # children / descendants accept a type= filter
+   turbines = client.get_node("my-portfolio").descendants(type="WindTurbine")
+
+``EdgeScope.get_raw()`` returns ``{uuid, edge_type, name, data,
+from_node_uuid, to_node_uuid}`` and works for any ``edge_type`` string;
+``EdgeScope.from_node()`` / ``.to_node()`` return the endpoint
+:class:`~energydb.NodeScope`\ s.
+
+Flat queries by type / subtree / properties (return lists of EDM objects):
 
 .. code-block:: python
 
@@ -258,15 +311,21 @@ Address the node by path or uuid and use the fluent scope ops:
    t01.move_to(client.get_node("my-portfolio", "Onshore-1"))
    t01.delete()
 
-``move_to`` rejects re-parenting into self or any descendant (cycle
-detection). ``rename`` and ``update`` are idempotent and round-trip safe.
+``update`` defaults to a **shallow JSONB merge** — the passed keys are merged
+over the existing ``data``. Pass ``replace_data=True`` to overwrite ``data``
+wholesale instead. ``move_to`` rejects re-parenting into self or any descendant
+(cycle detection). ``rename`` and ``update`` are idempotent and round-trip
+safe. Every mutator also accepts ``dry_run=True``, returning a
+:class:`~energydb.TreeDiff` without touching the database.
 
-The same surface exists on edges:
+The same surface exists on edges (edge ``move_to`` takes keyword-only
+``from_node=`` / ``to_node=`` endpoints):
 
 .. code-block:: python
 
    e = client.get_edge(uuid=line.id)
-   e.update(data={"capacity": 600})
+   e.update(data={"capacity": 600})          # shallow merge; replace_data=True to overwrite
+   e.move_to(from_node=bus_a_scope, to_node=bus_c_scope)
    e.delete()
 
 
@@ -287,9 +346,12 @@ For surgical additions on an existing node or edge, scopes expose
        canonical_unit="m/s",
        data_type="actual",
        timeseries_type="FLAT",
+       retention="forever",   # optional; derived from timeseries_type when omitted
+       description="Nacelle anemometer",  # optional
    )
 
-Or pass a metadata-only TimeSeries directly:
+``register_series`` returns the integer ``series_id``. Pass a metadata-only
+TimeSeries directly instead of the individual fields:
 
 .. code-block:: python
 
@@ -303,6 +365,18 @@ insert (enforced by a Postgres trigger). Reclassifying a series means
 registering a new one — this preserves ClickHouse-side data integrity. When
 ``retention`` is omitted it is derived from ``timeseries_type``: ``FLAT``
 (actuals) → ``forever``, ``OVERLAPPING`` (forecasts) → ``medium``.
+
+**``data_type`` and ``timeseries_type``.** ``data_type`` is a value from the
+:class:`~timedatamodel.DataType` enum, passed as a case-insensitive string
+(lowercased internally). The full vocabulary is ``actual``, ``observation``,
+``derived``, ``calculated``, ``estimation``, ``forecast``, ``prediction``,
+``scenario``, ``simulation``, ``reconstruction``, ``reference``, ``baseline``,
+``benchmark``, ``ideal`` — a hierarchy (e.g. ``observation`` rolls up to
+``actual``). ``timeseries_type`` is the temporal shape and must be one of the
+two :class:`~timedatamodel.TimeSeriesType` values: ``FLAT`` (one value per
+``valid_time``) or ``OVERLAPPING`` (versioned forecasts, many
+``knowledge_time`` per ``valid_time``). ``timeseries_type`` is the one series
+attribute that *can* be changed after registration.
 
 
 Edges and Grid Topology
@@ -375,7 +449,8 @@ via the scope's path or uuid before any data reaches the database.
      - ETL pipelines, scheduled loads, cross-portfolio reads
    * - **Routing**
      - Implicit (the scope's resolved uuid)
-     - Manifest column: ``node_uuid``, ``edge_uuid``, or ``path``
+     - Manifest column: ``node_uuid``, ``edge_uuid``, ``path``, or
+       ``from_path`` + ``to_path`` + ``edge_type``
 
 Writing
 ~~~~~~~
@@ -502,6 +577,12 @@ the data columns. The routing column is autodetected from the column names
   separator; names containing ``/`` are rejected at registration. The
   manifest must use ``Utf8`` — ``List(Utf8)`` from earlier API versions
   is rejected with an explicit migration message.
+- ``from_path`` + ``to_path`` + ``edge_type`` — human-readable routing for
+  edge-attached series (all three columns required together), the edge
+  analogue of ``path``. Each is ``Utf8`` joined with ``/``; the edge is
+  resolved server-side via its endpoint nodes' paths and type. Symmetric
+  with the edge read output columns, so an edge read's frame can be fed
+  back in as a manifest without resolving ``edge_uuid`` first.
 
 write() — long-format multi-series ingestion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -545,8 +626,20 @@ The other two routing forms are equivalent:
        "value":      [200.0 + h for h in range(24)],
    })
 
+   # By edge triple (human-readable; all three columns required)
+   pl.DataFrame({
+       "from_path":  ["my-grid/BusA"] * 24,
+       "to_path":    ["my-grid/BusB"] * 24,
+       "edge_type":  ["Line"] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power_flow"] * 24,
+       "valid_time": hours,
+       "value":      [200.0 + h for h in range(24)],
+   })
+
 Routing modes are mutually exclusive — passing more than one routing column
-raises ``ValueError``.
+raises ``ValueError``. Supplying only part of the edge triple (e.g.
+``from_path`` + ``to_path`` without ``edge_type``) is likewise a ``ValueError``.
 
 Series must already be registered (typically via
 :meth:`~energydb.Client.register_tree`) — unresolved
@@ -617,23 +710,27 @@ an ``output=`` kwarg that controls return shape:
 - ``output="frame"`` (default) — one DataFrame with the identity columns
   broadcast on every row. Good for ETL and ad-hoc analysis where you want
   to ``group_by(path)`` or filter further downstream.
-- ``output="by_path"`` — a ``dict`` keyed by ``(path, data_type, name)``
-  (or ``(from_path, to_path, edge_type, data_type, name)`` for edge
-  reads), one DataFrame per series. Sub-frames carry only the data
-  columns (``valid_time``, ``value``, plus opt-in ``knowledge_time`` /
-  ``change_time``). Each sub-frame is sorted by ``valid_time`` ascending.
+- ``output="by_path"`` — a ``dict`` keyed by a
+  :class:`~energydb.SeriesKey` ``(path, data_type, name)`` for node reads,
+  or an :class:`~energydb.EdgeSeriesKey`
+  ``(from_path, to_path, edge_type, data_type, name)`` for edge reads. Both
+  are ``NamedTuple``\ s, so keys support positional *and* attribute access
+  (``key.path``, ``key.name``, …). Each value is one DataFrame per series,
+  carrying only the data columns (``valid_time``, ``value``, plus opt-in
+  ``knowledge_time`` / ``change_time``), sorted by ``valid_time`` ascending.
 
 Use ``by_path`` when downstream code naturally operates per-series — model
 training, plotting, per-asset writes back. Series that resolve but have
 no rows in ClickHouse still appear as keys with an empty sub-frame, so
-callers can index by key without ``KeyError``.
+callers can index by key without ``KeyError``. :func:`~energydb.find`
+filters the result dict by partial key match (e.g. ``find(result,
+name="power")``).
 
 .. code-block:: python
 
    by_series = client.read(manifest, output="by_path")
    for key, sub in by_series.items():
-       path, data_type, name = key
-       train_one_model(path, sub)
+       train_one_model(key.path, sub)   # key is a SeriesKey NamedTuple
 
 The ``backend=`` kwarg is orthogonal: ``backend="polars"`` (default)
 returns polars frames in both modes; ``backend="pandas"`` converts every
@@ -702,6 +799,28 @@ you know exactly which node/edge changed.
 
 Use :meth:`Client.resolve_cache_stats` to see hit/miss counters and the
 current cache size if you are tuning read latency.
+
+
+Concurrent reads
+----------------
+
+When the ClickHouse meta-engine table is provisioned (see `Schema
+Management`_) and expressible for the query, reads run the PostgreSQL series
+resolve **in parallel** with the ClickHouse value read — ClickHouse
+self-resolves ``series_id`` through the ``PostgreSQL()`` engine table over the
+``series_meta`` view. The result is trimmed to the exact resolve and is
+byte-identical to the sequential path. Queries that cannot express an engine
+predicate (``.where()`` property filters, uuid-addressed subtrees) fall back
+to sequential automatically.
+
+Two environment variables gate this path:
+
+- ``ENERGYDB_DISABLE_ENGINE=1`` — session kill-switch; always use the
+  sequential path.
+- ``ENERGYDB_ENGINE_STRICT=1`` — raise on an engine-read failure instead of
+  degrading to sequential (useful in tests). Without it, the first failure
+  degrades the session and later reads go sequential until
+  :meth:`~energydb.Client.setup_ch_meta_engine` is called again.
 
 
 Run History
