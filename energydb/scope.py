@@ -32,7 +32,7 @@ from timedb import PgEngineMeta, UnchangedScope, profiling
 from energydb import series as series_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, autocommit_read_conn, execute_read
+from energydb._io import WriteResult, annotate_undefined_table, autocommit_read_conn, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -277,11 +277,15 @@ class _BaseScope:
         (caller MUST NOT call ``.commit()`` / ``.rollback()``). Otherwise
         borrow from the pool; mutators are responsible for explicit
         ``commit()`` or ``rollback()``.
+
+        Wrapped in :func:`annotate_undefined_table` on both branches, so every
+        scope operation gets the schema-misconfiguration note.
         """
         if self._txn is not None:
-            yield self._txn._conn
+            async with annotate_undefined_table():
+                yield self._txn._conn
             return
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             yield conn
 
     @asynccontextmanager
@@ -293,8 +297,10 @@ class _BaseScope:
         psycopg's implicit-BEGIN round-trip and the pool's rollback-on-return.
         """
         if self._txn is not None:
-            yield self._txn._conn
+            async with annotate_undefined_table():
+                yield self._txn._conn
             return
+        # ``autocommit_read_conn`` annotates already.
         async with autocommit_read_conn(self._pool) as conn:
             yield conn
 

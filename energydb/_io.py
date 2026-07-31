@@ -14,11 +14,13 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, NamedTuple
 
 import polars as pl
+import psycopg
 from timedb import PgEngineMeta, UnchangedScope, profiling
 
 if TYPE_CHECKING:
@@ -36,6 +38,7 @@ from energydb._join import (
 )
 from energydb._persist import apply_manifest_unit_conversion
 from energydb.errors import UnchangedScopeError, ValidationError
+from energydb.models import SCHEMA
 from energydb.paths import OnMissing, ResolveSummary, _check_on_missing, resolve_manifest
 from energydb.units import compute_unit_factor
 
@@ -202,7 +205,7 @@ async def write_manifest(
     )
     kt_known = knowledge_time is not None or "knowledge_time" in df.columns
 
-    async with pool.connection() as conn:
+    async with annotate_undefined_table(), pool.connection() as conn:
         if kt_known:
             # The knowledge_time-required check cannot fire here, so no rollback is
             # needed for it. The unchanged_scope check *can*, and it runs inside the
@@ -275,6 +278,64 @@ async def write_manifest(
 
 
 # ---------------------------------------------------------------------------
+# Schema diagnostics
+# ---------------------------------------------------------------------------
+
+# energydb's own relations: the four tables plus the series_meta view. Scoping the
+# annotation to these keeps it off a host application's own missing tables, which
+# have nothing to do with ENERGYDB_SCHEMA.
+_ENERGYDB_RELATIONS = frozenset({"node", "edge", "series", "runs", "series_meta"})
+
+_RELATION_RE = re.compile(r'relation "([^"]+)" does not exist')
+
+
+def _relation_name(exc: psycopg.errors.UndefinedTable) -> str | None:
+    """The unqualified relation name from an ``UndefinedTable``, or ``None``.
+
+    PostgreSQL reports ``relation "x" does not exist`` (schema-qualified as
+    ``"s.x"`` when the statement qualified it). Returns ``None`` on anything
+    unexpected: this runs inside an exception handler, so it must never raise an
+    error of its own on top of the one being reported.
+    """
+    diag = getattr(exc, "diag", None)
+    message = getattr(diag, "message_primary", None) or str(exc)
+    match = _RELATION_RE.search(message)
+    if match is None:
+        return None
+    return match.group(1).rsplit(".", 1)[-1]
+
+
+@contextlib.asynccontextmanager
+async def annotate_undefined_table():
+    """Attach an actionable note to ``UndefinedTable`` for energydb's own relations.
+
+    A client pointed at a schema without the energydb tables (wrong
+    ``ENERGYDB_SCHEMA``, or ``create()`` never ran) used to fail with a bare
+    ``relation "node" does not exist`` from inside whatever query happened to run
+    first — no mention of which schema was searched, that a schema knob exists, or
+    what to do.
+
+    Annotates rather than wraps (:pep:`678`): the exception stays an
+    ``UndefinedTable``, so anything downstream catching psycopg errors is
+    unaffected and there is no new class to document — every traceback just gains
+    the missing context. The sync facade propagates the object as-is, notes
+    included, so it needs no changes.
+    """
+    try:
+        yield
+    except psycopg.errors.UndefinedTable as exc:
+        if _relation_name(exc) in _ENERGYDB_RELATIONS:
+            exc.add_note(
+                f"energydb: the configured schema {(SCHEMA or 'public')!r} "
+                f"(ENERGYDB_SCHEMA={os.environ.get('ENERGYDB_SCHEMA', '<unset>')!r}) "
+                "does not contain the energydb tables. Either run "
+                "'await client.create()' once to provision them, or point "
+                "ENERGYDB_SCHEMA at the schema that has them."
+            )
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
 
@@ -289,8 +350,11 @@ async def autocommit_read_conn(pool):
     statement gets its own snapshot with or without the wrapping transaction —
     so autocommit drops both round-trips without changing visibility.
     Autocommit is switched back off before the connection returns to the pool.
+
+    Also the annotation point for every read: a schema-misconfiguration failure
+    surfaces here rather than from inside an arbitrary query.
     """
-    async with pool.connection() as conn:
+    async with annotate_undefined_table(), pool.connection() as conn:
         await conn.set_autocommit(True)
         try:
             yield conn

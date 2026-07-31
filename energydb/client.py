@@ -52,6 +52,7 @@ from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import (
     ReadResult,
     WriteResult,
+    annotate_undefined_table,
     autocommit_read_conn,
     engine_meta_for_manifest,
     execute_read,
@@ -226,7 +227,7 @@ class AsyncClient:
         own four tables — never the shared ``public`` schema, which would take
         the host application's tables with it.
         """
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             if SCHEMA is None:
                 await conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
             else:
@@ -250,7 +251,7 @@ class AsyncClient:
         into the DDL and readable via ``SHOW CREATE TABLE`` (warned about at
         provisioning time).
         """
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             await conn.execute(CREATE_SERIES_META_VIEW)
             await conn.commit()
         await asyncio.to_thread(self._provision_engine_table_blocking)
@@ -373,7 +374,7 @@ class AsyncClient:
         Returns the ``uuid`` of the tree's root, except when
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
         """
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             parent_uuid = await resolve_node_uuid(conn, _coerce_path((), kwarg=under)) if under is not None else None
             root_uuid, diff = await register_tree_under(
                 conn,
@@ -481,7 +482,7 @@ class AsyncClient:
         it walks the structure and validates endpoints against the tree's
         index in one pass.
         """
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             edge_uuid = await create_edge(conn, edm_obj, tree_root=None)
             await conn.commit()
         return edge_uuid
@@ -509,7 +510,7 @@ class AsyncClient:
         ``NodeScope.children()`` — not the EDM readers, which require a
         registered type.
         """
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             if parent is None:
                 parent_uuid = None
             elif isinstance(parent, UUID):
