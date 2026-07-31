@@ -41,7 +41,13 @@ from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
-from energydb._ch_meta_engine import DROP_ENGINE_TABLE, DROP_LEGACY_ENGINE_TABLE, engine_table_ddl
+from energydb._ch_meta_engine import (
+    CH_ENGINE_TABLE,
+    DROP_ENGINE_TABLE,
+    DROP_LEGACY_ENGINE_TABLE,
+    engine_table_ddl,
+    inlines_pg_password,
+)
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import (
     ReadResult,
@@ -169,6 +175,10 @@ class AsyncClient:
         deployments that never enable ``concurrent`` — those get a logged
         warning and reads fall back to the sequential path.
         :meth:`setup_ch_meta_engine` is the explicit, raising alternative.
+
+        For production, set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named
+        collection holding the PostgreSQL connection; otherwise the credentials
+        are inlined into the engine table's DDL (and a warning says so).
         """
         await asyncio.to_thread(self._create_blocking)
         try:
@@ -180,6 +190,18 @@ class AsyncClient:
             )
 
     def _provision_engine_table_blocking(self) -> None:
+        # Warn before issuing the DDL, and from here rather than from
+        # engine_table_ddl(), so DDL construction stays side-effect-free and the
+        # warning fires exactly when the credential is about to be written.
+        if inlines_pg_password(self._dsn):
+            logger.warning(
+                "energydb: provisioning the ClickHouse meta-engine table %r with inline "
+                "PostgreSQL credentials -- the password will be visible via SHOW CREATE TABLE "
+                "to any ClickHouse user with read access. For production, create a ClickHouse "
+                "named collection holding the PostgreSQL connection and set "
+                "ENERGYDB_CH_PG_COLLECTION to its name.",
+                CH_ENGINE_TABLE,
+            )
         # DROP + CREATE (not IF NOT EXISTS alone): the engine table is stateless, and
         # recreating it picks up view/column upgrades on existing deployments.
         self.td._ch.command(DROP_ENGINE_TABLE)
@@ -222,6 +244,11 @@ class AsyncClient:
         provisioning this raises on failure, and it clears the session's
         engine-unavailable degrade flag — call it to re-enable ``concurrent``
         after fixing engine infrastructure.
+
+        Set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named collection for
+        production deployments — without it the PostgreSQL password is inlined
+        into the DDL and readable via ``SHOW CREATE TABLE`` (warned about at
+        provisioning time).
         """
         async with self._pool.connection() as conn:
             await conn.execute(CREATE_SERIES_META_VIEW)

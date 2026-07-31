@@ -12,6 +12,7 @@ skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are not set.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import uuid
@@ -25,6 +26,7 @@ from energydb._ch_meta_engine import (
     CH_ENGINE_TABLE,
     _engine_table_name,
     engine_table_ddl,
+    inlines_pg_password,
     series_meta_view_ddl,
 )
 from energydb._io import _is_unknown_table, engine_meta_for_manifest, execute_read
@@ -615,3 +617,75 @@ def test_a_genuinely_unprovisioned_table_takes_the_info_path(client, caplog):
     assert out.height == 2  # the sequential fallback returned the data
 
     client.setup_ch_meta_engine()  # restore the fixture invariant
+
+
+# ---------------------------------------------------------------------------
+# Inline-credential warning at provisioning time
+# ---------------------------------------------------------------------------
+
+_PASSWORDLESS_DSN = "postgresql://app_user@db.example.com:6543/proddb"
+
+
+def test_a_dsn_with_a_password_inlines_it():
+    assert inlines_pg_password(DSN) is True
+
+
+def test_a_named_collection_keeps_the_password_out_of_the_ddl(monkeypatch):
+    """The secure path: nothing is inlined, so there is nothing to warn about."""
+    monkeypatch.setenv("ENERGYDB_CH_PG_COLLECTION", "pg_energydb")
+    assert inlines_pg_password(DSN) is False
+    # And the DDL really does omit it — the property the warning is a proxy for.
+    assert "s3cret" not in engine_table_ddl(DSN, "public")
+
+
+def test_a_passwordless_dsn_is_not_worth_warning_about():
+    """Trust auth / local compose inlines no secret. Warning there would fire on
+    every dev ``create()`` and train people to ignore the message that matters."""
+    assert inlines_pg_password(_PASSWORDLESS_DSN) is False
+    assert inlines_pg_password("postgresql://app_user:@db.example.com/proddb") is False
+
+
+def test_a_percent_encoded_password_still_counts():
+    """The DSN parser must decode before deciding — an encoded password is still a
+    password, and it is what lands in the DDL."""
+    assert inlines_pg_password("postgresql://u:p%40ss@db.example.com/proddb") is True
+
+
+@pytestmark_live
+def test_provisioning_warns_that_the_password_lands_in_the_ddl(client, caplog):
+    """The residual ask behind #100: the insecure default was silent."""
+    with caplog.at_level(logging.WARNING, logger="energydb.client"):
+        client.setup_ch_meta_engine()
+
+    records = [r for r in caplog.records if r.name == "energydb.client"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "SHOW CREATE TABLE" in message  # names the exposure
+    assert "ENERGYDB_CH_PG_COLLECTION" in message  # names the fix
+    # Provisioning still succeeded — this is a warning, not a new requirement.
+    assert _engine_table_exists(client)
+    assert client.get_node("P").read(data_type="actual", name="power").height == 2
+
+
+@pytestmark_live
+def test_create_emits_it_too(client, caplog):
+    """One funnel serves both entry points, but assert both: create() is the one
+    every deployment runs, and its provisioning is best-effort/exception-swallowing."""
+    with caplog.at_level(logging.WARNING, logger="energydb.client"):
+        client.create()
+
+    warnings = [r for r in caplog.records if r.name == "energydb.client" and "SHOW CREATE TABLE" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytestmark_live
+def test_no_warning_when_a_named_collection_is_configured(client, monkeypatch, caplog):
+    """The whole point of recommending the collection is that it silences this."""
+    monkeypatch.setenv("ENERGYDB_CH_PG_COLLECTION", "pg_energydb_absent")
+    # The collection does not exist on this server, so the DDL fails — but the
+    # warning decision happens first, which is exactly what is under test.
+    with caplog.at_level(logging.WARNING, logger="energydb.client"), contextlib.suppress(Exception):
+        client.setup_ch_meta_engine()
+
+    assert not [r for r in caplog.records if "SHOW CREATE TABLE" in r.getMessage()]
+    # No restore needed: the ``client`` fixture is per-test and re-provisions on setup.

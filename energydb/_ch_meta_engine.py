@@ -75,6 +75,20 @@ def series_meta_view_ddl(qualifier: str) -> tuple[str, str]:
     return create, f"DROP VIEW IF EXISTS {view}"
 
 
+def inlines_pg_password(pg_dsn: str) -> bool:
+    """True when :func:`engine_table_ddl` would embed a real password in the DDL.
+
+    Lives next to the function that does the inlining so the two cannot drift.
+    ``False`` when a named collection is configured (the password never reaches
+    the DDL) *and* when the DSN carries no password at all — a trust-auth or
+    passwordless dev DSN inlines nothing worth warning about, and a warning that
+    fires on every local ``create()`` is a warning nobody reads.
+    """
+    if os.environ.get("ENERGYDB_CH_PG_COLLECTION"):
+        return False
+    return bool(unquote(urlparse(pg_dsn).password or ""))
+
+
 def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
     """DDL for the ClickHouse ``PostgreSQL()`` engine table over ``series_meta``.
 
@@ -83,7 +97,11 @@ def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
     * ``ENERGYDB_CH_PG_COLLECTION`` set → a ClickHouse named collection holds
       the PG connection (production shape where the CH role allows it: the PG
       password stays out of the DDL / ``SHOW CREATE TABLE``).
-    * else creds are inlined from ``pg_dsn``. ``ENERGYDB_CH_PG_HOST``
+    * else creds are inlined from ``pg_dsn`` — which means the PostgreSQL
+      password is readable via ``SHOW CREATE TABLE`` to any ClickHouse user with
+      read access. Fine for dev/compose, not for production; the caller warns
+      about it at provisioning time (see :func:`inlines_pg_password`).
+      ``ENERGYDB_CH_PG_HOST``
       (``host:port``) overrides the DSN's host for **ClickHouse's network
       vantage**: the DSN addresses PG from the app (e.g. ``127.0.0.1:5433``
       for a local docker port-map), which is not necessarily resolvable from
