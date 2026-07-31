@@ -12,6 +12,7 @@ skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are not set.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -26,7 +27,7 @@ from energydb._ch_meta_engine import (
     engine_table_ddl,
     series_meta_view_ddl,
 )
-from energydb._io import engine_meta_for_manifest, execute_read
+from energydb._io import _is_unknown_table, engine_meta_for_manifest, execute_read
 
 DSN = "postgresql://app_user:s3cret@db.example.com:6543/proddb"
 
@@ -442,3 +443,175 @@ def test_uuid_object_routed_read_works_with_the_engine_disabled(client, monkeypa
     finally:
         disabled.close()
     assert out.equals(expected)
+
+
+# ---------------------------------------------------------------------------
+# Engine-probe log level: the not-provisioned case is a state, not an anomaly
+# ---------------------------------------------------------------------------
+
+
+class _FakeDatabaseError(Exception):
+    """Stands in for clickhouse-connect's DatabaseError, which embeds the server
+    text in its message rather than exposing a structured error code."""
+
+
+_UNKNOWN_TABLE_TEXT = (
+    "Code: 60. DB::Exception: Table default.energydb_series_meta_pg doesn't exist. (UNKNOWN_TABLE) (version 26.1.1.1)"
+)
+
+
+def test_unknown_table_is_recognised_from_the_server_text():
+    assert _is_unknown_table(_FakeDatabaseError(_UNKNOWN_TABLE_TEXT)) is True
+
+
+def test_the_error_code_alone_is_enough():
+    """A server locale or driver version that drops the symbolic name still has
+    the code — the classifier must not hinge on one spelling."""
+    assert _is_unknown_table(_FakeDatabaseError("Code: 60. DB::Exception: Table x doesn't exist.")) is True
+
+
+def test_a_real_engine_failure_is_not_classified_as_not_provisioned():
+    """The whole point of the split: network/auth/connectivity failures must keep
+    their warning + traceback. A quieter log for those would hide real breakage."""
+    refused = _FakeDatabaseError(
+        "Code: 1002. DB::Exception: Connection refused (POSTGRESQL_CONNECTION_FAILURE) (version 26.1.1.1)"
+    )
+    assert _is_unknown_table(refused) is False
+    assert _is_unknown_table(None) is False
+    assert _is_unknown_table(RuntimeError("engine down")) is False
+
+
+def test_the_marker_is_found_down_the_exception_chain():
+    """The driver may re-wrap the server error before it reaches us, so the
+    classifier walks ``__cause__``/``__context__`` rather than only the top."""
+    inner = _FakeDatabaseError(_UNKNOWN_TABLE_TEXT)
+    wrapped = RuntimeError("clickhouse query failed")
+    wrapped.__cause__ = inner
+    assert _is_unknown_table(wrapped) is True
+
+    outer = RuntimeError("read failed")
+    outer.__context__ = wrapped
+    assert _is_unknown_table(outer) is True
+
+
+def test_a_self_referential_chain_terminates():
+    """Defensive: the classifier runs inside an exception handler on the read
+    path, so it must not be able to spin on a cyclic chain."""
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert _is_unknown_table(a) is False
+
+
+def _fail_engine_with(monkeypatch, exc: BaseException):
+    """Make only the engine-backed CH read fail, with ``exc`` as the cause.
+
+    The sequential path is left intact, so the read under test still returns the
+    correct result — which is what lets these tests assert the log *and* the
+    fallback in one go.
+    """
+    import energydb._io as _io
+
+    orig = _io._td_call
+
+    def fake_td_call(td, *, relative, kwargs, meta_source=None):
+        if meta_source is None:
+            return orig(td, relative=relative, kwargs=kwargs)
+
+        def boom(*args, **kw):
+            raise exc
+
+        return boom
+
+    monkeypatch.setattr(_io, "_td_call", fake_td_call)
+    monkeypatch.setattr(_io, "_ENGINE_STRICT", False)
+
+
+@pytestmark_live
+def test_not_provisioned_logs_one_info_line_without_a_traceback(client, monkeypatch, caplog):
+    """**The regression this item exists for.** A deployment that never provisions
+    the engine table used to get a scary traceback on its first read of every
+    process, and learned to silence it with ENERGYDB_DISABLE_ENGINE=1 — which then
+    hid real engine failures too."""
+    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
+    expected = client.get_node("P").read(data_type="actual", name="power")
+    client._async._engine_unavailable = False
+
+    with caplog.at_level(logging.INFO, logger="energydb._io"):
+        out = client.get_node("P").read(data_type="actual", name="power")
+
+    records = [r for r in caplog.records if r.name == "energydb._io"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].exc_info is None  # no traceback
+    assert "not provisioned" in records[0].getMessage()
+    assert "setup_ch_meta_engine" in records[0].getMessage()
+    # Behaviour is unchanged: still degraded, still the correct sequential result.
+    assert client._async._engine_unavailable is True
+    assert out.equals(expected)
+
+
+@pytestmark_live
+def test_a_real_failure_still_warns_with_a_traceback(client, monkeypatch, caplog):
+    """The other half of the split, asserted so the quieting can't creep."""
+    _fail_engine_with(monkeypatch, _FakeDatabaseError("Code: 1002. Connection refused"))
+    client._async._engine_unavailable = False
+
+    with caplog.at_level(logging.INFO, logger="energydb._io"):
+        client.get_node("P").read(data_type="actual", name="power")
+
+    records = [r for r in caplog.records if r.name == "energydb._io"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is not None  # traceback retained
+
+
+@pytestmark_live
+def test_the_info_line_fires_once_per_session(client, monkeypatch, caplog):
+    """The session latches ``_engine_unavailable``, so later reads never re-probe.
+    Asserted here because the whole justification for info-level is that it is a
+    one-off statement of configuration, not a per-read complaint."""
+    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
+    client._async._engine_unavailable = False
+
+    with caplog.at_level(logging.INFO, logger="energydb._io"):
+        client.get_node("P").read(data_type="actual", name="power")
+        client.get_node("P").read(data_type="actual", name="power")
+        client.get_node("P").read(data_type="actual", name="power")
+
+    assert len([r for r in caplog.records if r.name == "energydb._io"]) == 1
+
+
+@pytestmark_live
+def test_strict_mode_still_raises_for_the_not_provisioned_case(client, monkeypatch):
+    """The classifier must not soften strict mode: ENERGYDB_ENGINE_STRICT=1 exists
+    so a broken engine is loud, and "not provisioned" is still broken to someone
+    who explicitly asked for the engine."""
+    import energydb._io as _io
+
+    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
+    monkeypatch.setattr(_io, "_ENGINE_STRICT", True)
+    client._async._engine_unavailable = False
+
+    with pytest.raises(_FakeDatabaseError, match="UNKNOWN_TABLE"):
+        client.get_node("P").read(data_type="actual", name="power")
+
+
+@pytestmark_live
+def test_a_genuinely_unprovisioned_table_takes_the_info_path(client, caplog):
+    """End-to-end without faking the failure: drop the engine table and read. This
+    is the exact configuration the item is about, so it is worth one test that
+    does not stub the driver."""
+    client.td._ch.command(f"DROP TABLE IF EXISTS {CH_ENGINE_TABLE}")
+    client._async._engine_unavailable = False
+
+    with caplog.at_level(logging.INFO, logger="energydb._io"):
+        out = client.get_node("P").read(data_type="actual", name="power")
+
+    records = [r for r in caplog.records if r.name == "energydb._io"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].exc_info is None
+    assert out.height == 2  # the sequential fallback returned the data
+
+    client.setup_ch_meta_engine()  # restore the fixture invariant

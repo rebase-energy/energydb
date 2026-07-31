@@ -378,6 +378,37 @@ class _EngineReadError(RuntimeError):
     """
 
 
+# ClickHouse's UNKNOWN_TABLE (error code 60). clickhouse-connect exposes no
+# structured error code -- server errors arrive as a DatabaseError whose message
+# embeds the server text -- so the match is on tokens from that text. The name is
+# the primary marker; the code is a fallback for a server locale/format that
+# omits it.
+_UNKNOWN_TABLE_MARKERS = ("UNKNOWN_TABLE", "Code: 60.")
+
+
+def _is_unknown_table(exc: BaseException | None) -> bool:
+    """True when an engine-read failure is "the engine table does not exist".
+
+    That is a *configuration state*, not an anomaly: any deployment that never
+    provisions the engine table sits in it permanently, and a traceback teaches
+    those operators to silence the log with ``ENERGYDB_DISABLE_ENGINE=1`` --
+    which then hides real engine failures too. Everything else (network, auth,
+    schema drift, CH-side PG connectivity) stays loud.
+
+    Walks the ``__cause__`` / ``__context__`` chain, because the driver may have
+    re-wrapped the server error before it reached us. Depth-bounded so a
+    self-referential chain can't spin.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = str(exc)
+        if any(marker in text for marker in _UNKNOWN_TABLE_MARKERS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def _td_call(
     td,
     *,
@@ -621,20 +652,34 @@ async def execute_read(
         try:
             values = await engine_task
         except _EngineReadError as err:
+            # Strict mode is decided before the classification below: a quieter log
+            # for one cause must never soften "raise instead of degrading".
             if _ENGINE_STRICT:
                 raise (err.__cause__ or err) from None
             client._engine_unavailable = True
-            logger.warning(
-                "energydb: engine-backed read failed for meta-engine table %r "
-                "(ENERGYDB_SCHEMA=%r); falling back to the slower sequential read path "
-                "(higher latency and an extra PostgreSQL round-trip per read) for the rest "
-                "of this session. The usual cause after an upgrade or an ENERGYDB_SCHEMA "
-                "change is a missing or mis-targeted meta-engine table -- (re)provision it "
-                "once with `await client.setup_ch_meta_engine()` (or `create()`).",
-                CH_ENGINE_TABLE,
-                os.environ.get("ENERGYDB_SCHEMA", "public"),
-                exc_info=err.__cause__,
-            )
+            if _is_unknown_table(err.__cause__):
+                # Not provisioned. One line, no traceback -- there is no anomaly to
+                # investigate, just a feature that was never turned on.
+                logger.info(
+                    "energydb: ClickHouse meta-engine table %r not provisioned "
+                    "(ENERGYDB_SCHEMA=%r) -- using sequential reads for this session. "
+                    "Provision it once with `await client.setup_ch_meta_engine()` to "
+                    "enable parallel engine reads.",
+                    CH_ENGINE_TABLE,
+                    os.environ.get("ENERGYDB_SCHEMA", "public"),
+                )
+            else:
+                logger.warning(
+                    "energydb: engine-backed read failed for meta-engine table %r "
+                    "(ENERGYDB_SCHEMA=%r); falling back to the slower sequential read path "
+                    "(higher latency and an extra PostgreSQL round-trip per read) for the rest "
+                    "of this session. The usual cause after an upgrade or an ENERGYDB_SCHEMA "
+                    "change is a missing or mis-targeted meta-engine table -- (re)provision it "
+                    "once with `await client.setup_ch_meta_engine()` (or `create()`).",
+                    CH_ENGINE_TABLE,
+                    os.environ.get("ENERGYDB_SCHEMA", "public"),
+                    exc_info=err.__cause__,
+                )
             # The parallel leg already resolved meta exactly -- fall back to the
             # sequential CH read without paying the resolve again.
         else:
