@@ -454,14 +454,16 @@ class _BaseScope:
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
         skip_unchanged: bool = False,
-        unchanged_scope: UnchangedScope = "valid_time",
+        unchanged_scope: UnchangedScope = "auto",
     ) -> WriteResult:
         """Write time-series data for a single series on this scope's owner.
 
         Builds a 1-route manifest (owner uuid, ``data_type``, ``name``,
         plus optional ``unit``) over ``df`` (pandas or polars) and
         delegates to :meth:`Client.write`. ``skip_unchanged`` /
-        ``unchanged_scope`` are forwarded; see :func:`timedb.write`. Returns a
+        ``unchanged_scope`` are forwarded — the default ``"auto"`` picks the
+        comparison key from this series' registered type, so an OVERLAPPING
+        series keeps its republications; see :meth:`Client.write`. Returns a
         :class:`WriteResult` — an ``int`` run_id carrying ``written`` /
         ``skipped`` counts.
         """

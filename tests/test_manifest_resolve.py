@@ -127,8 +127,61 @@ def test_overlapping_surfaces_in_summary():
     resolved, summary = asyncio.run(resolve_manifest(conn, manifest))
 
     assert summary.has_overlapping is True
+    assert summary.overlapping_series_ids == frozenset({99})
     # series_id attached to every row.
     assert resolved["series_id"].to_list() == [99, 99, 99]
+
+
+def test_summary_names_only_the_overlapping_series_by_uuid_route():
+    """``overlapping_series_ids`` is what lets one write dedupe FLAT and
+    OVERLAPPING series by different keys, so it must name exactly the
+    OVERLAPPING ones — not all resolved series, not just a boolean."""
+    n1, n2, n3 = uuid4(), uuid4(), uuid4()
+    rows = [
+        (str(n1), "actual", "power", 1, "MW", "FLAT", "forever", "P/A"),
+        (str(n2), "forecast", "power", 2, "MW", "OVERLAPPING", "medium", "P/B"),
+        (str(n3), "forecast", "power", 3, "MW", "OVERLAPPING", "medium", "P/C"),
+    ]
+    manifest = pl.DataFrame(
+        {
+            "node_uuid": [str(n1), str(n2), str(n3)],
+            "data_type": ["actual", "forecast", "forecast"],
+            "name": ["power"] * 3,
+        }
+    )
+    _resolved, summary = asyncio.run(resolve_manifest(_mock_conn_with_series(rows), manifest))
+
+    assert summary.overlapping_series_ids == frozenset({2, 3})
+    assert summary.has_overlapping is True
+
+
+def test_summary_names_only_the_overlapping_series_by_path_route():
+    """Same contract on the path route — the ids come from the resolved metadata
+    either way, so both routes must agree."""
+    rows = [
+        ("P/A", "actual", "power", 10, "MW", "FLAT", "forever", str(uuid4())),
+        ("P/B", "forecast", "power", 20, "MW", "OVERLAPPING", "medium", str(uuid4())),
+    ]
+    manifest = pl.DataFrame(
+        {
+            "path": ["P/A", "P/B"],
+            "data_type": ["actual", "forecast"],
+            "name": ["power", "power"],
+        }
+    )
+    _resolved, summary = asyncio.run(resolve_manifest(_mock_conn_with_series(rows), manifest))
+
+    assert summary.overlapping_series_ids == frozenset({20})
+
+
+def test_summary_is_empty_for_a_flat_only_manifest():
+    """Empty set → has_overlapping False → 'auto' behaves exactly like 'valid_time'."""
+    rows = [("P/A", "actual", "power", 10, "MW", "FLAT", "forever", str(uuid4()))]
+    manifest = pl.DataFrame({"path": ["P/A"], "data_type": ["actual"], "name": ["power"]})
+    _resolved, summary = asyncio.run(resolve_manifest(_mock_conn_with_series(rows), manifest))
+
+    assert summary.overlapping_series_ids == frozenset()
+    assert summary.has_overlapping is False
 
 
 def test_unresolved_triple_raises_with_owner_message():

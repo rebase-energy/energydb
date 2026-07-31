@@ -23,7 +23,7 @@ module-level re-export would be a cycle.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -137,6 +137,25 @@ class ManifestError(ValidationError):
     """
 
 
+class UnchangedScopeError(ValidationError):
+    """``skip_unchanged`` was asked for with a comparison key that would lose data.
+
+    Raised when ``unchanged_scope="valid_time"`` is requested explicitly for a
+    manifest containing OVERLAPPING series: that key ignores
+    ``knowledge_time``, so a genuine republication whose values happen to match
+    the previous one would be dropped. ``overlapping_series_ids`` carries the
+    offending series.
+    """
+
+    def __init__(self, message: str, *, overlapping_series_ids: Collection[int] | None = None):
+        super().__init__(message)
+        # Sorted list on the way out: the raise site holds a frozenset, and an
+        # unordered attribute makes for miserable assertions and log lines.
+        self.overlapping_series_ids: list[int] | None = (
+            None if overlapping_series_ids is None else sorted(overlapping_series_ids)
+        )
+
+
 class ConfigurationError(EnergyDBError, ValueError):
     """Client or environment misconfiguration (unusable conninfo, …)."""
 
@@ -168,5 +187,6 @@ __all__ = [
     "NodeNotFoundError",
     "NotFoundError",
     "SeriesNotFoundError",
+    "UnchangedScopeError",
     "ValidationError",
 ]

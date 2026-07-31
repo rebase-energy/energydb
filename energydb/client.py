@@ -760,7 +760,7 @@ class AsyncClient:
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
         skip_unchanged: bool = False,
-        unchanged_scope: UnchangedScope = "valid_time",
+        unchanged_scope: UnchangedScope = "auto",
     ) -> WriteResult:
         """Bulk-write timeseries data via a routing manifest.
 
@@ -771,8 +771,18 @@ class AsyncClient:
         optional ``knowledge_time``). Optional ``unit`` column triggers
         per-row unit conversion to each series's canonical unit.
 
-        ``skip_unchanged`` (with ``unchanged_scope``) drops rows whose latest
-        stored value is unchanged before the insert; see :func:`timedb.write`.
+        ``skip_unchanged`` drops rows whose latest stored value is unchanged
+        before the insert. ``unchanged_scope`` picks the comparison key:
+
+        * ``"auto"`` (default) — per series, using each series' registered
+          type: FLAT compares per ``valid_time``, OVERLAPPING per
+          ``(valid_time, knowledge_time)``. One call handles a mixed manifest;
+          for a FLAT-only manifest it is identical to ``"valid_time"``.
+        * ``"knowledge_time"`` — that key uniformly.
+        * ``"valid_time"`` — that key uniformly. Raises
+          :class:`~energydb.errors.UnchangedScopeError` if the manifest
+          contains OVERLAPPING series, since it would drop their
+          republications.
 
         Series must already be registered (typically via
         :meth:`register_tree`). Returns a :class:`WriteResult` — an ``int``

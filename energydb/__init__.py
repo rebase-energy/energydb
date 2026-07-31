@@ -83,6 +83,7 @@ from energydb.errors import (  # noqa: E402
     NodeNotFoundError,
     NotFoundError,
     SeriesNotFoundError,
+    UnchangedScopeError,
     ValidationError,
 )
 from energydb.scope import EdgeScope, NodeScope  # noqa: E402
@@ -115,6 +116,7 @@ __all__ = [
     "AlreadyExistsError",
     "ValidationError",
     "ManifestError",
+    "UnchangedScopeError",
     "ConfigurationError",
     "IncompatibleUnitError",
     # Core hierarchy

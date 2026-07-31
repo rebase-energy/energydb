@@ -34,10 +34,30 @@ class ResolveSummary(NamedTuple):
     Lifts ``OVERLAPPING`` detection out of the per-row resolved frame — it
     is a property of the *series set*, not the data rows, so paying
     linear-in-rows for it was wasted work. Powers the knowledge_time-
-    required check in :func:`energydb._io.write_manifest`.
+    required check and the per-series ``skip_unchanged`` comparison in
+    :func:`energydb._io.write_manifest`.
+
+    The ids (rather than a bare boolean) are what let one write call dedupe
+    FLAT and OVERLAPPING series by different keys: they become timedb's
+    ``knowledge_time_scoped_series``. Collected while walking the resolved
+    metadata that is already in hand, so no extra DB work.
     """
 
-    has_overlapping: bool
+    overlapping_series_ids: frozenset[int]
+
+    @property
+    def has_overlapping(self) -> bool:
+        """True when any resolved series is ``OVERLAPPING``."""
+        return bool(self.overlapping_series_ids)
+
+
+def _overlapping_ids(hash_to_meta: dict[int, tuple]) -> frozenset[int]:
+    """The ``series_id``s of the OVERLAPPING series in a resolved metadata map.
+
+    Every resolver's meta tuple starts ``(series_id, canonical_unit,
+    timeseries_type, retention, ...)``, so one shape serves all three routes.
+    """
+    return frozenset(m[0] for m in hash_to_meta.values() if m[2] == "OVERLAPPING")
 
 
 # A path is a tuple of names from the tree root.
@@ -542,7 +562,7 @@ async def _resolve_manifest_by_owner(
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
 
     summary = ResolveSummary(
-        has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()),
+        overlapping_series_ids=_overlapping_ids(hash_to_meta),
     )
     return resolved, summary
 
@@ -645,7 +665,7 @@ async def _resolve_manifest_by_path(
     if overlap:
         manifest = manifest.drop(overlap)
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
-    summary = ResolveSummary(has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()))
+    summary = ResolveSummary(overlapping_series_ids=_overlapping_ids(hash_to_meta))
     return resolved, summary
 
 
@@ -767,7 +787,7 @@ async def _resolve_manifest_by_edge_triple(
     if overlap:
         manifest = manifest.drop(overlap)
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
-    summary = ResolveSummary(has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()))
+    summary = ResolveSummary(overlapping_series_ids=_overlapping_ids(hash_to_meta))
     return resolved, summary
 
 

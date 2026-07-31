@@ -31,8 +31,8 @@ from energydb._join import (
     partition_node_by_path,
 )
 from energydb._persist import apply_manifest_unit_conversion
-from energydb.errors import ValidationError
-from energydb.paths import resolve_manifest
+from energydb.errors import UnchangedScopeError, ValidationError
+from energydb.paths import ResolveSummary, resolve_manifest
 from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,28 @@ class WriteResult(int):
         return f"WriteResult(run_id={int(self)}, written={self.written}, skipped={self.skipped})"
 
 
+def _check_unchanged_scope(summary: ResolveSummary, *, skip_unchanged: bool, unchanged_scope: UnchangedScope) -> None:
+    """Reject a uniform ``valid_time`` comparison over OVERLAPPING series.
+
+    That key ignores ``knowledge_time``, so a republication whose values match
+    the previous vintage would be dropped — unrecoverable for a forecast, which
+    is exactly why the series is OVERLAPPING. The caller asked for it
+    explicitly (the default is ``"auto"``), so raising beats silently losing
+    data. No-op unless ``skip_unchanged`` is actually on.
+    """
+    if not skip_unchanged or unchanged_scope != "valid_time":
+        return
+    ids = summary.overlapping_series_ids
+    if not ids:
+        return
+    raise UnchangedScopeError(
+        f'skip_unchanged with unchanged_scope="valid_time" would silently drop republications '
+        f"for {len(ids)} OVERLAPPING series in this manifest. "
+        f'Use unchanged_scope="auto" (per-series, recommended) or "knowledge_time" (uniform).',
+        overlapping_series_ids=ids,
+    )
+
+
 async def write_manifest(
     pool,
     td,
@@ -96,7 +118,7 @@ async def write_manifest(
     run_finish_time: datetime | None = None,
     run_params: dict | None = None,
     skip_unchanged: bool = False,
-    unchanged_scope: UnchangedScope = "valid_time",
+    unchanged_scope: UnchangedScope = "auto",
 ) -> WriteResult:
     """Resolve a manifest's routing → series_id and bulk-write.
 
@@ -105,9 +127,22 @@ async def write_manifest(
     ``unit`` column triggers per-row unit conversion to each series's
     canonical unit.
 
-    ``skip_unchanged`` (and ``unchanged_scope``) are forwarded to
-    :func:`timedb.write`; see that for the comparison semantics. The
-    ``runs`` row is upserted regardless, so an all-skipped write still
+    ``skip_unchanged`` drops rows whose stored value already matches;
+    ``unchanged_scope`` picks the comparison key:
+
+    * ``"auto"`` (default) — per series: FLAT series compare per
+      ``valid_time``, OVERLAPPING series per ``(valid_time, knowledge_time)``,
+      in one call. The resolve already knows each series' type, so the
+      OVERLAPPING ids ride along as timedb's ``knowledge_time_scoped_series``.
+      For a FLAT-only manifest this is identical to ``"valid_time"``.
+    * ``"knowledge_time"`` — that key uniformly, for every series.
+    * ``"valid_time"`` — that key uniformly. **Raises**
+      :class:`~energydb.errors.UnchangedScopeError` when the manifest contains
+      OVERLAPPING series, because ignoring ``knowledge_time`` for them would
+      silently drop genuine republications.
+
+    ``unchanged_scope`` is ignored entirely when ``skip_unchanged`` is false.
+    The ``runs`` row is upserted regardless, so an all-skipped write still
     records a run (with no ``run_series`` mapping). Returns a :class:`WriteResult`
     — an ``int`` run_id carrying ``written`` / ``skipped`` counts.
 
@@ -134,8 +169,9 @@ async def write_manifest(
 
     async with pool.connection() as conn:
         if kt_known:
-            # The OVERLAPPING check cannot fail with knowledge_time known, so
-            # nothing after the resolve statement needs a rollback.
+            # The knowledge_time-required check cannot fire here, so no rollback is
+            # needed for it. The unchanged_scope check *can*, and it runs inside the
+            # try below where the orphan-run compensation covers it.
             await conn.set_autocommit(True)
             try:
                 with profiling._phase(profiling.PHASE_EDB_RESOLVE):
@@ -144,6 +180,10 @@ async def write_manifest(
                         # skip the hierarchy JOIN. ``run`` folds the runs upsert into
                         # the resolve statement on every route (one round-trip).
                         resolved, summary = await resolve_manifest(conn, df, attach_path=False, run=run)
+                        # Only answerable after resolve, and on this path the folded
+                        # runs upsert has already committed — so it must raise inside
+                        # this block to get the same orphan-row compensation.
+                        _check_unchanged_scope(summary, skip_unchanged=skip_unchanged, unchanged_scope=unchanged_scope)
                     except Exception:
                         # The folded runs-upsert CTE committed with the statement;
                         # don't leave the orphan row behind a client-side resolve
@@ -166,6 +206,9 @@ async def write_manifest(
                     "knowledge_time is required for OVERLAPPING series; "
                     "pass knowledge_time as a kwarg or as a 'knowledge_time' column on the manifest."
                 )
+            # No _check_unchanged_scope here: it can only fire when the manifest has
+            # OVERLAPPING series, which the check above already rejects on this path.
+            # Either way the raise precedes the commit, so the run row rolls back.
 
             with profiling._phase(profiling.PHASE_EDB_COMMIT):
                 await conn.commit()
@@ -182,12 +225,16 @@ async def write_manifest(
     # orphaned runs row but no PG inconsistency — detectable by run_id. TimeDB is
     # synchronous (clickhouse-connect), so offload the CH leg to a worker thread
     # to keep the event loop free.
+    # timedb needs the id set only for the per-series ("auto") comparison, and
+    # rejects it alongside any other scope — pass it exactly when it applies.
+    kt_scoped = summary.overlapping_series_ids if (skip_unchanged and unchanged_scope == "auto") else None
     counts = await asyncio.to_thread(
         td.write,
         write_df,
         knowledge_time=knowledge_time,
         skip_unchanged=skip_unchanged,
         unchanged_scope=unchanged_scope,
+        knowledge_time_scoped_series=kt_scoped,
     )
     return WriteResult(rid, counts.written, counts.skipped)
 
