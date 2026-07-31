@@ -68,7 +68,7 @@ from timedatamodel import (  # noqa: E402
     TimeSeriesType,
 )
 
-from energydb._io import WriteResult  # noqa: E402
+from energydb._io import ReadResult, WriteResult  # noqa: E402
 from energydb._join import EdgeSeriesKey, SeriesKey, find  # noqa: E402
 from energydb._sync import Client  # noqa: E402
 from energydb._transaction import Transaction  # noqa: E402
@@ -96,6 +96,7 @@ __all__ = [
     "NodeScope",
     "EdgeScope",
     "Transaction",
+    "ReadResult",
     "WriteResult",
     # By-path result keys
     "SeriesKey",

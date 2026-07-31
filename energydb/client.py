@@ -27,7 +27,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -43,13 +43,21 @@ from timedb import TimeDBClient, UnchangedScope, profiling
 from energydb import runs as runs_mod
 from energydb._ch_meta_engine import DROP_ENGINE_TABLE, DROP_LEGACY_ENGINE_TABLE, engine_table_ddl
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, autocommit_read_conn, engine_meta_for_manifest, execute_read, write_manifest
+from energydb._io import (
+    ReadResult,
+    WriteResult,
+    autocommit_read_conn,
+    engine_meta_for_manifest,
+    execute_read,
+    write_manifest,
+)
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
 from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
 from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
 from energydb.paths import (
+    OnMissing,
     Path,
     _like_escape,
     build_filter_conditions,
@@ -818,6 +826,7 @@ class AsyncClient:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
+        on_missing: OnMissing = "raise",
     ) -> (
         pl.DataFrame
         | pd.DataFrame
@@ -825,6 +834,7 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | ReadResult
     ):
         """Bulk read via manifest. Detects edge vs node routing automatically.
 
@@ -862,10 +872,22 @@ class AsyncClient:
         ``backend="pandas"`` converts at the boundary. Internal
         identifiers (``series_id``, ``node_uuid``, ``edge_uuid``) are
         never exposed on the result.
+
+        **``on_missing`` changes the return type.** With the default
+        ``"raise"``, an unregistered ``(owner, data_type, name)`` triple fails
+        the whole call with
+        :class:`~energydb.errors.SeriesNotFoundError` (naming every unresolved
+        triple) and the return value is as described above. With ``"skip"``,
+        those triples are dropped from the read and the call returns a
+        :class:`ReadResult` — ``(data, missing)`` — so one unregistered series
+        can't cost you a 1,500-series batch, and you still learn which ones were
+        skipped. Only unregistered series are affected: a structurally invalid
+        manifest (missing/ambiguous routing column, wrong dtype, null routing
+        value) raises either way.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result, _n_series = await execute_read(
+        result, _n_series, missing = await execute_read(
             self._pool,
             self.td,
             self,
@@ -878,10 +900,11 @@ class AsyncClient:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            on_missing=on_missing,
             output=output,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
-            return to_backend(result, backend)
+            return self._with_missing(result, missing, backend=backend, on_missing=on_missing)
 
     async def read_relative(
         self,
@@ -890,6 +913,7 @@ class AsyncClient:
         unit: str | None = None,
         output: Output = "frame",
         backend: Backend = "polars",
+        on_missing: OnMissing = "raise",
         **td_kwargs,
     ) -> (
         pl.DataFrame
@@ -898,16 +922,19 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | ReadResult
     ):
         """Bulk relative read via manifest.
 
-        See :meth:`read` for the ``output`` / ``backend`` contract.
+        See :meth:`read` for the ``output`` / ``backend`` contract, and for
+        ``on_missing`` — which switches the return type to
+        :class:`ReadResult` when set to ``"skip"``, exactly as it does there.
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result, _n_series = await execute_read(
+        result, _n_series, missing = await execute_read(
             self._pool,
             self.td,
             self,
@@ -916,10 +943,40 @@ class AsyncClient:
             relative=True,
             unit=unit,
             output=output,
+            on_missing=on_missing,
             td_kwargs=td_kwargs,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
-            return to_backend(result, backend)
+            return self._with_missing(result, missing, backend=backend, on_missing=on_missing)
+
+    @staticmethod
+    def _with_missing(
+        result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame],
+        missing: pl.DataFrame,
+        *,
+        backend: Backend,
+        on_missing: OnMissing,
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+        | ReadResult
+    ):
+        """Convert a read to ``backend``, wrapping it iff ``on_missing="skip"``.
+
+        The return-type switch lives in one place so :meth:`read` and
+        :meth:`read_relative` can't drift apart on it.
+        """
+        data = to_backend(result, backend)
+        if on_missing == "skip":
+            # ``missing`` is always a plain frame, never the by_path dict shape,
+            # but ``to_backend`` is typed for the whole read-result union — narrow
+            # it back before it lands on ``ReadResult.missing``.
+            return ReadResult(data, cast("pl.DataFrame | pd.DataFrame", to_backend(missing, backend)))
+        return data
 
     # ------------------------------------------------------------------
     # Runs

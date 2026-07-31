@@ -537,7 +537,10 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
-        result, n_series = await execute_read(
+        # Scope reads route by subtree, not by a manifest: "nothing matched"
+        # already returns an empty result rather than raising, so there is no
+        # ``on_missing`` to expose and the third element is always empty.
+        result, n_series, _missing = await execute_read(
             self._pool,
             self._td,
             self._client,
@@ -579,7 +582,7 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read_relative")
-        result, n_series = await execute_read(
+        result, n_series, _missing = await execute_read(
             self._pool,
             self._td,
             self._client,

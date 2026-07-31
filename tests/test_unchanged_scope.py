@@ -24,8 +24,11 @@ from energydb._io import _check_unchanged_scope
 from energydb.errors import UnchangedScopeError, ValidationError
 from energydb.paths import ResolveSummary
 
-FLAT_ONLY = ResolveSummary(overlapping_series_ids=frozenset())
-MIXED = ResolveSummary(overlapping_series_ids=frozenset({7, 9}))
+# ``missing`` is the on_missing="skip" report; irrelevant to scope selection, so
+# these summaries carry the empty frame a fully-resolved manifest produces.
+NOTHING_MISSING = pl.DataFrame(schema={"path": pl.Utf8, "data_type": pl.Utf8, "name": pl.Utf8})
+FLAT_ONLY = ResolveSummary(overlapping_series_ids=frozenset(), missing=NOTHING_MISSING)
+MIXED = ResolveSummary(overlapping_series_ids=frozenset({7, 9}), missing=NOTHING_MISSING)
 
 
 # ---------------------------------------------------------------------------

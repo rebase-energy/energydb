@@ -16,9 +16,13 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, NamedTuple
 
 import polars as pl
 from timedb import PgEngineMeta, UnchangedScope, profiling
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from energydb import runs as runs_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
@@ -32,7 +36,7 @@ from energydb._join import (
 )
 from energydb._persist import apply_manifest_unit_conversion
 from energydb.errors import UnchangedScopeError, ValidationError
-from energydb.paths import ResolveSummary, resolve_manifest
+from energydb.paths import OnMissing, ResolveSummary, _check_on_missing, resolve_manifest
 from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,37 @@ class WriteResult(int):
 
     def __repr__(self) -> str:
         return f"WriteResult(run_id={int(self)}, written={self.written}, skipped={self.skipped})"
+
+
+class ReadResult(NamedTuple):
+    """A read's data plus the manifest triples that resolved to no series.
+
+    Returned by :meth:`~energydb.AsyncClient.read` /
+    :meth:`~energydb.AsyncClient.read_relative` **only** when
+    ``on_missing="skip"`` — the default (``"raise"``) returns ``data`` bare, so
+    existing callers never see this type. Opting in is new code by definition,
+    which is what makes the changed return shape safe.
+
+    ``data`` is exactly what the same call would return without ``on_missing``
+    (honouring ``output`` and ``backend``, including the empty shapes).
+    ``missing`` holds the unique unresolvable triples — the manifest's routing
+    column(s) plus ``data_type`` / ``name``, ``Utf8`` throughout (uuids
+    stringified), zero-row with the right schema when everything resolved. It
+    follows ``backend`` like ``data`` does.
+
+    A :class:`~typing.NamedTuple`, so ``data, missing = await client.read(...)``
+    unpacks — mirroring :class:`WriteResult`'s enriched-but-simple shape.
+    """
+
+    data: (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+    )
+    missing: pl.DataFrame | pd.DataFrame
 
 
 def _check_unchanged_scope(summary: ResolveSummary, *, skip_unchanged: bool, unchanged_scope: UnchangedScope) -> None:
@@ -483,8 +518,9 @@ async def execute_read(
     end_known: datetime | None = None,
     include_updates: bool = False,
     include_knowledge_time: bool = False,
+    on_missing: OnMissing = "raise",
     td_kwargs: dict | None = None,
-) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int]:
+) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int, pl.DataFrame]:
     """The one read pipeline: resolve meta, read values from CH, finish.
 
     Callers hand in exactly one of:
@@ -511,13 +547,22 @@ async def execute_read(
     degrades (``client._engine_unavailable``) and the read falls back to the
     sequential path; resolve/user errors propagate unchanged.
 
+    ``on_missing="skip"`` (``manifest=`` only) reads past manifest triples with
+    no registered series instead of failing the whole batch; they come back in
+    the third return element.
+
     ``relative`` picks ``td.read_relative`` (window args in ``td_kwargs``) over
-    ``td.read`` (explicit bitemporal args). Returns ``(result, n_series)``.
+    ``td.read`` (explicit bitemporal args). Returns
+    ``(result, n_series, missing)``, where ``missing`` is the unresolved-triple
+    frame from the resolve — always zero-row under the default ``"raise"``, and
+    schema-less for ``resolve=`` callers, which route by subtree rather than by
+    a manifest and so have no routing column to report.
     """
     if (resolve is None) == (manifest is None):
         raise ValidationError("execute_read requires exactly one of resolve= or manifest=.")
     if output not in {"frame", "by_path"}:
         raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
+    _check_on_missing(on_missing)
 
     kwargs = (
         dict(td_kwargs or {})
@@ -532,19 +577,24 @@ async def execute_read(
         }
     )
 
+    # ``missing`` is set by the resolve leg and read by every return path below.
+    missing = pl.DataFrame()
+
     async def _resolve_meta() -> pl.DataFrame | None:
+        nonlocal missing
         if resolve is not None:
             return await resolve()
         assert manifest is not None
         is_edge = "edge_uuid" in manifest.columns or all(c in manifest.columns for c in _EDGE_TRIPLE_COLS)
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             async with autocommit_read_conn(pool) as conn:
-                resolved, _summary = await resolve_manifest(conn, manifest)
+                resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing)
+        missing = summary.missing
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
             return _project_meta(resolved, is_edge=is_edge)
 
-    def _empty() -> tuple[pl.DataFrame | dict, int]:
-        return ({} if output == "by_path" else pl.DataFrame()), 0
+    def _empty() -> tuple[pl.DataFrame | dict, int, pl.DataFrame]:
+        return ({} if output == "by_path" else pl.DataFrame()), 0, missing
 
     # Build the predicate only if the engine is actually usable this session.
     meta_source = engine_meta() if (engine_meta is not None and not client._engine_unavailable) else None
@@ -594,18 +644,18 @@ async def execute_read(
             # the exact PG resolve before unit conversion / label attach.
             trim = meta.select(pl.col("series_id").cast(pl.UInt64)).unique()
             values = values.join(trim, on="series_id", how="semi")
-            return _finish_read(pool, values, meta, unit=unit, output=output), meta.height
+            return _finish_read(pool, values, meta, unit=unit, output=output), meta.height, missing
 
         if meta is None or meta.height == 0:
             return _empty()
         call = _td_call(td, relative=relative, kwargs=kwargs)
-        return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height
+        return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height, missing
 
     meta = await _resolve_meta()
     if meta is None or meta.height == 0:
         return _empty()
     call = _td_call(td, relative=relative, kwargs=kwargs)
-    return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height
+    return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height, missing
 
 
 def apply_per_series_unit(

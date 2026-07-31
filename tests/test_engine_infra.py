@@ -165,7 +165,7 @@ def test_engine_predicate_is_not_built_when_the_engine_is_unavailable():
         calls.append(1)
         raise AssertionError("the engine predicate must not be built when the engine is off")
 
-    _result, n_series = asyncio.run(
+    _result, n_series, missing = asyncio.run(
         execute_read(
             None,
             None,
@@ -176,6 +176,8 @@ def test_engine_predicate_is_not_built_when_the_engine_is_unavailable():
     )
     assert calls == []
     assert n_series == 0
+    # Scope-style ``resolve=`` reads have no manifest, so nothing to report.
+    assert missing.is_empty()
 
 
 def test_engine_predicate_is_built_once_when_the_engine_is_available():
@@ -187,7 +189,7 @@ def test_engine_predicate_is_built_once_when_the_engine_is_available():
         calls.append(1)
         return None
 
-    _result, n_series = asyncio.run(
+    _result, n_series, missing = asyncio.run(
         execute_read(
             None,
             None,
@@ -198,6 +200,7 @@ def test_engine_predicate_is_built_once_when_the_engine_is_available():
     )
     assert calls == [1]
     assert n_series == 0
+    assert missing.is_empty()
 
 
 # ---------------------------------------------------------------------------

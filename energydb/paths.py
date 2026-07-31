@@ -13,7 +13,8 @@ which is the upsert key on :class:`energydb.models.Edge`).
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from collections.abc import Sequence
+from typing import Any, Literal, NamedTuple
 from uuid import UUID
 
 import polars as pl
@@ -26,6 +27,18 @@ from energydb.errors import (
     ValidationError,
 )
 from energydb.runs import RunRow, run_upsert_cte
+
+# What to do with a manifest triple that has no registered series. ``"raise"``
+# is the default everywhere; ``"skip"`` is opt-in on reads only (writes must
+# never silently drop rows — that would be data loss).
+OnMissing = Literal["raise", "skip"]
+_ON_MISSING_VALUES = ("raise", "skip")
+
+
+def _check_on_missing(on_missing: str) -> None:
+    """Reject a typo before it silently becomes ``"skip"``-like behaviour."""
+    if on_missing not in _ON_MISSING_VALUES:
+        raise ValidationError(f"on_missing must be one of {list(_ON_MISSING_VALUES)}, got {on_missing!r}")
 
 
 class ResolveSummary(NamedTuple):
@@ -41,14 +54,68 @@ class ResolveSummary(NamedTuple):
     FLAT and OVERLAPPING series by different keys: they become timedb's
     ``knowledge_time_scoped_series``. Collected while walking the resolved
     metadata that is already in hand, so no extra DB work.
+
+    ``missing`` carries the manifest triples that resolved to no series —
+    always present, and zero-row (with the route's column schema) unless
+    ``on_missing="skip"`` actually dropped something. Riding on the summary
+    keeps the resolver's ``(resolved, summary)`` return arity stable.
     """
 
     overlapping_series_ids: frozenset[int]
+    missing: pl.DataFrame
 
     @property
     def has_overlapping(self) -> bool:
         """True when any resolved series is ``OVERLAPPING``."""
         return bool(self.overlapping_series_ids)
+
+
+def _resolvable_keys(hash_to_meta: dict[int, tuple]) -> pl.DataFrame:
+    """A ``_triple_k`` frame to semi-join a manifest down to its resolved rows.
+
+    A frame rather than ``is_in``: the key dtype stays explicit (so the empty
+    everything-was-missing case needs no special-casing) and it reuses the
+    ``_triple_k`` join the resolvers already run on.
+    """
+    return pl.DataFrame({"_triple_k": list(hash_to_meta)}, schema={"_triple_k": pl.UInt64})
+
+
+def _missing_frame(cols: Sequence[str], rows: Sequence[tuple[str, ...]]) -> pl.DataFrame:
+    """The unresolved routing triples as a ``Utf8`` frame keyed by ``cols``.
+
+    ``rows`` come from the resolver's deduplicated triple set, so the frame is
+    already unique. Zero-row (correct schema, never a schema-less empty frame)
+    when everything resolved — callers can select/join on it unconditionally.
+    """
+    return pl.DataFrame(
+        {c: [r[i] for r in rows] for i, c in enumerate(cols)},
+        schema={c: pl.Utf8 for c in cols},
+    )
+
+
+# How many unresolved triples the error message spells out before truncating.
+_MISSING_PREVIEW = 5
+
+
+def _series_not_found_error(
+    *, route: str, cols: Sequence[str], unresolved: Sequence[tuple[str, ...]]
+) -> SeriesNotFoundError:
+    """Build the all-triples :class:`SeriesNotFoundError` for a failed resolve.
+
+    The resolvers used to raise on the *first* unresolvable triple, so a
+    manifest of 1,500 series reported one gap per retry. The message now leads
+    with that same first-triple sentence (callers match on the
+    ``Series not registered for <route>=…`` prefix), then names the total and
+    spells out up to :data:`_MISSING_PREVIEW` of them; ``.missing`` on the
+    exception carries every one structurally.
+    """
+    rendered = [", ".join(f"{c}={v!r}" for c, v in zip(cols, t, strict=True)) for t in unresolved[:_MISSING_PREVIEW]]
+    message = f"Series not registered for {rendered[0]}."
+    if len(unresolved) > 1:
+        rest, remaining = rendered[1:], len(unresolved) - 1
+        truncated = f" ({len(rest)} of {remaining} shown)" if remaining > len(rest) else ""
+        message += f" {len(unresolved)} triples in this manifest are unresolved; also {'; '.join(rest)}{truncated}."
+    return SeriesNotFoundError(message, route=route, missing=unresolved)
 
 
 def _overlapping_ids(hash_to_meta: dict[int, tuple]) -> frozenset[int]:
@@ -311,10 +378,18 @@ _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 # Edge-triple routing: all three columns must be present together, resolved
 # server-side the same way node ``path`` is.
 _MANIFEST_EDGE_TRIPLE = ("from_path", "to_path", "edge_type")
+# The edge-triple route's identity is the whole quintuple, so its unresolved-key
+# reporting carries all five columns where the single-column routes carry three.
+_MISSING_EDGE_COLS = (*_MANIFEST_EDGE_TRIPLE, "data_type", "name")
 
 
 async def resolve_manifest(
-    conn, manifest: pl.DataFrame, *, attach_path: bool = True, run: RunRow | None = None
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    attach_path: bool = True,
+    run: RunRow | None = None,
+    on_missing: OnMissing = "raise",
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
@@ -340,7 +415,21 @@ async def resolve_manifest(
     attach steps don't need another PG round-trip. ``attach_path=False``
     skips that JOIN entirely — write pipelines drop those columns before
     the CH insert and don't need them.
+
+    ``on_missing`` governs unregistered series only:
+
+    * ``"raise"`` (default) — :class:`~energydb.errors.SeriesNotFoundError`
+      naming *every* unresolved triple, not just the first one hit.
+    * ``"skip"`` — unresolved rows are dropped from the resolved frame and
+      reported on ``summary.missing``, so one unregistered series can't fail a
+      1,500-series read. Read pipelines only; the write pipeline never passes
+      it, because silently dropping writes is data loss.
+
+    Structural problems (missing/ambiguous routing column, wrong dtype, null
+    routing values, missing ``data_type``/``name``) raise either way — they are
+    caller bugs, not catalog gaps.
     """
+    _check_on_missing(on_missing)
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
     # The edge triple is a single route spread across three columns. Treat it as
     # present only when all three are given; a strict subset is a usage error.
@@ -372,18 +461,24 @@ async def resolve_manifest(
     # call, folded into the resolve statement as a data-modifying CTE — every
     # route resolves in ONE round-trip.
     if route == "edge_uuid":
-        return await _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path, run=run)
+        return await _resolve_manifest_by_owner(
+            conn, manifest, owner_col="edge_uuid", attach_path=attach_path, run=run, on_missing=on_missing
+        )
     if route == "edge_triple":
         # A single ``edge ⋈ node ⋈ node ⋈ series`` query keyed by the endpoint
         # paths + edge_type. Always attaches ``edge_uuid`` so downstream edge
         # detection and projection work like the ``edge_uuid`` route.
-        return await _resolve_manifest_by_edge_triple(conn, manifest, run=run, attach_path=attach_path)
+        return await _resolve_manifest_by_edge_triple(
+            conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing
+        )
     if route == "path":
         # A single ``node ⋈ series`` query keyed by the materialized path.
         # ``attach_path=True`` (reads) also surfaces ``node_uuid`` on the
         # resolved frame for the post-read hierarchy attach.
-        return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path)
-    return await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path, run=run)
+        return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing)
+    return await _resolve_manifest_by_owner(
+        conn, manifest, owner_col="node_uuid", attach_path=attach_path, run=run, on_missing=on_missing
+    )
 
 
 def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -422,6 +517,7 @@ async def _resolve_manifest_by_owner(
     owner_col: str,
     attach_path: bool,
     run: RunRow | None = None,
+    on_missing: OnMissing = "raise",
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
     against the series table.
@@ -514,17 +610,20 @@ async def _resolve_manifest_by_owner(
         triple_to_meta[(owner, dt, name)] = (sid, unit, ts_type, retention, *paths)
 
     unresolved = [t for t in miss_triples if t not in triple_to_meta]
-    if unresolved:
-        owner, dt, name = unresolved[0]
-        raise SeriesNotFoundError(
-            f"Series not registered for {owner_col}={owner!r}, data_type={dt!r}, name={name!r}.",
-            route=owner_col,
-            missing=unresolved,
-        )
+    if unresolved and on_missing == "raise":
+        raise _series_not_found_error(route=owner_col, cols=(owner_col, "data_type", "name"), unresolved=unresolved)
 
     hash_to_meta: dict[int, tuple] = {
-        hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        hash_val: triple_to_meta[triple]
+        for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        if triple in triple_to_meta
     }
+    if unresolved:
+        # ``on_missing="skip"``: drop the unresolvable rows *before* the join.
+        # The left-join would otherwise leave them carrying a null ``series_id``
+        # and ``_project_meta``'s ``.unique()`` would emit a null-id series into
+        # the read.
+        manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
 
     # 4. Build the per-hash lookup frame and attach via a single left-join.
     ks: list[int] = list(hash_to_meta.keys())
@@ -563,12 +662,18 @@ async def _resolve_manifest_by_owner(
 
     summary = ResolveSummary(
         overlapping_series_ids=_overlapping_ids(hash_to_meta),
+        missing=_missing_frame((owner_col, "data_type", "name"), unresolved),
     )
     return resolved, summary
 
 
 async def _resolve_manifest_by_path(
-    conn, manifest: pl.DataFrame, *, run: RunRow | None = None, attach_path: bool = False
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    run: RunRow | None = None,
+    attach_path: bool = False,
+    on_missing: OnMissing = "raise",
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a path-routed manifest to series in ONE round-trip.
 
@@ -633,17 +738,17 @@ async def _resolve_manifest_by_path(
         triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention, node_uuid)
 
     unresolved = [t for t in miss_triples if t not in triple_to_meta]
-    if unresolved:
-        path, dt, name = unresolved[0]
-        raise SeriesNotFoundError(
-            f"Series not registered for path={path!r}, data_type={dt!r}, name={name!r}.",
-            route="path",
-            missing=unresolved,
-        )
+    if unresolved and on_missing == "raise":
+        raise _series_not_found_error(route="path", cols=("path", "data_type", "name"), unresolved=unresolved)
 
     hash_to_meta: dict[int, tuple] = {
-        hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        hash_val: triple_to_meta[triple]
+        for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        if triple in triple_to_meta
     }
+    if unresolved:
+        # ``on_missing="skip"`` — see the note in ``_resolve_manifest_by_owner``.
+        manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
     metas = list(hash_to_meta.values())
     lookup_data: dict[str, list] = {
         "_triple_k": list(hash_to_meta.keys()),
@@ -665,12 +770,20 @@ async def _resolve_manifest_by_path(
     if overlap:
         manifest = manifest.drop(overlap)
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
-    summary = ResolveSummary(overlapping_series_ids=_overlapping_ids(hash_to_meta))
+    summary = ResolveSummary(
+        overlapping_series_ids=_overlapping_ids(hash_to_meta),
+        missing=_missing_frame(("path", "data_type", "name"), unresolved),
+    )
     return resolved, summary
 
 
 async def _resolve_manifest_by_edge_triple(
-    conn, manifest: pl.DataFrame, *, run: RunRow | None = None, attach_path: bool = False
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    run: RunRow | None = None,
+    attach_path: bool = False,
+    on_missing: OnMissing = "raise",
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve an edge-triple-routed manifest to series in ONE round-trip.
 
@@ -754,18 +867,17 @@ async def _resolve_manifest_by_edge_triple(
         quint_to_meta[(fp, tp, et, dt, name)] = (sid, unit, ts_type, retention, edge_uuid)
 
     unresolved = [q for q in miss_quints if q not in quint_to_meta]
-    if unresolved:
-        fp, tp, et, dt, name = unresolved[0]
-        raise SeriesNotFoundError(
-            f"Series not registered for from_path={fp!r}, to_path={tp!r}, "
-            f"edge_type={et!r}, data_type={dt!r}, name={name!r}.",
-            route="edge_triple",
-            missing=unresolved,
-        )
+    if unresolved and on_missing == "raise":
+        raise _series_not_found_error(route="edge_triple", cols=_MISSING_EDGE_COLS, unresolved=unresolved)
 
     hash_to_meta: dict[int, tuple] = {
-        hash_val: quint_to_meta[quint] for hash_val, quint in zip(miss_keys, miss_quints, strict=True)
+        hash_val: quint_to_meta[quint]
+        for hash_val, quint in zip(miss_keys, miss_quints, strict=True)
+        if quint in quint_to_meta
     }
+    if unresolved:
+        # ``on_missing="skip"`` — see the note in ``_resolve_manifest_by_owner``.
+        manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
     metas = list(hash_to_meta.values())
     lookup_df = pl.DataFrame(
         {
@@ -787,11 +899,15 @@ async def _resolve_manifest_by_edge_triple(
     if overlap:
         manifest = manifest.drop(overlap)
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
-    summary = ResolveSummary(overlapping_series_ids=_overlapping_ids(hash_to_meta))
+    summary = ResolveSummary(
+        overlapping_series_ids=_overlapping_ids(hash_to_meta),
+        missing=_missing_frame(_MISSING_EDGE_COLS, unresolved),
+    )
     return resolved, summary
 
 
 __all__ = [
+    "OnMissing",
     "Path",
     "ResolveSummary",
     "resolve_edge_uuid",

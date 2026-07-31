@@ -182,6 +182,10 @@ def test_summary_is_empty_for_a_flat_only_manifest():
 
     assert summary.overlapping_series_ids == frozenset()
     assert summary.has_overlapping is False
+    # ``missing`` is always present — zero-row, with the route's schema — so a
+    # caller can select on it without first checking whether anything was skipped.
+    assert summary.missing.is_empty()
+    assert summary.missing.columns == ["path", "data_type", "name"]
 
 
 def test_unresolved_triple_raises_with_owner_message():
