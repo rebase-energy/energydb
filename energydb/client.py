@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 import pandas as pd
 import polars as pl
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
@@ -74,9 +75,36 @@ from energydb.paths import (
 from energydb.scope import EdgeScope, NodeScope, _coerce_path
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
-_SEARCH_PATH = f"SET search_path TO {SCHEMA}, public" if SCHEMA else "SET search_path TO public"
-
 logger = logging.getLogger(__name__)
+
+
+def _pool_conninfo(conninfo: str) -> str:
+    """``conninfo`` plus a startup ``options`` carrying energydb's search path.
+
+    The search path used to be a ``SET`` + ``commit()`` in the pool's ``configure``
+    callback — one extra round-trip on every checkout (the commit was needed
+    because an uncommitted ``SET`` leaves the connection in a transaction, which
+    ``psycopg_pool`` rejects). As a libpq startup option it travels in the startup
+    packet instead: set once per connection, zero per-checkout cost.
+
+    Only the pool sees this. ``self._dsn`` keeps the caller's URI, because
+    :meth:`AsyncClient._sqlalchemy_url`, :func:`engine_table_ddl` and
+    :meth:`AsyncClient._safe_dsn` all parse it as one and ``make_conninfo``
+    emits key=value.
+
+    A caller's own ``options`` are preserved and appended to, never clobbered.
+    The search path itself mirrors the previous ``SET`` exactly: ``"{schema},
+    public"`` for a named schema, plain ``"public"`` by default (rather than
+    ``public,public``, which would make ``SHOW search_path`` confusing).
+
+    Caveat: startup options travel in the libpq startup packet, so a connection
+    pooler in transaction-pooling mode may not honour them per-client. energydb's
+    supported deployments (direct PostgreSQL / Neon) do.
+    """
+    search_path = f"{SCHEMA},public" if SCHEMA else "public"
+    existing = conninfo_to_dict(conninfo).get("options") or ""
+    options = f"{existing} -c search_path={search_path}".strip() if existing else f"-c search_path={search_path}"
+    return make_conninfo(conninfo, options=options)
 
 
 class AsyncClient:
@@ -117,16 +145,17 @@ class AsyncClient:
         self._dsn = conninfo
 
         async def _configure(conn):
-            await conn.execute(_SEARCH_PATH)
             # ``prepare_threshold=1`` makes psycopg cache a server-side
             # prepared statement after the first execution of each SQL text.
             # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
             # (PG parse+plan stage skipped on subsequent calls).
+            # Client-side attribute only: no round-trip, no transaction opened,
+            # hence no commit (the search path now rides the startup packet —
+            # see :func:`_pool_conninfo`).
             conn.prepare_threshold = 1
-            await conn.commit()
 
         self._pool = AsyncConnectionPool(
-            conninfo=conninfo,
+            conninfo=_pool_conninfo(conninfo),
             min_size=1,
             max_size=10,
             open=False,
