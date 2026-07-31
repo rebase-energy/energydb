@@ -340,6 +340,10 @@ class _BaseScope:
     def _engine_meta(self, *, data_type: str | None, name: str | None) -> PgEngineMeta | None:
         """The engine-table predicate for this scope's read, or ``None`` when the scope
         can't be expressed server-side (the read then runs sequentially).
+
+        Called lazily: :func:`execute_read` receives this as a thunk and invokes
+        it only once the session's engine is known to be available, so an
+        implementation never runs on an engine-disabled session.
         """
         raise NotImplementedError
 
@@ -536,7 +540,7 @@ class _BaseScope:
             self._td,
             self._client,
             resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
-            engine_meta=self._engine_meta(data_type=data_type, name=name),
+            engine_meta=lambda: self._engine_meta(data_type=data_type, name=name),
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -578,7 +582,7 @@ class _BaseScope:
             self._td,
             self._client,
             resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
-            engine_meta=self._engine_meta(data_type=data_type, name=name),
+            engine_meta=lambda: self._engine_meta(data_type=data_type, name=name),
             relative=True,
             unit=unit,
             output=output,

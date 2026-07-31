@@ -359,9 +359,18 @@ def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
     superset of the manifest's triples; :func:`execute_read` trims values
     against the exactly-resolved meta, so correctness never depends on it.
 
-    Returns ``None`` for anything the engine can't cleanly express (missing or
-    null-carrying columns, non-Utf8 paths) — the read then runs sequentially
-    and ``resolve_manifest`` surfaces the proper error.
+    Returns ``None`` for anything the engine can't cleanly express — missing or
+    null-carrying columns, and non-Utf8 ``path`` / edge-triple columns — so the
+    read runs sequentially and ``resolve_manifest`` surfaces the proper error.
+    The ``node_uuid`` / ``edge_uuid`` routes accept *any* representation of a
+    uuid (``Utf8``, an ``Object`` column of :class:`uuid.UUID`, anything
+    ``str()``-able) and stay engine-eligible: they are the routes callers reach
+    for most, so degrading them to the sequential path would be an invisible
+    performance regression.
+
+    Total by construction — never raises. Callers rely on that: a crash here
+    would break ``read()`` outright, including for sessions that never take the
+    engine path.
     """
     if "data_type" not in manifest.columns or "name" not in manifest.columns:
         return None
@@ -387,11 +396,24 @@ def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
         return None
     route = routes[0]
     col = manifest[route]
-    if col.null_count() or (route == "path" and col.dtype != pl.Utf8):
-        return None
-    owners = tuple(str(v) for v in col.unique().to_list())
     if route == "path":
-        return PgEngineMeta(table=CH_ENGINE_TABLE, paths=owners, data_type=dts, name=names)
+        # Paths keep their Utf8-only contract: a non-string path is a caller
+        # error that resolve_manifest reports properly, so degrade here rather
+        # than guess at a stringification.
+        if col.null_count() or col.dtype != pl.Utf8:
+            return None
+        paths = tuple(dict.fromkeys(col.to_list()))
+        return PgEngineMeta(table=CH_ENGINE_TABLE, paths=paths, data_type=dts, name=names)
+
+    # uuid routes: normalize to strings *before* deduplicating. ``to_list()``
+    # works for every dtype (including the ``Object`` column a manifest of
+    # ``uuid.UUID`` produces, which ``unique()`` cannot handle), and
+    # ``dict.fromkeys`` dedupes dtype-independently in first-seen order.
+    # ``null_count()`` is unreliable on ``Object``, hence the explicit scan.
+    raw = col.to_list()
+    if any(v is None for v in raw):
+        return None
+    owners = tuple(dict.fromkeys(str(v) for v in raw))
     if route == "node_uuid":
         return PgEngineMeta(table=CH_ENGINE_TABLE, node_uuids=owners, data_type=dts, name=names)
     return PgEngineMeta(table=CH_ENGINE_TABLE, edge_uuids=owners, data_type=dts, name=names)
@@ -404,7 +426,7 @@ async def execute_read(
     *,
     resolve: Callable[[], Awaitable[pl.DataFrame | None]] | None = None,
     manifest: pl.DataFrame | None = None,
-    engine_meta: PgEngineMeta | None = None,
+    engine_meta: Callable[[], PgEngineMeta | None] | None = None,
     relative: bool = False,
     unit: str | None = None,
     output: str = "frame",
@@ -427,13 +449,20 @@ async def execute_read(
       ``Client.read_relative``), resolved via :func:`resolve_manifest` +
       :func:`_project_meta`.
 
-    When ``engine_meta`` is given and the session's engine is healthy, the PG
-    resolve runs **in parallel** with a CH value read that self-resolves its
-    ``series_id`` set through the PostgreSQL engine table; values are then
-    trimmed against the exact resolve (engine predicates may be supersets) and
-    joined client-side — byte-identical to the sequential path. On an engine
-    failure the session degrades (``client._engine_unavailable``) and the read
-    falls back to the sequential path; resolve/user errors propagate unchanged.
+    ``engine_meta`` is a zero-arg **factory** for the engine predicate, not the
+    predicate itself: it is invoked only once this function has confirmed the
+    session's engine is available, so an engine-disabled session never pays for
+    a value it would discard. A factory rather than a caller-side guard keeps
+    the ``_engine_unavailable`` check at the single place that owns it, and
+    makes the eager/lazy decision impossible to get wrong at a new call site.
+
+    When the factory yields a predicate, the PG resolve runs **in parallel**
+    with a CH value read that self-resolves its ``series_id`` set through the
+    PostgreSQL engine table; values are then trimmed against the exact resolve
+    (engine predicates may be supersets) and joined client-side —
+    byte-identical to the sequential path. On an engine failure the session
+    degrades (``client._engine_unavailable``) and the read falls back to the
+    sequential path; resolve/user errors propagate unchanged.
 
     ``relative`` picks ``td.read_relative`` (window args in ``td_kwargs``) over
     ``td.read`` (explicit bitemporal args). Returns ``(result, n_series)``.
@@ -470,8 +499,10 @@ async def execute_read(
     def _empty() -> tuple[pl.DataFrame | dict, int]:
         return ({} if output == "by_path" else pl.DataFrame()), 0
 
-    if engine_meta is not None and not client._engine_unavailable:
-        call = _td_call(td, relative=relative, kwargs=kwargs, meta_source=engine_meta)
+    # Build the predicate only if the engine is actually usable this session.
+    meta_source = engine_meta() if (engine_meta is not None and not client._engine_unavailable) else None
+    if meta_source is not None:
+        call = _td_call(td, relative=relative, kwargs=kwargs, meta_source=meta_source)
 
         def _engine_call() -> pl.DataFrame:
             # series_ids/retention are unused when meta_source resolves them server-side.

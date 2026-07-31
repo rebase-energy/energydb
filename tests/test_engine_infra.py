@@ -11,7 +11,9 @@ skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are not set.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import energydb as edb
@@ -24,7 +26,7 @@ from energydb._ch_meta_engine import (
     engine_table_ddl,
     series_meta_view_ddl,
 )
-from energydb._io import engine_meta_for_manifest
+from energydb._io import engine_meta_for_manifest, execute_read
 
 DSN = "postgresql://app_user:s3cret@db.example.com:6543/proddb"
 
@@ -71,6 +73,131 @@ def test_engine_meta_edge_triple_falls_back_when_incomplete_or_null():
         }
     )
     assert engine_meta_for_manifest(with_null) is None
+
+
+def test_engine_meta_node_uuid_object_column_stays_engine_eligible():
+    """A ``node_uuid`` column of ``uuid.UUID`` objects is polars dtype ``Object``.
+
+    Regression for two bugs at once: it used to raise (``unique()`` is not
+    supported on ``Object``), and the tempting fix — widening the Utf8 guard to
+    every route — would return ``None`` and silently push every uuid-routed read
+    onto the slow sequential path. Assert we get a real predicate.
+    """
+    u1, u2 = uuid.uuid4(), uuid.uuid4()
+    manifest = pl.DataFrame({"node_uuid": [u1, u2], "data_type": ["Actual", "actual"], "name": ["power", "power"]})
+    assert manifest["node_uuid"].dtype == pl.Object  # the shape that used to crash
+
+    meta = engine_meta_for_manifest(manifest)
+    assert meta is not None
+    assert meta.node_uuids == (str(u1), str(u2))
+    # data_type dedups before lowercasing, so mixed case can repeat a value in the
+    # IN list — harmless for a superset filter, and unchanged by this fix.
+    assert set(meta.data_type) == {"actual"}
+    assert meta.name == ("power",)
+
+
+def test_engine_meta_edge_uuid_object_column_stays_engine_eligible():
+    u1 = uuid.uuid4()
+    manifest = pl.DataFrame([{"edge_uuid": u1, "data_type": "actual", "name": "flow"}])
+    assert manifest["edge_uuid"].dtype == pl.Object
+
+    meta = engine_meta_for_manifest(manifest)
+    assert meta is not None
+    assert meta.edge_uuids == (str(u1),)
+
+
+def test_engine_meta_uuid_route_is_representation_independent():
+    """Stringified and UUID-object manifests produce the identical predicate."""
+    u1, u2 = uuid.uuid4(), uuid.uuid4()
+    cols = {"data_type": ["actual", "actual"], "name": ["power", "power"]}
+    as_objects = engine_meta_for_manifest(pl.DataFrame({"node_uuid": [u1, u2], **cols}))
+    as_strings = engine_meta_for_manifest(pl.DataFrame({"node_uuid": [str(u1), str(u2)], **cols}))
+    assert as_objects == as_strings
+
+
+def test_engine_meta_uuid_route_dedupes_mixed_representations():
+    """The same uuid as an object and as its string is one owner, not two."""
+    u1 = uuid.uuid4()
+    manifest = pl.DataFrame({"node_uuid": [u1, str(u1)], "data_type": ["actual", "actual"], "name": ["power", "power"]})
+    meta = engine_meta_for_manifest(manifest)
+    assert meta is not None
+    assert meta.node_uuids == (str(u1),)
+
+
+def test_engine_meta_uuid_route_with_a_null_returns_none():
+    """``null_count()`` is unreliable on ``Object``, so the None scan runs on the
+    materialized list — a null owner is inexpressible either way."""
+    manifest = pl.DataFrame({"node_uuid": [uuid.uuid4(), None], "data_type": ["actual"] * 2, "name": ["power"] * 2})
+    assert engine_meta_for_manifest(manifest) is None
+
+
+def test_engine_meta_path_route_non_utf8_returns_none():
+    """The ``path`` route keeps its Utf8-only contract: a non-string path is a
+    caller error that resolve_manifest reports properly."""
+    manifest = pl.DataFrame([{"path": uuid.uuid4(), "data_type": "actual", "name": "power"}])
+    assert engine_meta_for_manifest(manifest) is None
+
+
+# ---------------------------------------------------------------------------
+# The predicate is built lazily — only when the engine is usable (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClient:
+    """Just the one attribute ``execute_read`` consults."""
+
+    def __init__(self, *, engine_unavailable: bool) -> None:
+        self._engine_unavailable = engine_unavailable
+
+
+async def _resolves_to_nothing() -> None:
+    """An exact resolve that matched no series — short-circuits before any CH call."""
+    return None
+
+
+def test_engine_predicate_is_not_built_when_the_engine_is_unavailable():
+    """``ENERGYDB_DISABLE_ENGINE=1`` (and a degraded session) must skip predicate
+    construction entirely — it used to be evaluated eagerly at the call site, so
+    a predicate that raised broke reads the kill-switch was supposed to protect."""
+    calls = []
+
+    def factory():
+        calls.append(1)
+        raise AssertionError("the engine predicate must not be built when the engine is off")
+
+    _result, n_series = asyncio.run(
+        execute_read(
+            None,
+            None,
+            _FakeClient(engine_unavailable=True),
+            resolve=_resolves_to_nothing,
+            engine_meta=factory,
+        )
+    )
+    assert calls == []
+    assert n_series == 0
+
+
+def test_engine_predicate_is_built_once_when_the_engine_is_available():
+    """The converse: an available engine invokes the factory exactly once. A
+    factory yielding ``None`` (inexpressible read) falls through to sequential."""
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return None
+
+    _result, n_series = asyncio.run(
+        execute_read(
+            None,
+            None,
+            _FakeClient(engine_unavailable=False),
+            resolve=_resolves_to_nothing,
+            engine_meta=factory,
+        )
+    )
+    assert calls == [1]
+    assert n_series == 0
 
 
 # ---------------------------------------------------------------------------
@@ -235,3 +362,68 @@ def test_engine_failure_degrades_once_per_session(client, monkeypatch):
     out3 = client.get_node("P").read(data_type="actual", name="power")
     assert out3.equals(expected)
     assert calls["n"] == 2  # the engine was attempted again after the reset
+
+
+# ---------------------------------------------------------------------------
+# Live: uuid-routed manifests carrying uuid.UUID objects
+# ---------------------------------------------------------------------------
+
+
+def _uuid_manifest(node_uuid, *, stringify: bool) -> pl.DataFrame:
+    owner = str(node_uuid) if stringify else node_uuid
+    return pl.DataFrame([{"node_uuid": owner, "data_type": "actual", "name": "power"}])
+
+
+@pytestmark_live
+def test_uuid_object_routed_read_takes_the_engine_path(client, monkeypatch):
+    """End-to-end: a manifest holding a ``uuid.UUID`` reads correctly *and* over the
+    engine. ``get_raw()["uuid"]`` returns a UUID object, so feeding energydb's own
+    output straight back in is the natural thing to do — and is what used to crash."""
+    import energydb._io as _io
+
+    node_uuid = client.get_node("P", "T1").get_raw()["uuid"]
+    assert isinstance(node_uuid, uuid.UUID)
+
+    used_engine = []
+    orig = _io._td_call
+
+    def spy_td_call(td, *, relative, kwargs, meta_source=None):
+        used_engine.append(meta_source is not None)
+        return orig(td, relative=relative, kwargs=kwargs, meta_source=meta_source)
+
+    monkeypatch.setattr(_io, "_td_call", spy_td_call)
+    monkeypatch.setattr(_io, "_ENGINE_STRICT", True)  # an engine failure raises instead of degrading
+
+    out_obj = client.read(_uuid_manifest(node_uuid, stringify=False))
+    assert any(used_engine), "the uuid-routed read did not take the engine path"
+    assert out_obj.height == 2
+    assert client._async._engine_unavailable is False  # no degrade happened
+
+    out_str = client.read(_uuid_manifest(node_uuid, stringify=True))
+    assert out_obj.equals(out_str)  # representation-independent, byte for byte
+
+
+@pytestmark_live
+def test_uuid_object_routed_read_works_with_the_engine_disabled(client, monkeypatch):
+    """Regression for the eager evaluation: with ``ENERGYDB_DISABLE_ENGINE=1`` the
+    predicate must never be constructed, so even a predicate that raises cannot
+    break the read. This is the exact configuration that broke psd."""
+    import energydb.client as _client_mod
+
+    node_uuid = client.get_node("P", "T1").get_raw()["uuid"]
+    expected = client.read(_uuid_manifest(node_uuid, stringify=True))
+
+    monkeypatch.setenv("ENERGYDB_DISABLE_ENGINE", "1")
+
+    def must_not_be_called(_manifest):
+        raise AssertionError("engine_meta_for_manifest was invoked with the engine disabled")
+
+    monkeypatch.setattr(_client_mod, "engine_meta_for_manifest", must_not_be_called)
+
+    disabled = Client()
+    try:
+        assert disabled._async._engine_unavailable is True
+        out = disabled.read(_uuid_manifest(node_uuid, stringify=False))
+    finally:
+        disabled.close()
+    assert out.equals(expected)
