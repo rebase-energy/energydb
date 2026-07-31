@@ -35,7 +35,9 @@ Most time-series systems are agnostic about what their series represent — they
 - ⏱️ **Time-of-knowledge queries:** Forecast revisions, corrections, and as-of backtests, powered by [TimeDB](https://github.com/rebase-energy/timedb).
 - 🧭 **Lazy fluent navigation:** `client.get_node("Portfolio", "Site", "T01").read(...)` resolves to one indexed SQL query, regardless of subtree size.
 - ⚖️ **Unit conversion at the boundary:** Declare canonical units once; pint rescales every read and write automatically.
-- 🧹 **Idempotent writes:** `write(..., skip_unchanged=True)` drops rows that only duplicate the latest stored value before insert, so writing the same window repeatedly doesn't bloat storage. Opt-in; the write still returns its `run_id` (now a `WriteResult` carrying `.written` / `.skipped` counts).
+- 🧹 **Idempotent writes:** `write(..., skip_unchanged=True)` drops rows that only duplicate the latest stored value before insert, so writing the same window repeatedly doesn't bloat storage. The comparison key is chosen *per series* — actuals dedupe per `valid_time`, versioned forecasts per `(valid_time, knowledge_time)` — so a republished forecast is never mistaken for a duplicate. Opt-in; the write still returns its `run_id` (a `WriteResult` carrying `.written` / `.skipped` counts).
+- 🎯 **Partial reads that don't fail:** `read(manifest, on_missing="skip")` returns every series that resolved plus the triples that didn't, so one unregistered series in a 1,500-series manifest costs you that series — not the whole batch.
+- 🧯 **Typed errors:** `NodeNotFoundError`, `SeriesNotFoundError` (carrying every unresolved triple), `ManifestError`, … all under one `EnergyDBError` base — so you branch on types and structured fields instead of matching message text. Every class also subclasses `ValueError`, so broad handlers keep working.
 
 ---
 

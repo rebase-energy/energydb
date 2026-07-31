@@ -89,7 +89,9 @@ Release Notes
 
 For version-by-version changes and migration notes, see:
 
-- `Changelog <https://github.com/rebase-energy/energydb/blob/main/CHANGELOG.md>`_
+- `Releases <https://github.com/rebase-energy/energydb/releases>`_ — full
+  notes for every published version
+- :ref:`Upgrading to the current version <sdk-upgrading>`
 
 
 Documentation
