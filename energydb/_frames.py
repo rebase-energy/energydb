@@ -14,6 +14,7 @@ import pandas as pd
 import polars as pl
 
 from energydb._join import EdgeSeriesKey, SeriesKey
+from energydb.errors import ValidationError
 
 Backend = Literal["polars", "pandas"]
 Output = Literal["frame", "by_path"]
@@ -59,4 +60,4 @@ def to_backend(
                 {k: v.to_pandas() for k, v in d.items()},
             )
         return result.to_pandas()
-    raise ValueError(f"backend must be 'polars' or 'pandas', got {backend!r}")
+    raise ValidationError(f"backend must be 'polars' or 'pandas', got {backend!r}")

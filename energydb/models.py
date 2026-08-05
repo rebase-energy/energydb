@@ -24,6 +24,8 @@ from sqlalchemy import event
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase
 
+from energydb._ch_meta_engine import series_meta_view_ddl
+
 # Schema is configurable at import time via ``ENERGYDB_SCHEMA`` (default
 # ``"public"``). The default co-locates EnergyDB's tables with a host
 # application's tables in ``public``; a named schema isolates them. ``SCHEMA``
@@ -231,3 +233,13 @@ if SCHEMA is not None:
         "before_create",
         sa.DDL(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"),
     )
+
+# ``series_meta`` view — the read-only projection the ClickHouse ``concurrent`` read
+# path resolves against: CH's PostgreSQL table engine selects from it. The DDL lives
+# with its engine-table counterpart in ``_ch_meta_engine``; created after the tables
+# by ``Client.create()`` and (re)created idempotently by ``Client.setup_ch_meta_engine()``
+# since Alembic autogenerate does not track views.
+CREATE_SERIES_META_VIEW, DROP_SERIES_META_VIEW = series_meta_view_ddl(f"{SCHEMA}." if SCHEMA else "")
+
+event.listen(Base.metadata, "after_create", sa.DDL(CREATE_SERIES_META_VIEW))
+event.listen(Base.metadata, "before_drop", sa.DDL(DROP_SERIES_META_VIEW))

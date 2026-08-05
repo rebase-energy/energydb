@@ -161,14 +161,15 @@ class Client:
     """Synchronous EnergyDB client — a blocking facade over :class:`AsyncClient`.
 
     Accepts the same constructor arguments as :class:`AsyncClient`. The
-    connection pool is opened eagerly on construction, so the client is ready
-    to use immediately. Always call :meth:`close` (or use it as a context
-    manager) to release the pool and stop the background loop.
+    connection pool is opened eagerly on construction.
 
     ``client.namespace(ns)`` works here too: the reflection proxy wraps the
     returned :class:`AsyncClient` view, so the result is a sync,
     namespace-bound view sharing this client's pool (and, like the async
-    view, refuses lifecycle/schema operations).
+    view, refuses lifecycle/schema operations). The
+    connection pool is opened eagerly on construction, so the client is ready
+    to use immediately. Always call :meth:`close` (or use it as a context
+    manager) to release the pool and stop the background loop.
 
     >>> with Client(pg_conninfo=..., ch_url=...) as client:
     ...     client.create_node(node_type="site", name="S1")

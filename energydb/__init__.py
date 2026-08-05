@@ -1,8 +1,11 @@
 """EnergyDB — Energy database extending TimeDB with hierarchical asset management."""
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 
-load_dotenv(find_dotenv())
+# Load only the .env in the current working directory (no upward tree-walk).
+# override=False so an already-set env var (Docker, CI, uv run --env-file, a
+# caller that loaded its own .env first) always wins over this dev fallback.
+load_dotenv(".env")
 
 from energydatamodel import (  # noqa: E402
     # Areas
@@ -65,12 +68,24 @@ from timedatamodel import (  # noqa: E402
     TimeSeriesType,
 )
 
-from energydb._io import WriteResult  # noqa: E402
+from energydb._io import ReadResult, WriteResult  # noqa: E402
 from energydb._join import EdgeSeriesKey, SeriesKey, find  # noqa: E402
 from energydb._sync import Client  # noqa: E402
 from energydb._transaction import Transaction  # noqa: E402
 from energydb.client import AsyncClient  # noqa: E402
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff  # noqa: E402
+from energydb.errors import (  # noqa: E402
+    AlreadyExistsError,
+    ConfigurationError,
+    EdgeNotFoundError,
+    EnergyDBError,
+    ManifestError,
+    NodeNotFoundError,
+    NotFoundError,
+    SeriesNotFoundError,
+    UnchangedScopeError,
+    ValidationError,
+)
 from energydb.scope import EdgeScope, NodeScope  # noqa: E402
 from energydb.units import IncompatibleUnitError  # noqa: E402
 
@@ -78,10 +93,10 @@ __all__ = [
     # Client
     "AsyncClient",
     "Client",
-    "IncompatibleUnitError",
     "NodeScope",
     "EdgeScope",
     "Transaction",
+    "ReadResult",
     "WriteResult",
     # By-path result keys
     "SeriesKey",
@@ -93,6 +108,18 @@ __all__ = [
     "EdgeChange",
     "NodeSnapshot",
     "EdgeSnapshot",
+    # Errors
+    "EnergyDBError",
+    "NotFoundError",
+    "NodeNotFoundError",
+    "EdgeNotFoundError",
+    "SeriesNotFoundError",
+    "AlreadyExistsError",
+    "ValidationError",
+    "ManifestError",
+    "UnchangedScopeError",
+    "ConfigurationError",
+    "IncompatibleUnitError",
     # Core hierarchy
     "Element",
     "Node",

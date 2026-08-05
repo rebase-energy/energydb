@@ -21,8 +21,8 @@ internally-constructed :class:`timedb.TimeDBClient` against ClickHouse
    :show-inheritance:
 
 
-Write Results
--------------
+Results
+-------
 
 Returned by :meth:`Client.write <energydb.Client.write>`,
 :meth:`NodeScope.write <energydb.NodeScope.write>`, and
@@ -30,6 +30,14 @@ Returned by :meth:`Client.write <energydb.Client.write>`,
 ``run_id``) and carries ``written`` / ``skipped`` row counts.
 
 .. autoclass:: energydb.WriteResult
+   :members:
+   :show-inheritance:
+
+Returned by :meth:`Client.read <energydb.Client.read>` /
+:meth:`Client.read_relative <energydb.Client.read_relative>` **only** when
+``on_missing="skip"`` is passed; the default returns the data bare.
+
+.. autoclass:: energydb.ReadResult
    :members:
    :show-inheritance:
 
@@ -94,8 +102,57 @@ preview structural changes before applying them.
 Exceptions
 ----------
 
+Every exception energydb raises deliberately derives from
+:class:`~energydb.errors.EnergyDBError`. Each class that replaced a bare
+``ValueError`` raise site *also* derives from ``ValueError``, so broad
+``except ValueError`` handlers keep catching them. The not-found family
+carries structured identifier fields so callers can react programmatically
+instead of matching message text. All names are re-exported from the package
+root. See :ref:`the SDK error-handling guide <sdk-error-handling>` for usage.
+
+.. autoexception:: energydb.errors.EnergyDBError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.NotFoundError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.NodeNotFoundError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.EdgeNotFoundError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.SeriesNotFoundError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.AlreadyExistsError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.ValidationError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.ManifestError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.UnchangedScopeError
+   :members:
+   :show-inheritance:
+
+.. autoexception:: energydb.errors.ConfigurationError
+   :members:
+   :show-inheritance:
+
 .. autoexception:: energydb.IncompatibleUnitError
    :members:
+   :show-inheritance:
 
 
 Time-Series Declarations
@@ -118,9 +175,12 @@ kwarg; ``register_tree`` persists them alongside the structure.
 Schema (SQLAlchemy Models)
 --------------------------
 
-All tables live in the ``energydb`` PostgreSQL schema. The SQLAlchemy models
-are the single source of truth — no raw SQL files. Platform code imports
-``energydb.models.Base`` for Alembic migrations.
+All tables live in the schema named by ``ENERGYDB_SCHEMA``, defaulting to
+``public``. The SQLAlchemy models are the single source of truth — no raw SQL
+files. Platform code imports ``energydb.models.Base`` for Alembic migrations.
+Series immutability (``retention``, ``canonical_unit``, owner columns) is
+enforced in Python by ``register_series`` rather than by a DB trigger, so the
+schema is fully Alembic-autogeneratable.
 
 .. automodule:: energydb.models
    :members: Node, Edge, Series, Run

@@ -1,17 +1,27 @@
 SDK Usage
 =========
 
-The energydb SDK is a single class — :class:`~energydb.Client` — that owns a
-PostgreSQL connection pool and constructs a :class:`timedb.TimeDBClient` for
-ClickHouse I/O. Around it sit two fluent scopes (:class:`~energydb.NodeScope`
-and :class:`~energydb.EdgeScope`) that let you navigate the hierarchy and
-operate on a single node or edge in idiomatic Python.
+The energydb SDK is built around one client that owns a PostgreSQL connection
+pool and constructs a :class:`timedb.TimeDBClient` for ClickHouse I/O. It ships
+in two flavors:
+
+- :class:`~energydb.Client` — the synchronous facade. Every method blocks; the
+  connection pool is opened eagerly on construction. This is what the examples
+  below use.
+- :class:`~energydb.AsyncClient` — the ``async``/``await`` client the sync
+  facade wraps. ``await client.open()`` once before use (or use it as an async
+  context manager). Every ``Client`` method shown here has an identical
+  ``AsyncClient`` coroutine.
+
+Around either client sit two fluent scopes (:class:`~energydb.NodeScope` and
+:class:`~energydb.EdgeScope`) that let you navigate the hierarchy and operate
+on a single node or edge in idiomatic Python.
 
 Overview
 --------
 
-energydb stores three kinds of objects, all in the same PostgreSQL ``energydb``
-schema:
+energydb stores three kinds of objects, all in one PostgreSQL schema — named by
+the ``ENERGYDB_SCHEMA`` environment variable, defaulting to ``public``:
 
 - **Nodes** — Portfolio, Site, WindTurbine, Battery, JunctionPoint, …
   Identified by a UUID7 generated when the ``Element`` is constructed in
@@ -45,7 +55,11 @@ Import the package and instantiate the client:
    client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
 
 The constructor accepts explicit ``pg_conninfo=`` and ``ch_url=`` kwargs for
-custom connections; environment variables are the default.
+custom connections; environment variables are the default. Both are
+keyword-only. The synchronous ``Client`` opens its pool on construction and
+should be closed with ``client.close()`` (or used as a ``with`` block); the
+:class:`~energydb.AsyncClient` requires ``await client.open()`` before its
+first call.
 
 energydb re-exports the EnergyDataModel public API under ``edb.*`` (see
 ``edb.wind``, ``edb.solar``, ``edb.battery``, ``edb.grid``, ``edb.Site``,
@@ -59,11 +73,14 @@ Database Connection
 
 The client reads its connection settings from environment variables by default:
 
-- ``TIMEDB_PG_DSN`` (or ``DATABASE_URL``) — PostgreSQL DSN
+- ``TIMEDB_PG_DSN`` (or ``DATABASE_URL``) — PostgreSQL DSN (must be a URI)
 - ``TIMEDB_CH_URL`` — ClickHouse HTTP URL
+- ``ENERGYDB_SCHEMA`` — PostgreSQL schema for energydb's tables (default
+  ``public``)
 
 You can also use a ``.env`` file in your project root (see
-:doc:`installation`).
+:doc:`installation`). The ClickHouse client honors TimeDB's own
+``TIMEDB_CH_TIMEOUT`` / ``TIMEDB_CH_CONNECT_TIMEOUT`` tunables.
 
 For programmatic use, instantiate the client with explicit settings:
 
@@ -87,21 +104,36 @@ Before using the client, create the database schema:
 
    client.create()
 
-This runs ``CREATE SCHEMA energydb`` and ``Base.metadata.create_all`` against
-PostgreSQL, then delegates to TimeDB to create the ClickHouse
-``series_values`` table. Safe to run repeatedly.
+This runs ``Base.metadata.create_all`` against PostgreSQL — creating the
+``node``, ``edge``, ``series``, and ``runs`` tables plus the ``series_meta``
+view — then delegates to TimeDB to create the ClickHouse ``series_values`` and
+``run_series`` tables. When ``ENERGYDB_SCHEMA`` names a non-default schema, it
+also issues ``CREATE SCHEMA IF NOT EXISTS`` first; the default ``public``
+schema is used as-is. Finally it *best-effort* provisions the ClickHouse
+``PostgreSQL()`` meta-engine table used by the concurrent read path — a failure
+there is logged, not raised (reads fall back to the sequential path). Safe to
+run repeatedly.
+
+Use :meth:`~energydb.Client.setup_ch_meta_engine` as the explicit, *raising*
+alternative that (re)creates the ``series_meta`` view and the engine table and
+clears the session's engine-degraded flag — call it to re-enable ``concurrent``
+reads after fixing engine infrastructure.
 
 Deleting the Schema
 ~~~~~~~~~~~~~~~~~~~
 
-To drop both databases (use with caution):
+To drop energydb's tables and all ClickHouse values (use with caution):
 
 .. code-block:: python
 
    client.delete()
 
-**WARNING**: ``DROP SCHEMA energydb CASCADE`` removes every node, edge, series
-declaration, and run; ``td.delete()`` removes every value in ClickHouse.
+**WARNING**: this is destructive. With a named ``ENERGYDB_SCHEMA`` it runs
+``DROP SCHEMA … CASCADE``, removing every node, edge, series declaration, and
+run. With the default ``public`` schema it drops only energydb's own four
+tables (``series``, ``runs``, ``edge``, ``node``) — never the shared ``public``
+schema, which would take the host application's tables with it. Either way it
+then drops every value in ClickHouse.
 
 
 Hierarchies and Topology
@@ -156,16 +188,18 @@ writes those UUIDs straight into the row primary keys in PostgreSQL.
    ``register_tree`` is **create-only and structure-only**.
 
    * Any UUID in the payload that already exists in the DB raises
-     ``ValueError`` — modify existing rows through scope mutators
-     (:meth:`NodeScope.rename`, ``.update``, ``.delete``, ``.move_to``,
-     ``.add``) instead, optionally batched in a :meth:`Client.transaction`.
+     :class:`~energydb.errors.AlreadyExistsError` — modify existing rows
+     through scope mutators (:meth:`NodeScope.rename`, ``.update``,
+     ``.delete``, ``.move_to``, ``.add``) instead, optionally batched in a
+     :meth:`Client.transaction`.
    * Names must be non-empty and must not contain ``/`` (the path
-     separator). Violations raise ``ValueError`` before any SQL runs and
+     separator). Violations raise
+     :class:`~energydb.errors.ValidationError` before any SQL runs and
      are also rejected by PostgreSQL ``CHECK`` constraints.
    * If any node/edge in the tree carries non-empty inline
-     ``TimeSeries.df`` data, the call raises ``ValueError`` — write data
-     separately via :meth:`~energydb.Client.write` or the scope helpers
-     (see below).
+     ``TimeSeries.df`` data, the call raises
+     :class:`~energydb.errors.ValidationError` — write data separately via
+     :meth:`~energydb.Client.write` or the scope helpers (see below).
 
 Grafting onto an existing tree
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -229,7 +263,28 @@ With ``include_series=True``, every reconstructed node carries its registered
 series as metadata-only :class:`~timedatamodel.TimeSeries` entries (``df=None``)
 on ``timeseries``.
 
-Flat queries by type / subtree / properties:
+When you want the raw row rather than a reconstructed EDM object — any
+``node_type`` / ``edge_type`` string, no class lookup — use ``get_raw()`` and
+the lazy navigation helpers on a scope:
+
+.. code-block:: python
+
+   scope = client.get_node("my-portfolio", "Offshore-1", "T01")
+
+   scope.get_raw()      # {uuid, node_type, name, data, parent_uuid, path} — None if uuid-addressed & missing
+   scope.children()     # direct children, one level: list of {uuid, node_type, name, data, parent_uuid}
+   scope.descendants()  # whole subtree below (excludes self), same dict shape
+   scope.path()         # resolved path tuple
+
+   # children / descendants accept a type= filter
+   turbines = client.get_node("my-portfolio").descendants(type="WindTurbine")
+
+``EdgeScope.get_raw()`` returns ``{uuid, edge_type, name, data,
+from_node_uuid, to_node_uuid}`` and works for any ``edge_type`` string;
+``EdgeScope.from_node()`` / ``.to_node()`` return the endpoint
+:class:`~energydb.NodeScope`\ s.
+
+Flat queries by type / subtree / properties (return lists of EDM objects):
 
 .. code-block:: python
 
@@ -258,15 +313,21 @@ Address the node by path or uuid and use the fluent scope ops:
    t01.move_to(client.get_node("my-portfolio", "Onshore-1"))
    t01.delete()
 
-``move_to`` rejects re-parenting into self or any descendant (cycle
-detection). ``rename`` and ``update`` are idempotent and round-trip safe.
+``update`` defaults to a **shallow JSONB merge** — the passed keys are merged
+over the existing ``data``. Pass ``replace_data=True`` to overwrite ``data``
+wholesale instead. ``move_to`` rejects re-parenting into self or any descendant
+(cycle detection). ``rename`` and ``update`` are idempotent and round-trip
+safe. Every mutator also accepts ``dry_run=True``, returning a
+:class:`~energydb.TreeDiff` without touching the database.
 
-The same surface exists on edges:
+The same surface exists on edges (edge ``move_to`` takes keyword-only
+``from_node=`` / ``to_node=`` endpoints):
 
 .. code-block:: python
 
    e = client.get_edge(uuid=line.id)
-   e.update(data={"capacity": 600})
+   e.update(data={"capacity": 600})          # shallow merge; replace_data=True to overwrite
+   e.move_to(from_node=bus_a_scope, to_node=bus_c_scope)
    e.delete()
 
 
@@ -287,9 +348,12 @@ For surgical additions on an existing node or edge, scopes expose
        canonical_unit="m/s",
        data_type="actual",
        timeseries_type="FLAT",
+       retention="forever",   # optional; derived from timeseries_type when omitted
+       description="Nacelle anemometer",  # optional
    )
 
-Or pass a metadata-only TimeSeries directly:
+``register_series`` returns the integer ``series_id``. Pass a metadata-only
+TimeSeries directly instead of the individual fields:
 
 .. code-block:: python
 
@@ -299,10 +363,24 @@ Or pass a metadata-only TimeSeries directly:
    client.get_node(uuid=t01.id).register_series(ts)
 
 ``retention``, ``canonical_unit``, and the owner columns are immutable after
-insert (enforced by a Postgres trigger). Reclassifying a series means
+insert — ``register_series`` rejects a conflicting re-registration with
+:class:`~energydb.errors.AlreadyExistsError` (enforced in Python, so the
+schema stays fully Alembic-autogeneratable). Reclassifying a series means
 registering a new one — this preserves ClickHouse-side data integrity. When
 ``retention`` is omitted it is derived from ``timeseries_type``: ``FLAT``
 (actuals) → ``forever``, ``OVERLAPPING`` (forecasts) → ``medium``.
+
+**``data_type`` and ``timeseries_type``.** ``data_type`` is a value from the
+:class:`~timedatamodel.DataType` enum, passed as a case-insensitive string
+(lowercased internally). The full vocabulary is ``actual``, ``observation``,
+``derived``, ``calculated``, ``estimation``, ``forecast``, ``prediction``,
+``scenario``, ``simulation``, ``reconstruction``, ``reference``, ``baseline``,
+``benchmark``, ``ideal`` — a hierarchy (e.g. ``observation`` rolls up to
+``actual``). ``timeseries_type`` is the temporal shape and must be one of the
+two :class:`~timedatamodel.TimeSeriesType` values: ``FLAT`` (one value per
+``valid_time``) or ``OVERLAPPING`` (versioned forecasts, many
+``knowledge_time`` per ``valid_time``). ``timeseries_type`` is the one series
+attribute that *can* be changed after registration.
 
 
 Edges and Grid Topology
@@ -375,7 +453,8 @@ via the scope's path or uuid before any data reaches the database.
      - ETL pipelines, scheduled loads, cross-portfolio reads
    * - **Routing**
      - Implicit (the scope's resolved uuid)
-     - Manifest column: ``node_uuid``, ``edge_uuid``, or ``path``
+     - Manifest column: ``node_uuid``, ``edge_uuid``, ``path``, or
+       ``from_path`` + ``to_path`` + ``edge_type``
 
 Writing
 ~~~~~~~
@@ -417,10 +496,46 @@ Optional kwargs:
   ``run_finish_time``, ``run_params`` — provenance metadata stored in
   ``energydb.runs``
 - ``skip_unchanged`` / ``unchanged_scope`` — drop rows that only duplicate
-  the latest stored ``(value, annotation, changed_by)`` before the insert;
-  ``unchanged_scope`` (default ``"valid_time"``) selects the comparison key.
-  Forwarded to the underlying ``timedb`` write. The ``energydb.runs`` row is
-  upserted regardless, so an all-skipped write still records a run.
+  the latest stored ``(value, annotation, changed_by)`` before the insert.
+  See `Skipping unchanged writes`_ for the comparison keys. The
+  ``energydb.runs`` row is upserted regardless, so an all-skipped write still
+  records a run.
+
+Skipping unchanged writes
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Writing the same window twice with unchanged data appends rows that differ
+only in ``change_time`` — physically new, but invisible to every reader.
+``skip_unchanged=True`` drops them before the insert, at the cost of one
+bounded read-back.
+
+What counts as "unchanged" depends on the series: for a FLAT actual, a
+re-sent value is a duplicate; for an OVERLAPPING forecast, *every*
+publication is meaningful even when its values happen to repeat the previous
+one. ``unchanged_scope`` selects the comparison key accordingly:
+
+- ``"auto"`` (default) — **per series**, from each series' registered
+  ``timeseries_type``: FLAT compares per ``(series_id, valid_time)``,
+  OVERLAPPING per ``(series_id, valid_time, knowledge_time)``. One call
+  handles a manifest that mixes both. For a FLAT-only manifest this is
+  identical to ``"valid_time"``.
+- ``"knowledge_time"`` — that key uniformly, for every series in the call.
+- ``"valid_time"`` — that key uniformly. Raises
+  :class:`~energydb.errors.UnchangedScopeError` when the manifest contains
+  OVERLAPPING series, because it would silently drop their republications.
+
+.. code-block:: python
+
+   # Mixed manifest — actuals and forecast revisions in one call.
+   result = client.write(manifest, skip_unchanged=True)
+   print(result.written, result.skipped)
+
+.. note::
+
+   OVERLAPPING series require a ``knowledge_time`` (kwarg or column) on
+   every write, so whenever the knowledge-time-scoped comparison applies
+   there is a real publication time to compare against — never a per-batch
+   ``now()`` stamp.
 
 Reading
 ~~~~~~~
@@ -495,13 +610,24 @@ The manifest carries one routing column plus ``data_type``, ``name``, and
 the data columns. The routing column is autodetected from the column names
 — exactly one of:
 
-- ``node_uuid`` — programmatic routing by UUID
-- ``edge_uuid`` — programmatic routing for edge-attached series
+- ``node_uuid`` — programmatic routing by UUID. Values may be
+  :class:`uuid.UUID` objects or their string form; both are accepted, and a
+  mixed column is fine. ``uuid.UUID`` is what psycopg returns and what
+  ``get_raw()["uuid"]`` gives you, so energydb's own output feeds straight
+  back in.
+- ``edge_uuid`` — programmatic routing for edge-attached series, same value
+  handling as ``node_uuid``
 - ``path`` — human-readable, ``Utf8`` joined with ``/``
   (e.g. ``"my-portfolio/Offshore-1/T01"``). ``/`` is reserved as the
   separator; names containing ``/`` are rejected at registration. The
   manifest must use ``Utf8`` — ``List(Utf8)`` from earlier API versions
   is rejected with an explicit migration message.
+- ``from_path`` + ``to_path`` + ``edge_type`` — human-readable routing for
+  edge-attached series (all three columns required together), the edge
+  analogue of ``path``. Each is ``Utf8`` joined with ``/``; the edge is
+  resolved server-side via its endpoint nodes' paths and type. Symmetric
+  with the edge read output columns, so an edge read's frame can be fed
+  back in as a manifest without resolving ``edge_uuid`` first.
 
 write() — long-format multi-series ingestion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -527,9 +653,9 @@ The other two routing forms are equivalent:
 
 .. code-block:: python
 
-   # By node uuid (programmatic)
+   # By node uuid (programmatic) — UUID objects or strings, either works
    pl.DataFrame({
-       "node_uuid":  [str(t01.id)] * 24,
+       "node_uuid":  [t01.id] * 24,
        "data_type":  ["actual"] * 24,
        "name":       ["power"] * 24,
        "valid_time": hours,
@@ -545,13 +671,30 @@ The other two routing forms are equivalent:
        "value":      [200.0 + h for h in range(24)],
    })
 
+   # By edge triple (human-readable; all three columns required)
+   pl.DataFrame({
+       "from_path":  ["my-grid/BusA"] * 24,
+       "to_path":    ["my-grid/BusB"] * 24,
+       "edge_type":  ["Line"] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power_flow"] * 24,
+       "valid_time": hours,
+       "value":      [200.0 + h for h in range(24)],
+   })
+
 Routing modes are mutually exclusive — passing more than one routing column
-raises ``ValueError``.
+raises :class:`~energydb.errors.ManifestError`. Supplying only part of the
+edge triple (e.g. ``from_path`` + ``to_path`` without ``edge_type``) raises
+the same.
 
 Series must already be registered (typically via
 :meth:`~energydb.Client.register_tree`) — unresolved
-``(owner, data_type, name)`` triples raise before any data reaches
-ClickHouse.
+``(owner, data_type, name)`` triples raise
+:class:`~energydb.errors.SeriesNotFoundError` before any data reaches
+ClickHouse, and the exception names *every* unresolved triple, not just the
+first. Writes are always strict: there is no skip mode, because silently
+dropping writes would be data loss (reads have one — see
+`Reading past unregistered series`_).
 
 Optional columns and kwargs:
 
@@ -563,8 +706,8 @@ Optional columns and kwargs:
   ``run_id`` is one client-generated UUID7-derived integer per call
 - ``skip_unchanged`` / ``unchanged_scope`` (kwargs) — drop rows that only
   duplicate the latest stored value before the insert; ``unchanged_scope``
-  (default ``"valid_time"``) selects the comparison key. Forwarded to the
-  underlying ``timedb`` write.
+  (default ``"auto"``) selects the comparison key per series. See
+  `Skipping unchanged writes`_.
 
 Returns a :class:`~energydb.WriteResult` — an ``int`` run_id carrying
 ``.written`` / ``.skipped`` row counts. The ``energydb.runs`` row is upserted
@@ -596,6 +739,8 @@ Optional kwargs:
 - ``start_known`` / ``end_known`` — knowledge_time range (OVERLAPPING only)
 - ``include_updates`` — expose correction chain
 - ``include_knowledge_time`` — return one row per (knowledge_time, valid_time)
+- ``on_missing`` — ``"raise"`` (default) or ``"skip"``; see
+  `Reading past unregistered series`_
 
 The result columns mirror the scope read: ``path``, ``data_type``,
 ``name``, ``valid_time``, ``value`` for node manifests; ``from_path``,
@@ -608,6 +753,49 @@ Per-window relative reads use :meth:`Client.read_relative
 <energydb.Client.read_relative>`, with the same parameters as TimeDB's
 :meth:`~timedb.TimeDBClient.read_relative`.
 
+Reading past unregistered series
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default a manifest triple that resolves to no registered series fails the
+whole call with :class:`~energydb.errors.SeriesNotFoundError` — one gap in a
+1,500-series manifest and you get nothing back. Pass ``on_missing="skip"``
+to read everything that *does* resolve:
+
+.. code-block:: python
+
+   result = client.read(manifest, on_missing="skip")
+
+   result.data      # the frame (or dict) for every series that resolved
+   result.missing   # one row per unresolved triple
+
+   # NamedTuple — unpacking works too
+   data, missing = client.read(manifest, on_missing="skip")
+
+.. important::
+
+   ``on_missing="skip"`` **changes the return type** to
+   :class:`~energydb.ReadResult`, a ``NamedTuple(data, missing)``. The
+   default ``"raise"`` returns ``data`` bare, exactly as before.
+
+- ``data`` is precisely what the same call returns without ``on_missing``,
+  honouring ``output=`` and ``backend=`` — including the empty shapes when
+  nothing resolved (an empty frame, or ``{}`` for ``by_path``).
+- ``missing`` carries the unique unresolved triples: the manifest's routing
+  column(s) plus ``data_type`` / ``name``, ``Utf8`` throughout (uuids
+  stringified). It is zero-row with the correct schema when everything
+  resolved, and follows ``backend=`` like ``data`` does.
+
+Either way, the raise path reports **all** unresolved triples at once —
+:attr:`SeriesNotFoundError.missing <energydb.errors.SeriesNotFoundError>`
+carries the full list structurally, so discovering *N* gaps takes one call
+rather than *N*.
+
+``on_missing`` covers exactly one condition: "this triple has no registered
+series" (including a ``path`` that matches no node). Structural problems with
+the manifest — a missing or ambiguous routing column, a non-``Utf8`` ``path``,
+null routing values — raise :class:`~energydb.errors.ManifestError` under both
+settings. Those are caller bugs, not catalog gaps.
+
 Output modes
 ~~~~~~~~~~~~
 
@@ -617,23 +805,27 @@ an ``output=`` kwarg that controls return shape:
 - ``output="frame"`` (default) — one DataFrame with the identity columns
   broadcast on every row. Good for ETL and ad-hoc analysis where you want
   to ``group_by(path)`` or filter further downstream.
-- ``output="by_path"`` — a ``dict`` keyed by ``(path, data_type, name)``
-  (or ``(from_path, to_path, edge_type, data_type, name)`` for edge
-  reads), one DataFrame per series. Sub-frames carry only the data
-  columns (``valid_time``, ``value``, plus opt-in ``knowledge_time`` /
-  ``change_time``). Each sub-frame is sorted by ``valid_time`` ascending.
+- ``output="by_path"`` — a ``dict`` keyed by a
+  :class:`~energydb.SeriesKey` ``(path, data_type, name)`` for node reads,
+  or an :class:`~energydb.EdgeSeriesKey`
+  ``(from_path, to_path, edge_type, data_type, name)`` for edge reads. Both
+  are ``NamedTuple``\ s, so keys support positional *and* attribute access
+  (``key.path``, ``key.name``, …). Each value is one DataFrame per series,
+  carrying only the data columns (``valid_time``, ``value``, plus opt-in
+  ``knowledge_time`` / ``change_time``), sorted by ``valid_time`` ascending.
 
 Use ``by_path`` when downstream code naturally operates per-series — model
 training, plotting, per-asset writes back. Series that resolve but have
 no rows in ClickHouse still appear as keys with an empty sub-frame, so
-callers can index by key without ``KeyError``.
+callers can index by key without ``KeyError``. :func:`~energydb.find`
+filters the result dict by partial key match (e.g. ``find(result,
+name="power")``).
 
 .. code-block:: python
 
    by_series = client.read(manifest, output="by_path")
    for key, sub in by_series.items():
-       path, data_type, name = key
-       train_one_model(path, sub)
+       train_one_model(key.path, sub)   # key is a SeriesKey NamedTuple
 
 The ``backend=`` kwarg is orthogonal: ``backend="polars"`` (default)
 returns polars frames in both modes; ``backend="pandas"`` converts every
@@ -677,31 +869,72 @@ reads on the same connection see the transaction's own uncommitted writes.
    mutations and time-series I/O.
 
 
-Resolve cache
--------------
+Concurrent reads
+----------------
 
-Every :class:`Client` keeps an in-process cache (the *series registry*)
-of resolved series, node, and edge metadata. The cache is read-through
-on the resolve hot path and write-through on every local mutation —
-``register_tree``, ``register_series``, ``rename``, ``move_to``,
-``delete``, etc. all keep it consistent transparently. There is nothing
-to invalidate by hand under normal use.
+When the ClickHouse meta-engine table is provisioned (see `Schema
+Management`_) and expressible for the query, reads run the PostgreSQL series
+resolve **in parallel** with the ClickHouse value read — ClickHouse
+self-resolves ``series_id`` through the ``PostgreSQL()`` engine table over the
+``series_meta`` view. The result is trimmed to the exact resolve and is
+byte-identical to the sequential path. Queries that cannot express an engine
+predicate (``.where()`` property filters, uuid-addressed subtrees) fall back
+to sequential automatically.
 
-The one case the cache cannot observe is **another process** mutating
-schema state this client has already cached — registering a new series,
-deleting a node, or flipping a series's ``timeseries_type``. Reads from
-the cached client will continue to serve stale metadata until you call:
+Two environment variables gate this path:
 
-.. code-block:: python
+- ``ENERGYDB_DISABLE_ENGINE=1`` — session kill-switch; always use the
+  sequential path. Set at construction, so the engine predicate is never
+  even built.
+- ``ENERGYDB_ENGINE_STRICT=1`` — raise on an engine-read failure instead of
+  degrading to sequential (useful in tests). Without it, the first failure
+  degrades the session and later reads go sequential until
+  :meth:`~energydb.Client.setup_ch_meta_engine` is called again.
 
-   client.invalidate_series_cache()                 # clear everything
-   client.invalidate_series_cache(owner_uuid=...)   # evict one owner only
+Logging on degrade
+~~~~~~~~~~~~~~~~~~
 
-A focused eviction by ``owner_uuid`` is cheaper than a full clear when
-you know exactly which node/edge changed.
+The first engine-read failure in a process logs once, and the level tells
+you which kind of problem it is:
 
-Use :meth:`Client.resolve_cache_stats` to see hit/miss counters and the
-current cache size if you are tuning read latency.
+- **The engine table is not provisioned** → one ``info`` line, no traceback.
+  For a deployment that never calls
+  :meth:`~energydb.Client.setup_ch_meta_engine`, this is a steady
+  configuration state, not an incident: reads work, they just take the
+  sequential path.
+- **Anything else** (network, auth, schema drift, ClickHouse→PostgreSQL
+  connectivity) → a ``warning`` with the full traceback, naming the engine
+  table, ``ENERGYDB_SCHEMA``, and the fix.
+
+Either way the session latches the degrade, so later reads skip the engine
+without re-probing and without logging again.
+
+Provisioning credentials
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ClickHouse engine table needs PostgreSQL credentials to reach the
+``series_meta`` view. By default they are **inlined into the table's DDL**,
+where anyone with ``SHOW CREATE TABLE`` rights on the ClickHouse instance can
+read the password — so provisioning logs a warning saying exactly that
+whenever a password is actually being inlined.
+
+For production, put the connection in a `ClickHouse named collection
+<https://clickhouse.com/docs/en/operations/named-collections>`_ and point
+energydb at it:
+
+.. code-block:: bash
+
+   ENERGYDB_CH_PG_COLLECTION=my_pg_collection
+
+The password then stays out of both the DDL and ``SHOW CREATE TABLE``, and
+the warning goes away. One related knob:
+
+- ``ENERGYDB_CH_PG_HOST`` (``host:port``) — overrides the DSN's host for
+  **ClickHouse's** network vantage. The DSN addresses PostgreSQL from your
+  application, which is not necessarily how ClickHouse reaches it (e.g.
+  ``postgres:5432`` on a compose network vs ``127.0.0.1:5433`` locally).
+  Database, user, and password always come from the DSN — only the network
+  path differs.
 
 
 Run History
@@ -725,49 +958,144 @@ Run ids are client-side BIGINTs (top 63 bits of a UUID7), time-sortable, and
 fit cleanly in ``Int64``.
 
 
+.. _sdk-error-handling:
+
 Error Handling
 --------------
 
-Common errors and how to handle them:
+Every exception energydb raises deliberately lives in
+:mod:`energydb.errors` and derives from
+:class:`~energydb.errors.EnergyDBError`. Each class is also re-exported from
+the package root, so ``from energydb import SeriesNotFoundError`` works.
+
+.. code-block:: text
+
+   EnergyDBError
+   ├── NotFoundError              — an addressed entity does not exist
+   │   ├── NodeNotFoundError
+   │   ├── EdgeNotFoundError
+   │   └── SeriesNotFoundError
+   ├── AlreadyExistsError         — create-only violation
+   ├── ValidationError            — invalid arguments or invalid operation
+   │   ├── ManifestError          — structurally invalid manifest
+   │   └── UnchangedScopeError    — scope would drop OVERLAPPING revisions
+   ├── ConfigurationError         — client / environment misconfiguration
+   └── IncompatibleUnitError      — dimensionally incompatible unit conversion
+
+Catch the branch you mean:
 
 .. code-block:: python
 
-   from energydb import IncompatibleUnitError
+   from energydb import (
+       ManifestError,
+       NodeNotFoundError,
+       NotFoundError,
+       SeriesNotFoundError,
+   )
 
    try:
-       client.register_tree(portfolio)
-   except ValueError as e:
-       if "contains '/'" in str(e) or "must be non-empty" in str(e):
-           # Illegal node/edge/series name.
-           ...
-       else:
-           raise
+       df = client.read(manifest)
+   except SeriesNotFoundError as e:
+       # Every unresolved triple, structurally — not just the first.
+       for owner, data_type, name in e.missing:
+           log.warning("not registered: %s %s/%s", owner, data_type, name)
+   except ManifestError:
+       # The manifest itself is malformed — a bug in the producer.
+       raise
 
    try:
-       client.write(manifest)
-   except ValueError as e:
-       if "Series not registered" in str(e):
-           # Register series via register_tree first.
-           ...
-       elif "knowledge_time is required for OVERLAPPING" in str(e):
-           ...
-       else:
-           raise
-   except IncompatibleUnitError as e:
-       print(f"Unit mismatch: {e}")
+       node = client.get_node("my-portfolio", "Offshore-1", "T01").get()
+   except NodeNotFoundError as e:
+       e.path      # "my-portfolio/Offshore-1/T01"
+       e.uuid      # None — this call addressed by path
 
-Key exceptions:
+   # Or handle any absence uniformly.
+   except NotFoundError:
+       ...
 
-- ``ValueError`` — empty or ``/``-containing names, missing routing
-  columns, unresolved series, missing ``knowledge_time`` for OVERLAPPING,
-  illegal type changes, cycle-creating ``move_to``, ``List(Utf8)``
-  manifest paths (use ``Utf8`` joined with ``/``), uuid-already-exists on
-  ``register_tree``
-- ``RuntimeError`` — time-series ``read`` / ``write`` /
-  ``read_relative`` on a txn-bound scope (call them outside the
-  ``with``-block)
-- :class:`~energydb.IncompatibleUnitError` — unit conversion failed due to
-  dimensionality mismatch
+.. note::
+
+   **Every class above also subclasses** ``ValueError``. Broad
+   ``except ValueError`` handlers therefore catch all of them, which keeps
+   generic error-handling code working — but the typed classes are what you
+   want in new code, because message text is not a contract and the
+   structured fields are.
+
+Structured fields
+~~~~~~~~~~~~~~~~~
+
+The not-found family carries the identifiers the failing call was given, so
+callers (API servers especially) can react programmatically. Fields are
+keyword-only and default to ``None`` when the raise site does not know them;
+``str(e)`` is always the human-readable message.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Exception
+     - Fields
+   * - :class:`~energydb.errors.NodeNotFoundError`
+     - ``path``, ``uuid``
+   * - :class:`~energydb.errors.EdgeNotFoundError`
+     - ``uuid``, ``from_path``, ``to_path``, ``edge_type``
+   * - :class:`~energydb.errors.SeriesNotFoundError`
+     - ``route`` (``"path"`` / ``"node_uuid"`` / ``"edge_uuid"`` / the edge
+       triple), ``missing`` (every unresolved ``(owner, data_type, name)``)
+   * - :class:`~energydb.errors.UnchangedScopeError`
+     - ``overlapping_series_ids``
+
+What raises what
+~~~~~~~~~~~~~~~~
+
+- :class:`~energydb.errors.NotFoundError` — an addressed node, edge, or
+  series does not exist: a path or uuid that resolves to nothing, an edge
+  triple with no matching edge, a manifest triple with no registered series.
+- :class:`~energydb.errors.AlreadyExistsError` — create-only violations:
+  a UUID in a ``register_tree`` payload that already exists in the database,
+  a duplicate UUID on two elements of one tree, re-registering a series with
+  different immutable attributes.
+- :class:`~energydb.errors.ManifestError` — the manifest is structurally
+  wrong: no routing column, more than one routing column, a partial edge
+  triple, missing ``data_type`` / ``name``, a ``List(Utf8)`` ``path`` column
+  (use ``Utf8`` joined with ``/``), or null routing values.
+- :class:`~energydb.errors.UnchangedScopeError` —
+  ``unchanged_scope="valid_time"`` on a manifest containing OVERLAPPING
+  series, which would drop their republications. See
+  `Skipping unchanged writes`_.
+- :class:`~energydb.errors.ValidationError` — everything else the caller got
+  wrong: mutually exclusive kwargs passed together, an invalid enum or choice
+  value, a required field missing from an EDM payload, a naive (non-UTC)
+  datetime, a ``move_to`` that would create a cycle, ``dry_run=True`` inside
+  a transaction, an empty path.
+- :class:`~energydb.errors.ConfigurationError` — the client cannot be
+  constructed: no PostgreSQL connection configured, or a DSN that is not a
+  URI.
+- :class:`~energydb.IncompatibleUnitError` — a requested unit is not
+  dimensionally compatible with the series' ``canonical_unit``.
+- ``RuntimeError`` — time-series ``read`` / ``write`` / ``read_relative`` on
+  a txn-bound scope. Not part of the taxonomy: it reports misuse of the API's
+  shape rather than bad data. Call them outside the ``with``-block.
+
+Schema misconfiguration
+~~~~~~~~~~~~~~~~~~~~~~~
+
+If the configured schema does not contain energydb's tables — the wrong
+``ENERGYDB_SCHEMA``, or :meth:`~energydb.Client.create` never having run —
+queries fail with psycopg's own ``UndefinedTable``. energydb attaches a note
+to it naming the schema it searched, the environment variable that controls
+it, and the fix, so the traceback is actionable:
+
+.. code-block:: text
+
+   psycopg.errors.UndefinedTable: relation "node" does not exist
+   energydb: the configured schema 'analytics' (ENERGYDB_SCHEMA='analytics')
+   does not contain the energydb tables. Either run 'await client.create()'
+   once to provision them, or point ENERGYDB_SCHEMA at the schema that has
+   them.
+
+The exception type and message are unchanged — only a note is added — so
+existing handlers that catch psycopg errors are unaffected.
 
 
 Best Practices
@@ -814,9 +1142,42 @@ Best Practices
    fluent call replaces N targeted reads — the manifest pipeline batches
    resolution and the join in one round-trip.
 
-9. **Call ``invalidate_series_cache()`` only after a cross-process
-   schema change.** In-process registrations and deletions are tracked
-   automatically.
+9. **Catch typed exceptions, not message text.** ``except
+   SeriesNotFoundError`` (and its ``.missing`` list) says what you mean and
+   keeps saying it across releases; ``if "not registered" in str(e)`` does
+   not. See `Error Handling`_.
+
+10. **Reach for ``on_missing="skip"`` on wide reads.** A 1,500-series
+    manifest should not return nothing because one series was never
+    registered. Log ``result.missing`` and carry on.
+
+
+.. _sdk-upgrading:
+
+Upgrading to 0.9.0
+------------------
+
+No migration required: no schema change, and no ClickHouse engine-table
+re-provisioning. Four things are worth knowing:
+
+- **``unchanged_scope`` now defaults to ``"auto"``** on every write. For
+  FLAT-only manifests it is identical to the previous ``"valid_time"``
+  default; for manifests containing OVERLAPPING series it is the fix — those
+  republications are no longer dropped. Passing ``"valid_time"`` explicitly
+  with OVERLAPPING series in the manifest now raises
+  :class:`~energydb.errors.UnchangedScopeError` rather than losing data.
+- **``on_missing="skip"`` returns a** :class:`~energydb.ReadResult`, not a
+  bare frame. Only opted-in calls see this; the default is unchanged.
+- **The not-provisioned engine table logs at ``info``**, not ``warning`` with
+  a traceback. Alerting that matched on that warning will stop firing for
+  this cause — deliberately.
+- **``SHOW search_path`` echoes ``myschema,public``** (no space), because the
+  search path now travels in the libpq startup packet rather than a ``SET``
+  statement. Resolution is identical; only the spelling differs, which
+  matters solely to a deployment smoke-test that string-matches it.
+
+Existing ``except ValueError`` handlers keep working: every class in
+:mod:`energydb.errors` also subclasses ``ValueError``.
 
 
 Complete Example
@@ -855,7 +1216,7 @@ A complete workflow from setup to analysis:
    site = edb.Site(name="Offshore-1", lat=55.0, lon=3.0, members=[t01, t02])
    portfolio = edb.Portfolio(name="my-portfolio", members=[site])
 
-   # 2. Persist structure (idempotent).
+   # 2. Persist structure (create-only — raises if a UUID already exists).
    client.register_tree(portfolio)
 
    # 3. Targeted write — actual power for T01.

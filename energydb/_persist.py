@@ -6,13 +6,16 @@ gets the whole structure walk persisted atomically. ``register_tree_under``
 is structure-only (no timeseries data); manifest data writes go through
 ``_io.write_manifest``.
 
-Identity is the EDM ``Element.id`` (UUID7). ``create_node`` is create-only
-(``register_tree`` pre-validates that the uuid does not exist). Renames,
-moves, and property edits go through the scope mutators on
-:class:`NodeScope`. ``create_edge`` keeps an ``ON CONFLICT`` upsert because
-it's exposed as :meth:`Client.create_edge` and documented as idempotent.
-Edge endpoints are written straight into the FK columns
-``from_node_uuid`` / ``to_node_uuid`` — no path resolution at write time.
+Identity is the EDM ``Element.id`` (UUID7). ``register_tree_under`` is
+create-only (it pre-validates that no payload uuid exists) and persists the
+whole structure in three pipelined batches — nodes, edges, series — with
+materialized paths computed client-side from the DFS walk, so a tree costs
+a handful of round-trips instead of a few per row. Renames, moves, and
+property edits go through the scope mutators on :class:`NodeScope`.
+``create_edge`` keeps an ``ON CONFLICT`` upsert because it's exposed as
+:meth:`Client.create_edge` and documented as idempotent. Edge endpoints are
+written straight into the FK columns ``from_node_uuid`` / ``to_node_uuid``
+— no path resolution at write time.
 """
 
 from __future__ import annotations
@@ -29,57 +32,14 @@ from uuid6 import uuid7
 
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
+from energydb.errors import AlreadyExistsError, NodeNotFoundError, ValidationError
 from energydb.serialization import serialize_edge, serialize_node
-from energydb.series import validate_name
+from energydb.series import SERIES_INSERT_COLUMNS, prepare_series_row, validate_name
 from energydb.units import compute_unit_factor
 
 # ---------------------------------------------------------------------------
 # Node / edge persistence
 # ---------------------------------------------------------------------------
-
-
-async def create_node(
-    conn,
-    edm_obj,
-    *,
-    parent_uuid: UUID | None,
-) -> UUID:
-    """Insert one node under ``parent_uuid`` (or as a root if ``None``).
-
-    Caller (``_apply_diff``) is create-only and has already verified the
-    uuid does not exist, so a plain ``INSERT`` is enough. A colliding
-    ``(parent_uuid, name)`` pair surfaces as a uniqueness error from the
-    DB — kept implicit because the diff path can't reasonably preempt it
-    without a separate read round-trip.
-    """
-    row_data = serialize_node(edm_obj)
-    uuid_val: UUID = row_data["uuid"]
-    validate_name(row_data["name"], kind="node")
-
-    # Materialize ``path`` from the parent. For ``register_tree``'s DFS walk
-    # we could thread the parent's path through the recursion to skip this
-    # SELECT; deferred — the extra round-trip is cheap and the call sites
-    # would need a wider signature.
-    if parent_uuid is None:
-        path = row_data["name"]
-    else:
-        parent_row = await (
-            await conn.execute(
-                "SELECT path FROM node WHERE uuid = %s",
-                (parent_uuid,),
-            )
-        ).fetchone()
-        if parent_row is None:
-            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
-        path = f"{parent_row[0]}/{row_data['name']}"
-
-    await conn.execute(
-        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
-        (uuid_val, row_data["node_type"], row_data["name"], parent_uuid, path, row_data["data"]),
-    )
-
-    await _register_descriptors(conn, owner_col="node_uuid", owner_uuid=uuid_val, edm_obj=edm_obj)
-    return uuid_val
 
 
 async def create_node_raw(
@@ -112,7 +72,7 @@ async def create_node_raw(
             )
         ).fetchone()
         if parent_row is None:
-            raise ValueError(f"parent_uuid={parent_uuid} does not exist")
+            raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
         path = f"{parent_row[0]}/{name}"
 
     await conn.execute(
@@ -177,7 +137,7 @@ async def create_edge(
         if existing is None:
             raise RuntimeError("edge upsert returned no row and follow-up SELECT found nothing")
         if existing[0] != row_data["edge_type"]:
-            raise ValueError(
+            raise AlreadyExistsError(
                 f"Cannot persist {row_data['edge_type']!r} with id={uuid_val}: a "
                 f"{existing[0]!r} with the same id already exists. "
                 f"Edge type is immutable for a given id."
@@ -198,7 +158,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     """
     ref = getattr(edm_obj, attr, None)
     if ref is None:
-        raise ValueError(f"Edge {attr} is unset; cannot persist edge.")
+        raise ValidationError(f"Edge {attr} is unset; cannot persist edge.")
     if not isinstance(ref, Reference):
         raise TypeError(f"Edge {attr} must be a Reference, got {type(ref).__name__}.")
     uuid_val = ref.id
@@ -206,7 +166,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     if tree_root is not None:
         index = tree_root.index()
         if uuid_val not in index:
-            raise ValueError(
+            raise ValidationError(
                 f"Edge {attr} refers to {uuid_val} which is not in the tree rooted at "
                 f"{type(tree_root).__name__}({getattr(tree_root, 'name', None)!r}). "
                 f"Cross-tree edges are not supported."
@@ -247,8 +207,9 @@ async def register_tree_under(
     _validate_no_inline_data(edm_obj)
 
     target_nodes, target_edges, node_objs, edge_objs, root_uuid = _collect_target_state(edm_obj, parent_uuid)
-    existing_node_uuids = await _existing_uuids(conn, "node", list(target_nodes.keys()))
-    existing_edge_uuids = await _existing_uuids(conn, "edge", list(target_edges.keys()))
+    existing_node_uuids, existing_edge_uuids = await _existing_uuids(
+        conn, list(target_nodes.keys()), list(target_edges.keys())
+    )
 
     if existing_node_uuids or existing_edge_uuids:
         parts = []
@@ -256,7 +217,7 @@ async def register_tree_under(
             parts.append(f"node uuid(s): {', '.join(str(u) for u in existing_node_uuids)}")
         if existing_edge_uuids:
             parts.append(f"edge uuid(s): {', '.join(str(u) for u in existing_edge_uuids)}")
-        raise ValueError(
+        raise AlreadyExistsError(
             f"register_tree is create-only; the payload contains "
             f"{len(existing_node_uuids)} node(s) and {len(existing_edge_uuids)} "
             f"edge(s) whose UUIDs already exist ({'; '.join(parts)}). "
@@ -275,15 +236,100 @@ async def register_tree_under(
     if dry_run:
         return root_uuid, diff
 
-    # node_objs is in DFS order (parent-before-child) — exactly what the
-    # parent_uuid FK chain needs. Edges go second once their endpoints exist.
-    # Series declarations attached to each owner are registered as a side
-    # effect of create_node / create_edge.
-    for uid, obj in node_objs.items():
-        await create_node(conn, obj, parent_uuid=target_nodes[uid].parent_uuid)
-    for obj in edge_objs.values():
-        await create_edge(conn, obj, tree_root=edm_obj)
+    # Batched persistence: the whole structure goes to PG in three pipelined
+    # statements (nodes, edges, series) instead of a few round-trips per row.
+    # Paths are materialized client-side from the DFS walk; the only per-tree
+    # lookup is the graft parent's path (which doubles as its existence check).
+    parent_path: str | None = None
+    if parent_uuid is not None:
+        parent_row = await (await conn.execute("SELECT path FROM node WHERE uuid = %s", (parent_uuid,))).fetchone()
+        if parent_row is None:
+            raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
+        parent_path = parent_row[0]
+
+    paths: dict[UUID, str] = {}
+    node_rows: list[tuple] = []
+    for uid, snap in target_nodes.items():  # DFS order: parent before child, as the FK chain needs
+        validate_name(snap.name, kind="node")
+        if snap.parent_uuid is None:
+            path = snap.name
+        elif snap.parent_uuid in paths:
+            path = f"{paths[snap.parent_uuid]}/{snap.name}"
+        else:  # the payload root, grafted under the existing parent
+            path = f"{parent_path}/{snap.name}"
+        paths[uid] = path
+        node_rows.append((uid, snap.node_type, snap.name, snap.parent_uuid, path, Jsonb(snap.data)))
+
+    # Plain INSERTs (no upsert): the create-only pre-check above already
+    # guarantees none of these uuids exist. A colliding (parent_uuid, name)
+    # pair still surfaces as the DB uniqueness error, exactly as before.
+    edge_rows: list[tuple] = []
+    for snap in target_edges.values():
+        if snap.name is not None:
+            validate_name(snap.name, kind="edge")
+        edge_rows.append(
+            (snap.uuid, snap.edge_type, snap.name, snap.from_node_uuid, snap.to_node_uuid, Jsonb(snap.data))
+        )
+
+    series_rows = _collect_series_rows(node_objs, edge_objs)
+
+    # One explicit pipeline around all three batches: every INSERT is queued
+    # and the whole structure needs a single network sync, rather than
+    # relying on executemany's per-call internal pipelining.
+    async with conn.pipeline(), conn.cursor() as cur:
+        await cur.executemany(
+            "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+            node_rows,
+        )
+        if edge_rows:
+            await cur.executemany(
+                "INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                edge_rows,
+            )
+        if series_rows:
+            await cur.executemany(
+                f"INSERT INTO series ({', '.join(SERIES_INSERT_COLUMNS)}) "
+                f"VALUES ({', '.join(['%s'] * len(SERIES_INSERT_COLUMNS))})",
+                series_rows,
+            )
     return root_uuid, diff
+
+
+# Param indices into a prepare_series_row tuple (see SERIES_INSERT_COLUMNS).
+_S_DT = SERIES_INSERT_COLUMNS.index("data_type")
+_S_NAME = SERIES_INSERT_COLUMNS.index("name")
+_S_UNIT = SERIES_INSERT_COLUMNS.index("canonical_unit")
+_S_RET = SERIES_INSERT_COLUMNS.index("retention")
+
+
+def _collect_series_rows(node_objs: dict[UUID, Any], edge_objs: dict[UUID, Any]) -> list[tuple]:
+    """One validated INSERT tuple per unique series declaration on the tree.
+
+    Every owner is freshly created by this call, so the only possible
+    conflict is a duplicate declaration inside the payload itself. Mirroring
+    :func:`energydb.series.register_series`'s DB-driven contract: identical
+    duplicates collapse to one row (the single-row path would have returned
+    the existing series_id), duplicates that disagree on the immutable
+    fields (canonical_unit, retention) raise.
+    """
+    rows: dict[tuple, tuple] = {}
+    for owner_col, objs in (("node_uuid", node_objs), ("edge_uuid", edge_objs)):
+        for uid, obj in objs.items():
+            for ts in getattr(obj, "timeseries", None) or []:
+                row = prepare_series_row(owner_col=owner_col, owner_uuid=uid, **_ts_register_args(ts))
+                key = (owner_col, uid, row[_S_DT], row[_S_NAME])
+                prev = rows.get(key)
+                if prev is None:
+                    rows[key] = row
+                elif (prev[_S_UNIT], prev[_S_RET]) != (row[_S_UNIT], row[_S_RET]):
+                    raise AlreadyExistsError(
+                        f"Series ({owner_col}={uid}, data_type={row[_S_DT]!r}, name={row[_S_NAME]!r}) "
+                        f"is declared twice on the tree with conflicting immutable fields: "
+                        f"canonical_unit={prev[_S_UNIT]!r} vs {row[_S_UNIT]!r}, "
+                        f"retention={prev[_S_RET]!r} vs {row[_S_RET]!r}."
+                    )
+    return list(rows.values())
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +364,7 @@ def _collect_target_state(
             edge_queue.append(obj)
             return
         if obj.id in node_snaps:
-            raise ValueError(
+            raise AlreadyExistsError(
                 f"Duplicate UUID {obj.id} on two distinct nodes in the tree. Each Element must have a unique id."
             )
         row = serialize_node(obj)
@@ -339,14 +385,14 @@ def _collect_target_state(
     edge_objs: dict[UUID, Any] = {}
     for child in edge_queue:
         if child.id in edge_snaps:
-            raise ValueError(f"Duplicate UUID {child.id} on two distinct edges in the tree.")
+            raise AlreadyExistsError(f"Duplicate UUID {child.id} on two distinct edges in the tree.")
         row = serialize_edge(child)
         from_uuid = _endpoint_uuid(child, "from_element", edm_obj)
         to_uuid = _endpoint_uuid(child, "to_element", edm_obj)
         if from_uuid not in node_snaps:
-            raise ValueError(f"Edge {child.id} from_element {from_uuid} is not in the tree.")
+            raise ValidationError(f"Edge {child.id} from_element {from_uuid} is not in the tree.")
         if to_uuid not in node_snaps:
-            raise ValueError(f"Edge {child.id} to_element {to_uuid} is not in the tree.")
+            raise ValidationError(f"Edge {child.id} to_element {to_uuid} is not in the tree.")
         edge_snaps[child.id] = EdgeSnapshot(
             uuid=child.id,
             edge_type=row["edge_type"],
@@ -365,24 +411,22 @@ def _collect_target_state(
 # ---------------------------------------------------------------------------
 
 
-async def _existing_uuids(conn, table: str, uuids: list[UUID]) -> list[UUID]:
-    """Return the subset of ``uuids`` that exist in ``{table}``.
+async def _existing_uuids(conn, node_uuids: list[UUID], edge_uuids: list[UUID]) -> tuple[list[UUID], list[UUID]]:
+    """The subsets of the payload's node/edge uuids that already exist.
 
-    Lighter than ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids``
-    when the caller only needs to know *whether* the rows exist (e.g. the
-    create-only pre-check on ``register_tree``). ``table`` is interpolated
-    into the SQL and must be one of the trusted internal values
-    ``"node"`` / ``"edge"``.
+    One round-trip for both tables (UNION ALL over the two indexed probes) —
+    this is the create-only pre-check on ``register_tree``. Lighter than
+    ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids`` when the caller
+    only needs to know *whether* the rows exist.
     """
-    if not uuids:
-        return []
     rows = await (
         await conn.execute(
-            f"SELECT uuid FROM {table} WHERE uuid = ANY(%s)",
-            (uuids,),
+            "SELECT 0 AS kind, uuid FROM node WHERE uuid = ANY(%s) "
+            "UNION ALL SELECT 1, uuid FROM edge WHERE uuid = ANY(%s)",
+            (node_uuids, edge_uuids),
         )
     ).fetchall()
-    return [r[0] for r in rows]
+    return [r[1] for r in rows if r[0] == 0], [r[1] for r in rows if r[0] == 1]
 
 
 async def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnapshot]:
@@ -434,7 +478,7 @@ def _validate_no_inline_data(edm_obj) -> None:
         for ts in ts_list:
             if ts.df is not None and ts.df.height > 0:
                 obj_name = getattr(obj, "name", "<unnamed>")
-                raise ValueError(
+                raise ValidationError(
                     f"register_tree() received {obj_name!r} with inline timeseries data "
                     f"(name={ts.name!r}, rows={ts.df.height}). register_tree() is "
                     f"structure-only — write data separately with client.write(df)."
@@ -462,6 +506,34 @@ async def _register_descriptors(
         await _register_one(conn, owner_col=owner_col, owner_uuid=owner_uuid, ts=ts)
 
 
+def _ts_register_args(ts: TimeSeries) -> dict[str, Any]:
+    """Normalize a ``TimeSeries``' registration fields.
+
+    Shared by the single-row path (:func:`_register_one`, via
+    ``create_edge``) and the batched ``register_tree`` path, so both agree
+    on field extraction and the required-field errors.
+    """
+    name = ts.name
+    data_type = str(ts.data_type).lower() if ts.data_type is not None else None
+    ts_type = ts.timeseries_type
+    timeseries_type = ts_type.value if isinstance(ts_type, TimeSeriesType) else (str(ts_type) if ts_type else None)
+
+    if name is None:
+        raise ValidationError("ts.name is required")
+    if data_type is None:
+        raise ValidationError(f"ts.data_type is required for {name!r}")
+    if timeseries_type is None:
+        raise ValidationError(f"ts.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
+
+    return {
+        "data_type": data_type,
+        "name": name,
+        "canonical_unit": ts.unit,
+        "timeseries_type": timeseries_type,
+        "description": ts.description,
+    }
+
+
 async def _register_one(
     conn,
     *,
@@ -470,29 +542,7 @@ async def _register_one(
     ts: TimeSeries,
 ) -> int:
     """Register one series row using ``series_mod.register_series``."""
-    name = ts.name
-    canonical_unit = ts.unit
-    data_type = str(ts.data_type).lower() if ts.data_type is not None else None
-    ts_type = ts.timeseries_type
-    timeseries_type = ts_type.value if isinstance(ts_type, TimeSeriesType) else (str(ts_type) if ts_type else None)
-
-    if name is None:
-        raise ValueError("ts.name is required")
-    if data_type is None:
-        raise ValueError(f"ts.data_type is required for {name!r}")
-    if timeseries_type is None:
-        raise ValueError(f"ts.timeseries_type is required for {name!r} (FLAT | OVERLAPPING)")
-
-    return await series_mod.register_series(
-        conn,
-        owner_col=owner_col,
-        owner_uuid=owner_uuid,
-        data_type=data_type,
-        name=name,
-        canonical_unit=canonical_unit,
-        timeseries_type=timeseries_type,
-        description=ts.description,
-    )
+    return await series_mod.register_series(conn, owner_col=owner_col, owner_uuid=owner_uuid, **_ts_register_args(ts))
 
 
 # ---------------------------------------------------------------------------

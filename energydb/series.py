@@ -22,6 +22,8 @@ from uuid import UUID
 import polars as pl
 from timedb import RETENTION_TIERS
 
+from energydb.errors import AlreadyExistsError, EdgeNotFoundError, ValidationError
+
 OwnerCol = Literal["node_uuid", "edge_uuid"]
 
 _VALID_TIMESERIES_TYPES = {"FLAT", "OVERLAPPING"}
@@ -41,12 +43,12 @@ _CONFLICT_CONSTRAINT_BY_OWNER = {
 
 def _validate_timeseries_type(ts_type: str) -> None:
     if ts_type not in _VALID_TIMESERIES_TYPES:
-        raise ValueError(f"Unknown timeseries_type {ts_type!r}. Valid values: {sorted(_VALID_TIMESERIES_TYPES)}")
+        raise ValidationError(f"Unknown timeseries_type {ts_type!r}. Valid values: {sorted(_VALID_TIMESERIES_TYPES)}")
 
 
 def _validate_retention(retention: str) -> None:
     if retention not in RETENTION_TIERS:
-        raise ValueError(f"Unknown retention {retention!r}. Valid values: {sorted(RETENTION_TIERS)}")
+        raise ValidationError(f"Unknown retention {retention!r}. Valid values: {sorted(RETENTION_TIERS)}")
 
 
 def validate_name(name: str, *, kind: str) -> None:
@@ -60,12 +62,56 @@ def validate_name(name: str, *, kind: str) -> None:
     if not isinstance(name, str):
         raise TypeError(f"{kind} name must be a string, got {type(name).__name__}")
     if len(name) == 0:
-        raise ValueError(f"{kind} name must be non-empty.")
+        raise ValidationError(f"{kind} name must be non-empty.")
     if "/" in name:
-        raise ValueError(
+        raise ValidationError(
             f"{kind} name {name!r} contains '/'. '/' is reserved as the path "
             f"separator and may not appear inside a node, edge, or series name."
         )
+
+
+# Column order of SERIES_INSERT_SQL params -- shared by the single-row upsert
+# below and the batched register_tree path in ``_persist``.
+SERIES_INSERT_COLUMNS = (
+    "node_uuid",
+    "edge_uuid",
+    "data_type",
+    "name",
+    "canonical_unit",
+    "timeseries_type",
+    "retention",
+    "description",
+)
+
+
+def prepare_series_row(
+    *,
+    owner_col: OwnerCol,
+    owner_uuid: UUID,
+    data_type: str,
+    name: str,
+    canonical_unit: str,
+    timeseries_type: str,
+    retention: str | None = None,
+    description: str | None = None,
+) -> tuple:
+    """Validate + normalize one series declaration; return the INSERT param tuple.
+
+    Pure (no I/O): validation and the shape-derived retention default
+    (FLAT → ``"forever"``, OVERLAPPING → ``"medium"``) live here so the
+    single-row upsert and the batched ``register_tree`` insert agree exactly.
+    Param order is :data:`SERIES_INSERT_COLUMNS`.
+    """
+    _validate_timeseries_type(timeseries_type)
+    validate_name(name, kind="series")
+    if retention is None:
+        retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
+    _validate_retention(retention)
+
+    # Populate the right column based on owner_col; the other stays NULL.
+    node_uuid = owner_uuid if owner_col == "node_uuid" else None
+    edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
+    return (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description)
 
 
 async def register_series(
@@ -90,15 +136,17 @@ async def register_series(
     If ``retention`` is omitted, it is derived from ``timeseries_type``:
     FLAT (actuals) → ``"forever"``, OVERLAPPING (forecasts) → ``"medium"``.
     """
-    _validate_timeseries_type(timeseries_type)
-    validate_name(name, kind="series")
-    if retention is None:
-        retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
-    _validate_retention(retention)
-
-    # Populate the right column based on owner_col; the other stays NULL.
-    node_uuid = owner_uuid if owner_col == "node_uuid" else None
-    edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
+    params = prepare_series_row(
+        owner_col=owner_col,
+        owner_uuid=owner_uuid,
+        data_type=data_type,
+        name=name,
+        canonical_unit=canonical_unit,
+        timeseries_type=timeseries_type,
+        retention=retention,
+        description=description,
+    )
+    retention = params[SERIES_INSERT_COLUMNS.index("retention")]
     conflict_constraint = _CONFLICT_CONSTRAINT_BY_OWNER[owner_col]
 
     row = await (
@@ -111,7 +159,7 @@ async def register_series(
             ON CONFLICT ON CONSTRAINT {conflict_constraint} DO NOTHING
             RETURNING series_id
             """,
-            (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description),
+            params,
         )
     ).fetchone()
 
@@ -131,7 +179,7 @@ async def register_series(
         raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
     existing_sid, existing_unit, existing_retention = existing
     if existing_unit != canonical_unit or existing_retention != retention:
-        raise ValueError(
+        raise AlreadyExistsError(
             f"Series ({owner_col}={owner_uuid}, data_type={data_type!r}, name={name!r}) "
             f"already exists with canonical_unit={existing_unit!r}, "
             f"retention={existing_retention!r}; cannot re-register with "
@@ -141,84 +189,76 @@ async def register_series(
     return existing_sid
 
 
-async def resolve_for_read(
+async def resolve_subtree_series_for_read(
     conn,
     *,
-    owner_col: OwnerCol,
-    owner_uuids: list[UUID],
+    root_path: str | None = None,
+    start_uuid: UUID | None = None,
+    rel_path: str | None = None,
+    where_conds: list[str] | None = None,
+    where_params: list[Any] | None = None,
     data_type: str | None = None,
     name: str | None = None,
 ) -> pl.DataFrame:
-    """Bulk resolve series rows for a read.
+    """Resolve a node subtree straight to per-series read meta in ONE round-trip.
 
-    Single PG round-trip: joins through the owner row(s) to also fetch the
-    materialized hierarchy path(s) — so the post-read attach step needs no
-    further PG calls. For ``owner_col="node_uuid"`` the result carries a
-    ``path`` column; for ``owner_col="edge_uuid"`` it carries
-    ``edge_type``, ``from_path`` and ``to_path``. UUIDs are returned as
-    ``Utf8`` so they join cleanly against the string-form ids the manifest
-    pipeline carries. Empty df if nothing matches.
+    A single query walks root → subtree (materialized-path prefix scan) →
+    ``series`` ⋈ ``node``, replacing the former ``resolve_node_uuid`` +
+    ``resolve_subtree_uuids`` + per-owner series scan chain on the node
+    read path (which round-tripped the resolved uuid set back to PG as an
+    ``ANY()`` param). The root is given either as ``root_path`` (a ``/``-joined
+    path the caller already holds) or as ``start_uuid`` (+ optional ``rel_path``
+    for relative navigation), whose path is derived inline via a CTE so the
+    resolve stays one round-trip.
+
+    ``where_conds`` / ``where_params`` are extra subtree-node predicates from
+    :func:`build_filter_conditions` (qualified with ``table_alias="n"``).
+    Returns one row per series with the per-series read-meta columns
+    (``series_id``, ``canonical_unit``, ``timeseries_type``, ``retention``,
+    ``node_uuid``, ``data_type``, ``name``, ``path``). Empty df if the subtree
+    is empty or nothing matches.
     """
-    conditions = [f"s.{owner_col} = ANY(%s)"]
-    params: list[Any] = [owner_uuids]
-
-    if data_type:
-        conditions.append("s.data_type = %s")
-        params.append(data_type)
-    if name:
-        conditions.append("s.name = %s")
-        params.append(name)
-
-    if owner_col == "node_uuid":
-        select_extra = ", n.path AS path"
-        join_sql = "JOIN node n ON n.uuid = s.node_uuid"
+    cte_params: list[Any] = []
+    if root_path is not None:
+        root_cte = "SELECT %s::text AS rp"
+        cte_params.append(root_path)
+    elif start_uuid is not None and rel_path:
+        root_cte = "SELECT (path || '/' || %s) AS rp FROM node WHERE uuid = %s"
+        cte_params.extend([rel_path, start_uuid])
+    elif start_uuid is not None:
+        root_cte = "SELECT path AS rp FROM node WHERE uuid = %s"
+        cte_params.append(start_uuid)
     else:
-        select_extra = ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path"
-        join_sql = (
-            "JOIN edge e   ON e.uuid = s.edge_uuid "
-            "JOIN node fn  ON fn.uuid = e.from_node_uuid "
-            "JOIN node tn  ON tn.uuid = e.to_node_uuid"
-        )
+        raise ValidationError("resolve_subtree_series_for_read needs root_path or start_uuid.")
 
-    # ``::text`` casts on the uuid columns: PG returns strings directly,
-    # skipping psycopg's per-row UUID-object parse — ~15ms cheaper at
-    # scale=200 on the 7-col SELECT compared to letting psycopg parse.
-    sql = (
-        "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
-        "s.node_uuid::text, s.edge_uuid::text, s.data_type, s.name" + select_extra + " "
-        "FROM series s " + join_sql + " "
-        "WHERE " + " AND ".join(conditions)
-    )
-    rows = await (await conn.execute(sql, params)).fetchall()
+    where_parts = list(where_conds or [])
+    where_vals: list[Any] = list(where_params or [])
+    if data_type:
+        where_parts.append("s.data_type = %s")
+        where_vals.append(data_type)
+    if name:
+        where_parts.append("s.name = %s")
+        where_vals.append(name)
+    where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
 
-    if owner_col == "node_uuid":
-        return pl.DataFrame(
-            [
-                {
-                    "series_id": r[0],
-                    "canonical_unit": r[1],
-                    "timeseries_type": r[2],
-                    "retention": r[3],
-                    "node_uuid": r[4],
-                    "edge_uuid": r[5],
-                    "data_type": r[6],
-                    "name": r[7],
-                    "path": r[8],
-                }
-                for r in rows
-            ],
-            schema={
-                "series_id": pl.Int64,
-                "canonical_unit": pl.Utf8,
-                "timeseries_type": pl.Utf8,
-                "retention": pl.Utf8,
-                "node_uuid": pl.Utf8,
-                "edge_uuid": pl.Utf8,
-                "data_type": pl.Utf8,
-                "name": pl.Utf8,
-                "path": pl.Utf8,
-            },
-        )
+    # The subtree prefix is the root path or a DB-derived path (start_uuid
+    # branch), so it can't always be escaped Python-side; inline the LIKE
+    # metacharacter escape in SQL — the former ``energydb._like_esc`` helper,
+    # dropped from the schema, expanded here — to keep the resolve one round-trip.
+    sql = rf"""
+        WITH root AS ({root_cte})
+        SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               s.node_uuid::text AS node_uuid, s.data_type, s.name, n.path AS path
+        FROM root r
+        JOIN node n
+          ON (n.path = r.rp
+              OR n.path LIKE
+                 replace(replace(replace(r.rp, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_')
+                 || '/%%' ESCAPE '\')
+        JOIN series s ON s.node_uuid = n.uuid
+        WHERE TRUE{where_clause}
+    """
+    rows = await (await conn.execute(sql, [*cte_params, *where_vals])).fetchall()
 
     return pl.DataFrame(
         [
@@ -228,12 +268,9 @@ async def resolve_for_read(
                 "timeseries_type": r[2],
                 "retention": r[3],
                 "node_uuid": r[4],
-                "edge_uuid": r[5],
-                "data_type": r[6],
-                "name": r[7],
-                "edge_type": r[8],
-                "from_path": r[9],
-                "to_path": r[10],
+                "data_type": r[5],
+                "name": r[6],
+                "path": r[7],
             }
             for r in rows
         ],
@@ -243,6 +280,101 @@ async def resolve_for_read(
             "timeseries_type": pl.Utf8,
             "retention": pl.Utf8,
             "node_uuid": pl.Utf8,
+            "data_type": pl.Utf8,
+            "name": pl.Utf8,
+            "path": pl.Utf8,
+        },
+    )
+
+
+async def resolve_edge_series_for_read(
+    conn,
+    *,
+    edge_uuid: UUID | None = None,
+    from_path: str | None = None,
+    to_path: str | None = None,
+    edge_type: str | None = None,
+    data_type: str | None = None,
+    name: str | None = None,
+) -> pl.DataFrame:
+    """Resolve an edge's series for a read in ONE round-trip.
+
+    The edge is addressed by ``edge_uuid`` OR by its
+    ``(from_path, to_path, edge_type)`` triple; the triple form collapses the
+    former three-step chain (paths → uuids, edge lookup, series scan) into a
+    single query. The endpoint paths and ``edge_type`` ride along on the join,
+    so the post-read attach step needs no further PG calls.
+
+    ``series`` is LEFT-JOINed so an existing edge with no (matching) series
+    still returns a row — distinguishing "edge not found" from "no series":
+
+    * triple-addressed + edge missing → raises ``ValueError`` (same contract
+      as the former ``resolve_edge_uuid`` lookup);
+    * uuid-addressed + edge missing → empty df (historical contract);
+    * edge exists, nothing matches → empty df.
+    """
+    join_conds = ["s.edge_uuid = e.uuid"]
+    join_params: list[Any] = []
+    if data_type:
+        join_conds.append("s.data_type = %s")
+        join_params.append(data_type)
+    if name:
+        join_conds.append("s.name = %s")
+        join_params.append(name)
+
+    if edge_uuid is not None:
+        where_sql = "e.uuid = %s"
+        where_params: list[Any] = [edge_uuid]
+    elif from_path is not None and to_path is not None and edge_type is not None:
+        where_sql = "fn.path = %s AND tn.path = %s AND e.edge_type = %s"
+        where_params = [from_path, to_path, edge_type]
+    else:
+        raise ValidationError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
+
+    # ``::text`` cast on the uuid column: PG returns strings directly,
+    # skipping psycopg's per-row UUID-object parse.
+    sql = (
+        "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
+        "s.edge_uuid::text, s.data_type, s.name, "
+        "e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path "
+        "FROM edge e "
+        "JOIN node fn ON fn.uuid = e.from_node_uuid "
+        "JOIN node tn ON tn.uuid = e.to_node_uuid "
+        "LEFT JOIN series s ON " + " AND ".join(join_conds) + " "
+        "WHERE " + where_sql
+    )
+    rows = await (await conn.execute(sql, [*join_params, *where_params])).fetchall()
+
+    if not rows and edge_uuid is None:
+        raise EdgeNotFoundError(
+            f"Edge not found: type={edge_type!r} from={from_path!r} to={to_path!r}",
+            from_path=from_path,
+            to_path=to_path,
+            edge_type=edge_type,
+        )
+
+    return pl.DataFrame(
+        [
+            {
+                "series_id": r[0],
+                "canonical_unit": r[1],
+                "timeseries_type": r[2],
+                "retention": r[3],
+                "edge_uuid": r[4],
+                "data_type": r[5],
+                "name": r[6],
+                "edge_type": r[7],
+                "from_path": r[8],
+                "to_path": r[9],
+            }
+            for r in rows
+            if r[0] is not None  # LEFT-JOIN row for a series-less edge
+        ],
+        schema={
+            "series_id": pl.Int64,
+            "canonical_unit": pl.Utf8,
+            "timeseries_type": pl.Utf8,
+            "retention": pl.Utf8,
             "edge_uuid": pl.Utf8,
             "data_type": pl.Utf8,
             "name": pl.Utf8,

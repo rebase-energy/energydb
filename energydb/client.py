@@ -24,11 +24,12 @@ API split:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -38,29 +39,76 @@ if TYPE_CHECKING:
 
 import pandas as pd
 import polars as pl
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
 from timedb import TimeDBClient, UnchangedScope, profiling
 
 from energydb import runs as runs_mod
+from energydb._ch_meta_engine import (
+    CH_ENGINE_TABLE,
+    DROP_ENGINE_TABLE,
+    DROP_LEGACY_ENGINE_TABLE,
+    engine_table_ddl,
+    inlines_pg_password,
+)
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, read_manifest, read_relative_manifest, write_manifest
+from energydb._io import (
+    ReadResult,
+    WriteResult,
+    annotate_undefined_table,
+    autocommit_read_conn,
+    engine_meta_for_manifest,
+    execute_read,
+    write_manifest,
+)
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
-from energydb.models import SCHEMA, Base
+from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
+from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
 from energydb.paths import (
+    OnMissing,
     Path,
     _like_escape,
     build_filter_conditions,
+    derived_prefix_like,
     resolve_node_uuid,
-    resolve_subtree_uuids,
 )
 from energydb.scope import EdgeScope, NodeScope, _coerce_path
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
-_SEARCH_PATH = f"SET search_path TO {SCHEMA}, public" if SCHEMA else "SET search_path TO public"
+logger = logging.getLogger(__name__)
+
+
+def _pool_conninfo(conninfo: str) -> str:
+    """``conninfo`` plus a startup ``options`` carrying energydb's search path.
+
+    The search path used to be a ``SET`` + ``commit()`` in the pool's ``configure``
+    callback — one extra round-trip on every checkout (the commit was needed
+    because an uncommitted ``SET`` leaves the connection in a transaction, which
+    ``psycopg_pool`` rejects). As a libpq startup option it travels in the startup
+    packet instead: set once per connection, zero per-checkout cost.
+
+    Only the pool sees this. ``self._dsn`` keeps the caller's URI, because
+    :meth:`AsyncClient._sqlalchemy_url`, :func:`engine_table_ddl` and
+    :meth:`AsyncClient._safe_dsn` all parse it as one and ``make_conninfo``
+    emits key=value.
+
+    A caller's own ``options`` are preserved and appended to, never clobbered.
+    The search path itself mirrors the previous ``SET`` exactly: ``"{schema},
+    public"`` for a named schema, plain ``"public"`` by default (rather than
+    ``public,public``, which would make ``SHOW search_path`` confusing).
+
+    Caveat: startup options travel in the libpq startup packet, so a connection
+    pooler in transaction-pooling mode may not honour them per-client. energydb's
+    supported deployments (direct PostgreSQL / Neon) do.
+    """
+    search_path = f"{SCHEMA},public" if SCHEMA else "public"
+    existing = conninfo_to_dict(conninfo).get("options") or ""
+    options = f"{existing} -c search_path={search_path}".strip() if existing else f"-c search_path={search_path}"
+    return make_conninfo(conninfo, options=options)
 
 
 class AsyncClient:
@@ -87,12 +135,21 @@ class AsyncClient:
         pg_conninfo: str | None = None,
         ch_url: str | None = None,
     ):
-        """Construct a client."""
+        """Construct a client.
+
+        Reads run the PG meta-resolve and the CH value read **in parallel**
+        whenever the read is expressible over the ClickHouse engine table
+        (provisioned by :meth:`create` for fresh DBs, or explicitly by
+        :meth:`setup_ch_meta_engine`); anything else — and any engine failure —
+        uses the sequential path, with identical results. Set
+        ``ENERGYDB_DISABLE_ENGINE=1`` to force sequential reads for the whole
+        session (ops kill-switch; also what benchmarks use for before/after).
+        """
         conninfo = pg_conninfo or os.environ.get("TIMEDB_PG_DSN") or os.environ.get("DATABASE_URL")
         if not conninfo:
-            raise ValueError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
+            raise ConfigurationError("PostgreSQL connection not configured. Pass pg_conninfo or set TIMEDB_PG_DSN.")
         if "://" not in conninfo:
-            raise ValueError(
+            raise ConfigurationError(
                 "pg_conninfo must be a URI (e.g. postgresql://user:pass@host/db); "
                 "key=value DSNs are not supported here because the schema-create path "
                 "needs a SQLAlchemy URL."
@@ -100,74 +157,32 @@ class AsyncClient:
         self._dsn = conninfo
 
         async def _configure(conn):
-            await conn.execute(_SEARCH_PATH)
             # ``prepare_threshold=1`` makes psycopg cache a server-side
             # prepared statement after the first execution of each SQL text.
             # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
             # (PG parse+plan stage skipped on subsequent calls).
+            # Client-side attribute only: no round-trip, no transaction opened,
+            # hence no commit (the search path now rides the startup packet —
+            # see :func:`_pool_conninfo`).
             conn.prepare_threshold = 1
-            await conn.commit()
 
         self._pool = AsyncConnectionPool(
-            conninfo=conninfo,
+            conninfo=_pool_conninfo(conninfo),
             min_size=1,
             max_size=10,
             open=False,
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
+        # Set on the first engine-read failure (or by the env kill-switch): the rest of the
+        # session uses the sequential resolve without re-trying the engine.
+        # setup_ch_meta_engine() resets it.
+        self._engine_unavailable = os.environ.get("ENERGYDB_DISABLE_ENGINE") == "1"
 
     async def open(self) -> None:
         """Open the async connection pool. Await once before first use."""
         self._require_root("open")
         await self._pool.open()
-
-    # ------------------------------------------------------------------
-    # Namespacing
-    # ------------------------------------------------------------------
-
-    def namespace(self, ns: str) -> AsyncClient:
-        """Return a view of this client bound to one namespace.
-
-        The view shares the parent's connection pool and ClickHouse client;
-        it is a cheap, disposable dict-copy — create one per request. Every
-        PG round-trip made through the view first binds the transaction-local
-        ``energydb.namespace`` GUC (see :meth:`_conn`), which row-level
-        security policies — when installed — use to filter every table to
-        that namespace. Lifecycle and schema operations (:meth:`open`,
-        :meth:`close`, :meth:`create`, :meth:`delete`) stay with the root
-        client and raise on a view.
-        """
-        if not ns:
-            raise ValueError("namespace must be a non-empty string")
-        clone = object.__new__(type(self))
-        clone.__dict__ = {**self.__dict__, "_namespace": ns, "_owns_pool": False}
-        return clone
-
-    def _require_root(self, op: str) -> None:
-        """Raise unless called on a root client (namespaced views share the
-        pool and must never manage its lifecycle or touch schema DDL)."""
-        if not self._owns_pool:
-            raise RuntimeError(f"{op}() is not available on a namespaced view — call it on the root client")
-
-    @asynccontextmanager
-    async def _conn(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
-        """Borrow a pooled connection — the single checkout point for every
-        PG round-trip below (and in ``scope`` / ``_io`` / ``_transaction``).
-
-        On a namespaced view, the transaction-local ``energydb.namespace``
-        GUC is bound first. ``set_config(..., is_local := true)`` is
-        ``SET LOCAL`` in function form — parameterizable and server-side
-        preparable — so the value dies with the transaction and nothing
-        leaks when the connection returns to the shared pool.
-        """
-        async with self._pool.connection() as conn:
-            if self._namespace is not None:
-                await conn.execute(
-                    "SELECT set_config('energydb.namespace', %s, true)",
-                    (self._namespace,),
-                )
-            yield conn
 
     def _safe_dsn(self) -> str:
         """The DSN with the userinfo segment (user:pass) replaced by ``***``.
@@ -188,18 +203,140 @@ class AsyncClient:
         return f"AsyncClient(pg={self._safe_dsn()!r}{ns})"
 
     # ------------------------------------------------------------------
+    # Namespacing
+    # ------------------------------------------------------------------
+
+    def namespace(self, ns: str) -> AsyncClient:
+        """Return a view of this client bound to one namespace.
+
+        The view shares the parent's connection pool and ClickHouse client;
+        it is a cheap, disposable dict-copy — create one per request. Every
+        PG round-trip made through the view binds the ``energydb.namespace``
+        GUC (see :meth:`_conn` / :meth:`_read_conn`), which row-level
+        security policies — when installed — use to filter every table to
+        that namespace, and which the columns' server defaults use to stamp
+        writes. Lifecycle and schema operations (:meth:`open`, :meth:`close`,
+        :meth:`create`, :meth:`delete`, :meth:`setup_ch_meta_engine`) stay
+        with the root client and raise on a view.
+
+        Engine-parallel reads are disabled on views: the ClickHouse meta
+        engine table reads PG with its own (RLS-bypassing) credentials, so
+        until its predicate carries the namespace, views always take the
+        sequential resolve — identical results, namespace-enforced.
+        """
+        if not ns:
+            raise ValidationError("namespace must be a non-empty string")
+        clone = object.__new__(type(self))
+        clone.__dict__ = {
+            **self.__dict__,
+            "_namespace": ns,
+            "_owns_pool": False,
+            "_engine_unavailable": True,
+        }
+        return clone
+
+    def _require_root(self, op: str) -> None:
+        """Raise unless called on a root client (namespaced views share the
+        pool and must never manage its lifecycle or touch schema DDL)."""
+        if not self._owns_pool:
+            raise ValidationError(f"{op}() is not available on a namespaced view — call it on the root client")
+
+    @asynccontextmanager
+    async def _conn(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
+        """Borrow a pooled connection for transactional work — the single
+        checkout point for every mutating PG round-trip (here and in
+        ``scope`` / ``_transaction``).
+
+        On a namespaced view, the transaction-local ``energydb.namespace``
+        GUC is bound first. ``set_config(..., is_local := true)`` is
+        ``SET LOCAL`` in function form — parameterizable and server-side
+        preparable — so the value dies with the transaction and nothing
+        leaks when the connection returns to the shared pool.
+        """
+        async with annotate_undefined_table(), self._pool.connection() as conn:
+            if self._namespace is not None:
+                await conn.execute(
+                    "SELECT set_config('energydb.namespace', %s, true)",
+                    (self._namespace,),
+                )
+            yield conn
+
+    @asynccontextmanager
+    async def _read_conn(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
+        """Borrow an autocommit connection for pure reads (see
+        :func:`energydb._io.autocommit_read_conn` for why autocommit).
+
+        Autocommit has no transaction for ``SET LOCAL`` to live in, so on a
+        namespaced view the GUC is bound at **session** level and cleared
+        again before the connection returns to the shared pool. If the clear
+        itself fails the connection is broken and the pool discards it, so a
+        stale binding cannot leak to another checkout.
+        """
+        async with autocommit_read_conn(self._pool) as conn:
+            if self._namespace is None:
+                yield conn
+                return
+            await conn.execute(
+                "SELECT set_config('energydb.namespace', %s, false)",
+                (self._namespace,),
+            )
+            try:
+                yield conn
+            finally:
+                await conn.execute("SELECT set_config('energydb.namespace', '', false)")
+
+    # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
 
     async def create(self) -> None:
-        """Create PG schema + CH tables.
+        """Create PG schema + CH tables, and provision the CH meta engine table.
 
-        Schema is defined by the SQLAlchemy models in :mod:`energydb.models`.
-        SQLAlchemy's ``create_all`` and TimeDB's create are synchronous, so they
-        run in a worker thread to keep the event loop free.
+        Schema is defined by the SQLAlchemy models in :mod:`energydb.models`
+        (the ``series_meta`` view rides on the DDL events). SQLAlchemy's
+        ``create_all`` and TimeDB's create are synchronous, so they run in a
+        worker thread to keep the event loop free.
+
+        The engine table is best-effort: a CH role that cannot create
+        ``PostgreSQL()`` engine tables must not break ``create()`` for
+        deployments that never enable ``concurrent`` — those get a logged
+        warning and reads fall back to the sequential path.
+        :meth:`setup_ch_meta_engine` is the explicit, raising alternative.
+
+        For production, set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named
+        collection holding the PostgreSQL connection; otherwise the credentials
+        are inlined into the engine table's DDL (and a warning says so).
         """
         self._require_root("create")
         await asyncio.to_thread(self._create_blocking)
+        try:
+            await asyncio.to_thread(self._provision_engine_table_blocking)
+        except Exception:  # noqa: BLE001  -- best-effort; engine reads degrade to sequential
+            logger.warning(
+                "could not provision the ClickHouse meta engine table; reads will use the sequential path",
+                exc_info=True,
+            )
+
+    def _provision_engine_table_blocking(self) -> None:
+        # Warn before issuing the DDL, and from here rather than from
+        # engine_table_ddl(), so DDL construction stays side-effect-free and the
+        # warning fires exactly when the credential is about to be written.
+        if inlines_pg_password(self._dsn):
+            logger.warning(
+                "energydb: provisioning the ClickHouse meta-engine table %r with inline "
+                "PostgreSQL credentials -- the password will be visible via SHOW CREATE TABLE "
+                "to any ClickHouse user with read access. For production, create a ClickHouse "
+                "named collection holding the PostgreSQL connection and set "
+                "ENERGYDB_CH_PG_COLLECTION to its name.",
+                CH_ENGINE_TABLE,
+            )
+        # DROP + CREATE (not IF NOT EXISTS alone): the engine table is stateless, and
+        # recreating it picks up view/column upgrades on existing deployments.
+        self.td._ch.command(DROP_ENGINE_TABLE)
+        if DROP_LEGACY_ENGINE_TABLE:
+            # Remove a stale bare-named table left by a pre-fix named-schema deployment.
+            self.td._ch.command(DROP_LEGACY_ENGINE_TABLE)
+        self.td._ch.command(engine_table_ddl(self._dsn, SCHEMA or "public"))
 
     def _create_blocking(self) -> None:
         engine = create_engine(self._sqlalchemy_url())
@@ -218,13 +355,36 @@ class AsyncClient:
         the host application's tables with it.
         """
         self._require_root("delete")
-        async with self._pool.connection() as conn:
+        async with annotate_undefined_table(), self._pool.connection() as conn:
             if SCHEMA is None:
                 await conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
             else:
                 await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             await conn.commit()
         await asyncio.to_thread(self.td.delete)
+        await asyncio.to_thread(self.td._ch.command, DROP_ENGINE_TABLE)
+
+    async def setup_ch_meta_engine(self) -> None:
+        """Provision the ClickHouse ↔ PG metadata bridge for ``concurrent`` reads.
+
+        Idempotent. (Re)creates the PG ``series_meta`` view and the ClickHouse
+        ``PostgreSQL()`` engine table over it (see :mod:`energydb._ch_meta_engine`
+        for the credential/vantage resolution). Unlike :meth:`create`'s best-effort
+        provisioning this raises on failure, and it clears the session's
+        engine-unavailable degrade flag — call it to re-enable ``concurrent``
+        after fixing engine infrastructure.
+
+        Set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named collection for
+        production deployments — without it the PostgreSQL password is inlined
+        into the DDL and readable via ``SHOW CREATE TABLE`` (warned about at
+        provisioning time).
+        """
+        self._require_root("setup_ch_meta_engine")
+        async with annotate_undefined_table(), self._pool.connection() as conn:
+            await conn.execute(CREATE_SERIES_META_VIEW)
+            await conn.commit()
+        await asyncio.to_thread(self._provision_engine_table_blocking)
+        self._engine_unavailable = False
 
     async def close(self) -> None:
         self._require_root("close")
@@ -252,10 +412,10 @@ class AsyncClient:
         """
         if uuid is not None:
             if names_or_path:
-                raise ValueError("Pass either uuid= or names, not both.")
+                raise ValidationError("Pass either uuid= or names, not both.")
             return NodeScope(self, node_uuid=uuid)
         if not names_or_path:
-            raise ValueError("Provide a path or uuid=.")
+            raise ValidationError("Provide a path or uuid=.")
         return NodeScope(self, path=_coerce_path(names_or_path))
 
     def get_edge(
@@ -274,10 +434,10 @@ class AsyncClient:
         """
         if uuid is not None:
             if from_path is not None or to_path is not None or type is not None:
-                raise ValueError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
+                raise ValidationError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
             return EdgeScope(self, edge_uuid=uuid)
         if from_path is None or to_path is None or type is None:
-            raise ValueError("Provide uuid= or (from_path, to_path, type=).")
+            raise ValidationError("Provide uuid= or (from_path, to_path, type=).")
         return EdgeScope(
             self,
             from_path=_coerce_path((), kwarg=from_path),
@@ -360,6 +520,33 @@ class AsyncClient:
             return diff
         return root_uuid
 
+    @staticmethod
+    def _within_match(within) -> tuple[str, Any, str | None]:
+        """``(addr_sql, param, joined_path|None)`` for a ``within=`` root row ``r``.
+
+        ``joined_path`` is ``None`` for the UUID form — a missing UUID root
+        yields an empty result (historical contract), while a missing path
+        raises, so callers need to know which form they got.
+        """
+        if isinstance(within, UUID):
+            return "r.uuid = %s", within, None
+        joined = "/".join(_coerce_path((), kwarg=within))
+        return "r.path = %s", joined, joined
+
+    @staticmethod
+    def _subtree_on(alias: str, joined: str | None) -> tuple[str, list[Any]]:
+        """ON-clause fragment matching ``alias`` rows in root ``r``'s subtree (incl. ``r``).
+
+        With ``joined`` (path-addressed root) the escaped prefix is a bind
+        param, so PG extracts the literal prefix at plan time and Index Scans
+        ``ix_node_path_prefix``. The uuid form derives the prefix from the
+        root row inside the statement — a catalog-wide scan, kept only where
+        the root path is unknown client-side.
+        """
+        if joined is not None:
+            return rf"({alias}.path = r.path OR {alias}.path LIKE %s || '/%%' ESCAPE '\')", [_like_escape(joined)]
+        return rf"({alias}.path = r.path OR {alias}.path LIKE {derived_prefix_like('r.path')} ESCAPE '\')", []
+
     async def query_nodes(
         self,
         *,
@@ -370,36 +557,44 @@ class AsyncClient:
         """Return matching nodes as a flat list of EDM objects.
 
         ``within`` accepts a ``/``-joined string (``"P/Site"``), a path
-        tuple/list of segments, or a :class:`UUID`.
+        tuple/list of segments, or a :class:`UUID`. One round-trip either
+        way: the ``within`` subtree is matched by path prefix inside the
+        statement (filters ride on the join), not resolved separately.
         """
         where_filters: dict[str, Any] = dict(property_filters)
         if type is not None:
             where_filters["node_type"] = type
 
-        async with self._conn() as conn:
-            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
-            conditions: list[str] = list(filter_conds)
-            params: list[Any] = list(filter_params)
-
-            if within is not None:
-                within_uuid = (
-                    within
-                    if isinstance(within, UUID)
-                    else await resolve_node_uuid(conn, _coerce_path((), kwarg=within))
+        async with self._read_conn() as conn:
+            if within is None:
+                filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
+                where = " AND ".join(filter_conds) if filter_conds else "TRUE"
+                rows = await (
+                    await conn.execute(
+                        f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
+                        list(filter_params),
+                    )
+                ).fetchall()
+            else:
+                filter_conds, filter_params = build_filter_conditions(
+                    where_filters, type_col="node_type", table_alias="n"
                 )
-                conditions.append("uuid = ANY(%s)")
-                params.append(await resolve_subtree_uuids(conn, within_uuid))
-
-            where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = await (
-                await conn.execute(
-                    # Dynamic WHERE built from build_filter_conditions (params
-                    # stay bound). psycopg's LiteralString typing rightly
-                    # dislikes this; proper fix is sql.Composed end-to-end.
-                    f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
-                    params,
-                )
-            ).fetchall()
+                extra = ("".join(f" AND {c}" for c in filter_conds)) if filter_conds else ""
+                addr, addr_param, joined = self._within_match(within)
+                subtree_on, prefix_params = self._subtree_on("n", joined)
+                sql = f"""
+                    SELECT n.uuid, n.node_type, n.name, n.data
+                    FROM node r LEFT JOIN node n
+                      ON {subtree_on}{extra}
+                    WHERE {addr}
+                    ORDER BY n.name
+                """
+                rows = await (
+                    await conn.execute(sql, [*prefix_params, *filter_params, addr_param])  # ty: ignore[invalid-argument-type]
+                ).fetchall()
+                if not rows and joined is not None:
+                    raise NodeNotFoundError(f"Node not found: {joined}", path=joined)
+                rows = [r for r in rows if r[0] is not None]  # LEFT-JOIN row when nothing matches
 
         return [reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]}) for r in rows]
 
@@ -468,7 +663,7 @@ class AsyncClient:
         the node does not exist. Safe for any ``node_type`` string, unlike
         :meth:`get_node` / :meth:`get_tree`.
         """
-        async with self._conn() as conn:
+        async with self._read_conn() as conn:
             row = await (
                 await conn.execute(
                     "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
@@ -492,30 +687,21 @@ class AsyncClient:
     async def get_subtree_raw(self, root_uuid: UUID) -> list[dict]:
         """Return the node + every descendant as raw dicts (no EDM reconstruction).
 
-        Indexed materialized-path prefix scan (``ix_node_path_prefix``). Each
-        dict is ``{uuid, node_type, name, data, parent_uuid, path}``. Includes
-        the root itself; empty list if the root does not exist.
+        One round-trip: materialized-path prefix scan with the prefix derived
+        from the root row inside the statement. Each dict is ``{uuid,
+        node_type, name, data, parent_uuid, path}``. Includes the root
+        itself; empty list if the root does not exist.
         """
-        async with self._conn() as conn:
-            root = await (
-                await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
-                    (root_uuid,),
-                )
-            ).fetchone()
-            if root is None:
-                return []
-            root_path = root[0]
+        async with self._read_conn() as conn:
+            sql = rf"""
+                SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid, c.path, c.created_at, c.updated_at
+                FROM node r JOIN node c
+                  ON (c.path = r.path OR c.path LIKE {derived_prefix_like("r.path")} ESCAPE '\')
+                WHERE r.uuid = %s
+                ORDER BY c.path
+                """
             rows = await (
-                await conn.execute(
-                    r"""
-                SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at
-                FROM node
-                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
-                ORDER BY path
-                """,
-                    (root_path, _like_escape(root_path)),
-                )
+                await conn.execute(sql, (root_uuid,))  # ty: ignore[invalid-argument-type]
             ).fetchall()
         return [
             {
@@ -571,7 +757,7 @@ class AsyncClient:
         if limit is not None:
             sql += " LIMIT %s"
             params.append(limit)
-        async with self._conn() as conn:
+        async with self._read_conn() as conn:
             # Dynamic WHERE from the allowlisted fragments above — same
             # ty-ignored f-string story as query_nodes.
             rows = await (await conn.execute(sql, params)).fetchall()  # ty: ignore[invalid-argument-type]
@@ -592,29 +778,34 @@ class AsyncClient:
     async def list_series(self, owner_uuid: UUID, *, owner_col: str = "node_uuid") -> list[dict]:
         """List the series catalog owned by a node (or edge).
 
-        Returns ``{name, data_type, canonical_unit, timeseries_type,
+        Returns ``{series_id, name, data_type, canonical_unit, timeseries_type,
         description}`` per series. ``owner_col`` is ``"node_uuid"`` (default)
         or ``"edge_uuid"``.
+
+        ``series_id`` is the timedb-internal handle (the same value
+        :meth:`NodeScope.register_series` returns) and makes this the reverse
+        lookup from ``(owner, data_type, name)``. It is an *input* to lower-level
+        timedb APIs, not a secret; read **results** still never carry it.
         """
         if owner_col not in ("node_uuid", "edge_uuid"):
-            raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
-        async with self._conn() as conn:
+            raise ValidationError("owner_col must be 'node_uuid' or 'edge_uuid'")
+        async with self._read_conn() as conn:
             rows = await (
                 await conn.execute(
-                    # owner_col is allowlist-validated above; see query_nodes
-                    # on why this stays a ty-ignored f-string for now.
-                    f"SELECT name, data_type, canonical_unit, timeseries_type, description "  # ty: ignore[invalid-argument-type]
+                    f"SELECT series_id, name, data_type, canonical_unit, timeseries_type, description "  # ty: ignore[invalid-argument-type]
                     f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
                     (owner_uuid,),
                 )
             ).fetchall()
         return [
             {
-                "name": r[0],
-                "data_type": r[1],
-                "canonical_unit": r[2],
-                "timeseries_type": r[3],
-                "description": r[4],
+                # First: it reads as the row identity.
+                "series_id": r[0],
+                "name": r[1],
+                "data_type": r[2],
+                "canonical_unit": r[3],
+                "timeseries_type": r[4],
+                "description": r[5],
             }
             for r in rows
         ]
@@ -630,37 +821,48 @@ class AsyncClient:
 
         ``within`` (``/``-joined string ``"P/Site"``, path tuple/list of
         segments, or a :class:`UUID`) restricts to edges where either
-        endpoint is in that subtree.
+        endpoint is in that subtree. One round-trip either way: the subtree
+        is matched by path prefix inside the statement (DISTINCT collapses
+        edges reached via both endpoints).
         """
         where_filters: dict[str, Any] = dict(property_filters)
         if type is not None:
             where_filters["edge_type"] = type
 
-        async with self._conn() as conn:
-            filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
-            conditions: list[str] = list(filter_conds)
-            params: list[Any] = list(filter_params)
-
-            if within is not None:
-                within_uuid = (
-                    within
-                    if isinstance(within, UUID)
-                    else await resolve_node_uuid(conn, _coerce_path((), kwarg=within))
+        async with self._read_conn() as conn:
+            if within is None:
+                filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
+                where = " AND ".join(filter_conds) if filter_conds else "TRUE"
+                rows = await (
+                    await conn.execute(
+                        f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "  # ty: ignore[invalid-argument-type]
+                        f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
+                        list(filter_params),
+                    )
+                ).fetchall()
+            else:
+                filter_conds, filter_params = build_filter_conditions(
+                    where_filters, type_col="edge_type", table_alias="e"
                 )
-                subtree = await resolve_subtree_uuids(conn, within_uuid)
-                conditions.append("(from_node_uuid = ANY(%s) OR to_node_uuid = ANY(%s))")
-                params.append(subtree)
-                params.append(subtree)
-
-            where = " AND ".join(conditions) if conditions else "TRUE"
-            rows = await (
-                await conn.execute(
-                    # Same dynamic-WHERE story as query_nodes.
-                    f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "  # ty: ignore[invalid-argument-type]
-                    f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
-                    params,
-                )
-            ).fetchall()
+                extra = ("".join(f" AND {c}" for c in filter_conds)) if filter_conds else ""
+                addr, addr_param, joined = self._within_match(within)
+                subtree_on, prefix_params = self._subtree_on("m", joined)
+                sql = f"""
+                    SELECT DISTINCT e.uuid, e.edge_type, e.name, e.data, e.from_node_uuid, e.to_node_uuid
+                    FROM node r
+                    LEFT JOIN node m
+                      ON {subtree_on}
+                    LEFT JOIN edge e
+                      ON (e.from_node_uuid = m.uuid OR e.to_node_uuid = m.uuid){extra}
+                    WHERE {addr}
+                    ORDER BY e.name NULLS LAST
+                    """
+                rows = await (
+                    await conn.execute(sql, [*prefix_params, *filter_params, addr_param])  # ty: ignore[invalid-argument-type]
+                ).fetchall()
+                if not rows and joined is not None:
+                    raise NodeNotFoundError(f"Node not found: {joined}", path=joined)
+                rows = [r for r in rows if r[0] is not None]  # LEFT-JOIN rows when nothing matches
             if not rows:
                 return []
 
@@ -700,67 +902,65 @@ class AsyncClient:
         outside the tree shape — query them separately with
         :meth:`get_edge` or :meth:`query_edges`.
         """
-        async with self._conn() as conn:
-            if uuid is not None:
-                root_uuid = uuid
-            elif names_or_path:
-                root_uuid = await resolve_node_uuid(conn, _coerce_path(names_or_path))
-            else:
-                raise ValueError("Provide a path or uuid=.")
+        if uuid is not None:
+            addr, addr_param, joined = "r.uuid = %s", uuid, None
+            missing_err = NodeNotFoundError(f"Node not found: uuid={uuid}", uuid=uuid)
+        elif names_or_path:
+            joined = "/".join(_coerce_path(names_or_path))
+            addr, addr_param = "r.path = %s", joined
+            missing_err = NodeNotFoundError(f"Node not found: {joined}", path=joined)
+        else:
+            raise ValidationError("Provide a path or uuid=.")
 
-            # Two-step: fetch the root's path, then LIKE with the escaped
-            # prefix as a bind param so PG picks Index Scan on
-            # ``ix_node_path_prefix``. A column-source LIKE would Seq Scan.
-            root_path_row = await (
-                await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
-                    (root_uuid,),
-                )
-            ).fetchone()
-            if root_path_row is None:
-                raise ValueError(f"Node not found: uuid={root_uuid}")
-            root_path = root_path_row[0]
-            rows = await (
-                await conn.execute(
-                    r"""
-                SELECT uuid, node_type, name, data, parent_uuid
-                FROM node
-                WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
-                """,
-                    (root_path, _like_escape(root_path)),
-                )
-            ).fetchall()
-
-            nodes: dict[UUID, Any] = {}
-            parent_map: dict[UUID, UUID | None] = {}
-            for r in rows:
-                node_uuid = r[0]
-                parent_map[node_uuid] = r[4]
-                nodes[node_uuid] = reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]})
-
+        # One statement for the subtree (the root resolve and the prefix
+        # scan are inlined); with ``include_series`` a second, independent
+        # statement joins the series — both ride ONE pipeline flush.
+        subtree_on, prefix_params = self._subtree_on("n", joined)
+        subtree_from = f"FROM node r JOIN node n ON {subtree_on}"
+        params = [*prefix_params, addr_param]
+        nodes_sql = f"SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid, r.uuid {subtree_from} WHERE {addr}"
+        series_sql = (
+            f"SELECT s.node_uuid, s.data_type, s.name, s.canonical_unit, s.timeseries_type, s.description "
+            f"{subtree_from} JOIN series s ON s.node_uuid = n.uuid WHERE {addr}"
+        )
+        async with self._read_conn() as conn:
             if include_series:
-                series_rows = await (
-                    await conn.execute(
-                        "SELECT node_uuid, data_type, name, canonical_unit, timeseries_type, description "
-                        "FROM series WHERE node_uuid = ANY(%s)",
-                        (list(nodes.keys()),),
-                    )
-                ).fetchall()
-                for nid, dt, sname, unit, tstype, desc in series_rows:
-                    node_obj = nodes.get(nid)
-                    if node_obj is None:
-                        continue
-                    series = TimeSeries(
-                        df=None,
-                        name=sname,
-                        unit=unit or "dimensionless",
-                        data_type=DataType(dt.upper()) if dt else None,
-                        timeseries_type=TimeSeriesType(tstype) if tstype else TimeSeriesType.FLAT,
-                        description=desc,
-                    )
-                    if node_obj.timeseries is None:
-                        node_obj.timeseries = []
-                    node_obj.timeseries.append(series)
+                async with conn.pipeline():
+                    nodes_cur = await conn.execute(nodes_sql, params)  # ty: ignore[invalid-argument-type]
+                    series_cur = await conn.execute(series_sql, params)  # ty: ignore[invalid-argument-type]
+                rows = await nodes_cur.fetchall()
+                series_rows = await series_cur.fetchall()
+            else:
+                rows = await (await conn.execute(nodes_sql, params)).fetchall()  # ty: ignore[invalid-argument-type]
+                series_rows = []
+
+        if not rows:
+            raise missing_err
+        root_uuid = rows[0][5]  # r.uuid rides along on every subtree row
+
+        nodes: dict[UUID, Any] = {}
+        parent_map: dict[UUID, UUID | None] = {}
+        for r in rows:
+            node_uuid = r[0]
+            parent_map[node_uuid] = r[4]
+            nodes[node_uuid] = reconstruct_node({"uuid": r[0], "node_type": r[1], "name": r[2], "data": r[3]})
+
+        if include_series:
+            for nid, dt, sname, unit, tstype, desc in series_rows:
+                node_obj = nodes.get(nid)
+                if node_obj is None:
+                    continue
+                series = TimeSeries(
+                    df=None,
+                    name=sname,
+                    unit=unit or "dimensionless",
+                    data_type=DataType(dt.upper()) if dt else None,
+                    timeseries_type=TimeSeriesType(tstype) if tstype else TimeSeriesType.FLAT,
+                    description=desc,
+                )
+                if node_obj.timeseries is None:
+                    node_obj.timeseries = []
+                node_obj.timeseries.append(series)
 
         # Attach children to their parents (flat pass — uuid-based, order-agnostic).
         for node_uuid, parent_uuid in parent_map.items():
@@ -785,7 +985,7 @@ class AsyncClient:
         run_finish_time: datetime | None = None,
         run_params: dict | None = None,
         skip_unchanged: bool = False,
-        unchanged_scope: UnchangedScope = "valid_time",
+        unchanged_scope: UnchangedScope = "auto",
     ) -> WriteResult:
         """Bulk-write timeseries data via a routing manifest.
 
@@ -796,8 +996,18 @@ class AsyncClient:
         optional ``knowledge_time``). Optional ``unit`` column triggers
         per-row unit conversion to each series's canonical unit.
 
-        ``skip_unchanged`` (with ``unchanged_scope``) drops rows whose latest
-        stored value is unchanged before the insert; see :func:`timedb.write`.
+        ``skip_unchanged`` drops rows whose latest stored value is unchanged
+        before the insert. ``unchanged_scope`` picks the comparison key:
+
+        * ``"auto"`` (default) — per series, using each series' registered
+          type: FLAT compares per ``valid_time``, OVERLAPPING per
+          ``(valid_time, knowledge_time)``. One call handles a mixed manifest;
+          for a FLAT-only manifest it is identical to ``"valid_time"``.
+        * ``"knowledge_time"`` — that key uniformly.
+        * ``"valid_time"`` — that key uniformly. Raises
+          :class:`~energydb.errors.UnchangedScopeError` if the manifest
+          contains OVERLAPPING series, since it would drop their
+          republications.
 
         Series must already be registered (typically via
         :meth:`register_tree`). Returns a :class:`WriteResult` — an ``int``
@@ -806,7 +1016,7 @@ class AsyncClient:
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             df_pl = to_polars(df)
         return await write_manifest(
-            self._pool,
+            self,
             self.td,
             df_pl,
             knowledge_time=knowledge_time,
@@ -833,6 +1043,7 @@ class AsyncClient:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
+        on_missing: OnMissing = "raise",
     ) -> (
         pl.DataFrame
         | pd.DataFrame
@@ -840,8 +1051,19 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | ReadResult
     ):
         """Bulk read via manifest. Detects edge vs node routing automatically.
+
+        Routing is chosen from the columns present (exactly one route):
+
+        * ``path`` — node series by materialized path (``Utf8`` joined with ``/``).
+        * ``node_uuid`` / ``edge_uuid`` — series by owner uuid.
+        * ``from_path`` + ``to_path`` + ``edge_type`` — edge series by their
+          endpoint paths and type (all three required together), resolved
+          server-side the same way node ``path`` is. Symmetric with the edge
+          output columns below, so an edge read's own output can be fed back in
+          as a manifest without a UUID-resolution round-trip.
 
         Accepts pandas or polars on input. Output shape:
 
@@ -867,13 +1089,27 @@ class AsyncClient:
         ``backend="pandas"`` converts at the boundary. Internal
         identifiers (``series_id``, ``node_uuid``, ``edge_uuid``) are
         never exposed on the result.
+
+        **``on_missing`` changes the return type.** With the default
+        ``"raise"``, an unregistered ``(owner, data_type, name)`` triple fails
+        the whole call with
+        :class:`~energydb.errors.SeriesNotFoundError` (naming every unresolved
+        triple) and the return value is as described above. With ``"skip"``,
+        those triples are dropped from the read and the call returns a
+        :class:`ReadResult` — ``(data, missing)`` — so one unregistered series
+        can't cost you a 1,500-series batch, and you still learn which ones were
+        skipped. Only unregistered series are affected: a structurally invalid
+        manifest (missing/ambiguous routing column, wrong dtype, null routing
+        value) raises either way.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = await read_manifest(
+        result, _n_series, missing = await execute_read(
             self._pool,
             self.td,
-            manifest,
+            self,
+            manifest=manifest,
+            engine_meta=lambda: engine_meta_for_manifest(manifest),
             unit=unit,
             start_valid=start_valid,
             end_valid=end_valid,
@@ -881,10 +1117,11 @@ class AsyncClient:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            on_missing=on_missing,
             output=output,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
-            return to_backend(result, backend)
+            return self._with_missing(result, missing, backend=backend, on_missing=on_missing)
 
     async def read_relative(
         self,
@@ -893,6 +1130,7 @@ class AsyncClient:
         unit: str | None = None,
         output: Output = "frame",
         backend: Backend = "polars",
+        on_missing: OnMissing = "raise",
         **td_kwargs,
     ) -> (
         pl.DataFrame
@@ -901,25 +1139,61 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | ReadResult
     ):
         """Bulk relative read via manifest.
 
-        See :meth:`read` for the ``output`` / ``backend`` contract.
+        See :meth:`read` for the ``output`` / ``backend`` contract, and for
+        ``on_missing`` — which switches the return type to
+        :class:`ReadResult` when set to ``"skip"``, exactly as it does there.
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
-        result = await read_relative_manifest(
+        result, _n_series, missing = await execute_read(
             self._pool,
             self.td,
-            manifest,
+            self,
+            manifest=manifest,
+            engine_meta=lambda: engine_meta_for_manifest(manifest),
+            relative=True,
             unit=unit,
             output=output,
-            **td_kwargs,
+            on_missing=on_missing,
+            td_kwargs=td_kwargs,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
-            return to_backend(result, backend)
+            return self._with_missing(result, missing, backend=backend, on_missing=on_missing)
+
+    @staticmethod
+    def _with_missing(
+        result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame],
+        missing: pl.DataFrame,
+        *,
+        backend: Backend,
+        on_missing: OnMissing,
+    ) -> (
+        pl.DataFrame
+        | pd.DataFrame
+        | dict[SeriesKey, pl.DataFrame]
+        | dict[SeriesKey, pd.DataFrame]
+        | dict[EdgeSeriesKey, pl.DataFrame]
+        | dict[EdgeSeriesKey, pd.DataFrame]
+        | ReadResult
+    ):
+        """Convert a read to ``backend``, wrapping it iff ``on_missing="skip"``.
+
+        The return-type switch lives in one place so :meth:`read` and
+        :meth:`read_relative` can't drift apart on it.
+        """
+        data = to_backend(result, backend)
+        if on_missing == "skip":
+            # ``missing`` is always a plain frame, never the by_path dict shape,
+            # but ``to_backend`` is typed for the whole read-result union — narrow
+            # it back before it lands on ``ReadResult.missing``.
+            return ReadResult(data, cast("pl.DataFrame | pd.DataFrame", to_backend(missing, backend)))
+        return data
 
     # ------------------------------------------------------------------
     # Runs
@@ -930,7 +1204,7 @@ class AsyncClient:
         run_ids = await asyncio.to_thread(self.td.read_run_series, series_id=series_id)
         if not run_ids:
             return []
-        async with self._conn() as conn:
+        async with self._read_conn() as conn:
             return await runs_mod.get_runs(conn, run_ids)
 
     # ------------------------------------------------------------------

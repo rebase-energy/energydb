@@ -152,11 +152,54 @@ docker exec -it energydb_clickhouse clickhouse-client
 
 ## 7) Running Tests
 
-The test suite uses `pytest` and assumes the local PostgreSQL + ClickHouse stack is reachable.
+The test suite uses `pytest`:
 
 ```bash
 pytest
 ```
+
+### Live tests skip silently
+
+A large share of the suite talks to real databases and is gated on
+`TIMEDB_PG_DSN` / `TIMEDB_CH_URL` being set. Without them those tests are
+**skipped, not failed** — so a green run does not mean the suite passed.
+Always check the skip count:
+
+```bash
+pytest -q          # look at the summary line: "N passed, M skipped"
+```
+
+If `M` is non-zero, the databases were not reachable. Bring up the stack
+(step 3) and re-run; with the local Docker setup and `.env` in place the whole
+suite runs with zero skips.
+
+### The ClickHouse meta-engine tests need one extra variable
+
+The parallel read path uses a ClickHouse `PostgreSQL()` engine table, so
+**ClickHouse itself** dials PostgreSQL. The DSN in `.env` addresses PostgreSQL
+from *your machine* (`127.0.0.1:5433`), which the ClickHouse container cannot
+resolve. Point ClickHouse at PostgreSQL's address on the Docker network:
+
+```bash
+# Bash/Zsh — container name and internal port, not the host port-map
+export ENERGYDB_CH_PG_HOST='energydb_postgres:5432'
+```
+
+```fish
+# Fish
+set -x ENERGYDB_CH_PG_HOST energydb_postgres:5432
+```
+
+Only the network path changes; database, user, and password still come from
+the DSN. Without this, engine provisioning succeeds but engine reads fail and
+degrade to the sequential path — which the tests assert against.
+
+Two more variables are useful when running tests:
+
+- `ENERGYDB_ENGINE_STRICT=1` — an engine-read failure raises instead of
+  silently degrading, so a broken engine is loud. Recommended locally.
+- `ENERGYDB_SCHEMA` — the schema under test (default `public`). The
+  schema-diagnostics tests exercise a named schema.
 
 ## 8) Building Documentation
 

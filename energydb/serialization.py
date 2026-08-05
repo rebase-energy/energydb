@@ -22,6 +22,8 @@ from energydatamodel.json_io import get_registry
 from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
 
+from energydb.errors import ValidationError
+
 # ``id`` is round-tripped via the dedicated ``uuid`` column, not through the
 # ``data`` JSONB blob. Same for fields stored as their own columns.
 _NODE_EXCLUDES = {"id", "timeseries"}
@@ -88,7 +90,7 @@ def reconstruct_node(row: dict[str, Any]):
     node_type = row["node_type"]
     cls = _type_registry().get(node_type)
     if cls is None:
-        raise ValueError(f"Unknown node type: {node_type}")
+        raise ValidationError(f"Unknown node type: {node_type}")
     if not issubclass(cls, (edm.Node, edm.Collection)):
         raise TypeError(f"node table row has type {node_type} which is not a Node or Collection subclass")
 
@@ -130,7 +132,7 @@ def reconstruct_edge(row: dict[str, Any]):
     edge_type = row["edge_type"]
     cls = _type_registry().get(edge_type)
     if cls is None:
-        raise ValueError(f"Unknown edge type: {edge_type}")
+        raise ValidationError(f"Unknown edge type: {edge_type}")
     if not issubclass(cls, edm.Edge):
         raise TypeError(f"edge table row has type {edge_type} which is not an Edge subclass")
 

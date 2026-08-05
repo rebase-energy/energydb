@@ -16,6 +16,7 @@ from typing import Any
 import energydb.client as client_mod
 import pytest
 from energydb.client import AsyncClient
+from energydb.errors import ValidationError
 
 _DSN = "postgresql://user:pass@localhost:5432/energydb_unit_test"
 
@@ -59,6 +60,15 @@ def test_namespace_rejects_empty(client: AsyncClient) -> None:
         client.namespace("")
 
 
+def test_view_disables_engine_reads(client: AsyncClient) -> None:
+    """The CH meta-engine reads PG with its own (RLS-bypassing) credentials,
+    so namespaced views must always take the sequential resolve."""
+    view = client.namespace("ws-1")
+    assert view._engine_unavailable is True
+    # ...and binding a namespace never mutates the root client.
+    assert client._engine_unavailable is False
+
+
 def test_repr_shows_namespace(client: AsyncClient) -> None:
     assert "namespace" not in repr(client)
     assert "namespace='ws-1'" in repr(client.namespace("ws-1"))
@@ -69,11 +79,11 @@ def test_repr_shows_namespace(client: AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("op", ["open", "close", "create", "delete"])
+@pytest.mark.parametrize("op", ["open", "close", "create", "delete", "setup_ch_meta_engine"])
 def test_lifecycle_ops_raise_on_view(client: AsyncClient, op: str) -> None:
     view = client.namespace("ws-1")
     coro: Any = getattr(view, op)()
-    with pytest.raises(RuntimeError, match="root client"):
+    with pytest.raises(ValidationError, match="root client"):
         asyncio.run(coro)
 
 
@@ -82,7 +92,7 @@ def test_lifecycle_guard_passes_on_root(client: AsyncClient) -> None:
     # exercising open()/close() here: a pool opened and closed across two
     # event loops deadlocks, and pool lifecycle is psycopg_pool's business,
     # not this guard's.)
-    for op in ("open", "close", "create", "delete"):
+    for op in ("open", "close", "create", "delete", "setup_ch_meta_engine"):
         client._require_root(op)
 
 

@@ -327,3 +327,68 @@ def test_find_unknown_attribute_matches_nothing(client):
     """Unknown filter attribute matches nothing (defensive)."""
     out = client.read(_manifest("P/T1"), output="by_path")
     assert edb.find(out, nonexistent_attr="x") == []
+
+
+# ---------------------------------------------------------------------------
+# Engine-parallel reads must be byte-identical to the sequential path
+# ---------------------------------------------------------------------------
+
+
+def test_engine_read_matches_sequential(client, monkeypatch):
+    """Engine-parallel reads return the identical labelled result as the sequential path:
+    node scope (4 bitemporal modes + by_path) and the path-routed manifest. (Edge reads run
+    through the same engine path in the live edge tests.)
+
+    Skips if the engine can't reach Postgres from ClickHouse's network vantage (the
+    CREATE TABLE never dials PG, so an unreachable engine only surfaces on first use —
+    e.g. local docker without ENERGYDB_CH_PG_HOST=postgres:5432). Runs in strict mode so
+    a broken engine path raises instead of silently falling back (which would trivially pass).
+    """
+    import energydb._io as _io
+    from energydb._ch_meta_engine import CH_ENGINE_TABLE
+    from polars.testing import assert_frame_equal
+
+    try:
+        client.setup_ch_meta_engine()
+        client.td._ch.command(f"SELECT count() FROM {CH_ENGINE_TABLE}")  # force a CH->PG connection
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"CH meta engine not usable in this env: {exc}")
+    monkeypatch.setattr(_io, "_ENGINE_STRICT", True)
+
+    def seq(fn):
+        """Run ``fn`` with the engine disabled (the sequential baseline), then re-enable."""
+        client._async._engine_unavailable = True
+        try:
+            return fn()
+        finally:
+            client._async._engine_unavailable = False
+
+    scope = client.get_node("P")
+    for kw in (
+        {},  # read_latest
+        {"include_updates": True},  # latest + changes
+        {"include_knowledge_time": True},  # overlapping
+        {"include_updates": True, "include_knowledge_time": True},  # overlapping + changes
+    ):
+        base = seq(lambda kw=kw: scope.read(data_type="actual", name="power", **kw))
+        eng = scope.read(data_type="actual", name="power", **kw)
+        assert_frame_equal(base.sort(base.columns), eng.sort(eng.columns))
+
+    base_bp = seq(lambda: scope.read(data_type="actual", name="power", output="by_path"))
+    eng_bp = scope.read(data_type="actual", name="power", output="by_path")
+    assert base_bp.keys() == eng_bp.keys()
+    for key, sub in base_bp.items():
+        assert_frame_equal(sub.sort(sub.columns), eng_bp[key].sort(eng_bp[key].columns))
+
+    manifest = _manifest("P/T1", "P/T2")
+    base_m = seq(lambda: client.read(manifest))
+    eng_m = client.read(manifest)
+    assert_frame_equal(base_m.sort(base_m.columns), eng_m.sort(eng_m.columns))
+
+    # read_relative rides the same engine path; the huge issue_offset keeps every
+    # row inside its window even though the fixture's knowledge_time is now().
+    rel_kw = {"window_length": timedelta(hours=1), "issue_offset": timedelta(days=365), "start_window": BASE}
+    base_r = seq(lambda: scope.read_relative(data_type="actual", name="power", **rel_kw))
+    eng_r = scope.read_relative(data_type="actual", name="power", **rel_kw)
+    assert eng_r.height > 0  # the engine leg must self-resolve (guards the meta_source wiring)
+    assert_frame_equal(base_r.sort(base_r.columns), eng_r.sort(eng_r.columns))

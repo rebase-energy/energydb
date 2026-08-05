@@ -13,10 +13,32 @@ which is the upsert key on :class:`energydb.models.Edge`).
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from collections.abc import Sequence
+from typing import Any, Literal, NamedTuple
 from uuid import UUID
 
 import polars as pl
+
+from energydb.errors import (
+    EdgeNotFoundError,
+    ManifestError,
+    NodeNotFoundError,
+    SeriesNotFoundError,
+    ValidationError,
+)
+from energydb.runs import RunRow, run_upsert_cte
+
+# What to do with a manifest triple that has no registered series. ``"raise"``
+# is the default everywhere; ``"skip"`` is opt-in on reads only (writes must
+# never silently drop rows — that would be data loss).
+OnMissing = Literal["raise", "skip"]
+_ON_MISSING_VALUES = ("raise", "skip")
+
+
+def _check_on_missing(on_missing: str) -> None:
+    """Reject a typo before it silently becomes ``"skip"``-like behaviour."""
+    if on_missing not in _ON_MISSING_VALUES:
+        raise ValidationError(f"on_missing must be one of {list(_ON_MISSING_VALUES)}, got {on_missing!r}")
 
 
 class ResolveSummary(NamedTuple):
@@ -25,10 +47,84 @@ class ResolveSummary(NamedTuple):
     Lifts ``OVERLAPPING`` detection out of the per-row resolved frame — it
     is a property of the *series set*, not the data rows, so paying
     linear-in-rows for it was wasted work. Powers the knowledge_time-
-    required check in :func:`energydb._io.write_manifest`.
+    required check and the per-series ``skip_unchanged`` comparison in
+    :func:`energydb._io.write_manifest`.
+
+    The ids (rather than a bare boolean) are what let one write call dedupe
+    FLAT and OVERLAPPING series by different keys: they become timedb's
+    ``knowledge_time_scoped_series``. Collected while walking the resolved
+    metadata that is already in hand, so no extra DB work.
+
+    ``missing`` carries the manifest triples that resolved to no series —
+    always present, and zero-row (with the route's column schema) unless
+    ``on_missing="skip"`` actually dropped something. Riding on the summary
+    keeps the resolver's ``(resolved, summary)`` return arity stable.
     """
 
-    has_overlapping: bool
+    overlapping_series_ids: frozenset[int]
+    missing: pl.DataFrame
+
+    @property
+    def has_overlapping(self) -> bool:
+        """True when any resolved series is ``OVERLAPPING``."""
+        return bool(self.overlapping_series_ids)
+
+
+def _resolvable_keys(hash_to_meta: dict[int, tuple]) -> pl.DataFrame:
+    """A ``_triple_k`` frame to semi-join a manifest down to its resolved rows.
+
+    A frame rather than ``is_in``: the key dtype stays explicit (so the empty
+    everything-was-missing case needs no special-casing) and it reuses the
+    ``_triple_k`` join the resolvers already run on.
+    """
+    return pl.DataFrame({"_triple_k": list(hash_to_meta)}, schema={"_triple_k": pl.UInt64})
+
+
+def _missing_frame(cols: Sequence[str], rows: Sequence[tuple[str, ...]]) -> pl.DataFrame:
+    """The unresolved routing triples as a ``Utf8`` frame keyed by ``cols``.
+
+    ``rows`` come from the resolver's deduplicated triple set, so the frame is
+    already unique. Zero-row (correct schema, never a schema-less empty frame)
+    when everything resolved — callers can select/join on it unconditionally.
+    """
+    return pl.DataFrame(
+        {c: [r[i] for r in rows] for i, c in enumerate(cols)},
+        schema={c: pl.Utf8 for c in cols},
+    )
+
+
+# How many unresolved triples the error message spells out before truncating.
+_MISSING_PREVIEW = 5
+
+
+def _series_not_found_error(
+    *, route: str, cols: Sequence[str], unresolved: Sequence[tuple[str, ...]]
+) -> SeriesNotFoundError:
+    """Build the all-triples :class:`SeriesNotFoundError` for a failed resolve.
+
+    The resolvers used to raise on the *first* unresolvable triple, so a
+    manifest of 1,500 series reported one gap per retry. The message now leads
+    with that same first-triple sentence (callers match on the
+    ``Series not registered for <route>=…`` prefix), then names the total and
+    spells out up to :data:`_MISSING_PREVIEW` of them; ``.missing`` on the
+    exception carries every one structurally.
+    """
+    rendered = [", ".join(f"{c}={v!r}" for c, v in zip(cols, t, strict=True)) for t in unresolved[:_MISSING_PREVIEW]]
+    message = f"Series not registered for {rendered[0]}."
+    if len(unresolved) > 1:
+        rest, remaining = rendered[1:], len(unresolved) - 1
+        truncated = f" ({len(rest)} of {remaining} shown)" if remaining > len(rest) else ""
+        message += f" {len(unresolved)} triples in this manifest are unresolved; also {'; '.join(rest)}{truncated}."
+    return SeriesNotFoundError(message, route=route, missing=unresolved)
+
+
+def _overlapping_ids(hash_to_meta: dict[int, tuple]) -> frozenset[int]:
+    """The ``series_id``s of the OVERLAPPING series in a resolved metadata map.
+
+    Every resolver's meta tuple starts ``(series_id, canonical_unit,
+    timeseries_type, retention, ...)``, so one shape serves all three routes.
+    """
+    return frozenset(m[0] for m in hash_to_meta.values() if m[2] == "OVERLAPPING")
 
 
 # A path is a tuple of names from the tree root.
@@ -49,6 +145,19 @@ def _like_escape(s: str) -> str:
     return s.translate(_LIKE_TRANS)
 
 
+def derived_prefix_like(expr: str) -> str:
+    r"""SQL fragment: the LIKE pattern ``<expr-escaped>/%`` for a server-side path.
+
+    The single-round-trip hierarchy queries derive the subtree prefix inside
+    the statement (e.g. from a joined root row), so it can't be escaped
+    Python-side with :func:`_like_escape` — the LIKE metacharacter escape is
+    inlined in SQL instead. Combine as
+    ``path LIKE {derived_prefix_like('r.path')} ESCAPE '\'`` and pair with an
+    explicit ``path = r.path`` term when the root row itself should match.
+    """
+    return rf"replace(replace(replace({expr}, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_') || '/%%'"
+
+
 # ---------------------------------------------------------------------------
 # Node resolution: path -> uuid
 # ---------------------------------------------------------------------------
@@ -65,7 +174,7 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
     if not path:
         if start_uuid is not None:
             return start_uuid
-        raise ValueError("Empty path cannot be resolved.")
+        raise ValidationError("Empty path cannot be resolved.")
 
     joined = "/".join(path)
     if start_uuid is None:
@@ -89,8 +198,8 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
 
     if row is None:
         if start_uuid is None:
-            raise ValueError(f"Node not found: {joined}")
-        raise ValueError(f"Node not found: {joined} (relative to {start_uuid})")
+            raise NodeNotFoundError(f"Node not found: {joined}", path=joined)
+        raise NodeNotFoundError(f"Node not found: {joined} (relative to {start_uuid})", path=joined)
     return row[0]
 
 
@@ -99,8 +208,8 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
 
     Joins each tuple with ``/`` and hits the unique ``node.path`` index in
     one ``ANY()`` scan. Input may contain duplicates; the returned dict is
-    keyed by deduplicated path tuples. Raises ``ValueError`` if any path
-    fails to resolve.
+    keyed by deduplicated path tuples. Raises
+    :class:`~energydb.errors.NodeNotFoundError` if any path fails to resolve.
     """
     if not paths:
         return {}
@@ -131,7 +240,12 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
     missing = [p for p in unique if p not in out]
     if missing:
         rendered = ", ".join("/".join(p) for p in missing)
-        raise ValueError(f"Could not resolve path(s): {rendered}")
+        # ``path`` only when a single path missed — with several, no one value
+        # identifies the failure, so leave it unset rather than pick a winner.
+        raise NodeNotFoundError(
+            f"Could not resolve path(s): {rendered}",
+            path="/".join(missing[0]) if len(missing) == 1 else None,
+        )
     return out
 
 
@@ -224,7 +338,7 @@ async def resolve_path(conn, node_uuid: UUID) -> Path:
         )
     ).fetchone()
     if row is None:
-        raise ValueError(f"Node not found: uuid={node_uuid}")
+        raise NodeNotFoundError(f"Node not found: uuid={node_uuid}", uuid=node_uuid)
     return tuple(row[0].split("/"))
 
 
@@ -245,7 +359,12 @@ async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str
         )
     ).fetchall()
     if not rows:
-        raise ValueError(f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}")
+        raise EdgeNotFoundError(
+            f"Edge not found: type={edge_type!r} from={'/'.join(from_path)!r} to={'/'.join(to_path)!r}",
+            from_path="/".join(from_path),
+            to_path="/".join(to_path),
+            edge_type=edge_type,
+        )
     return rows[0][0]
 
 
@@ -256,10 +375,21 @@ async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str
 
 _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
+# Edge-triple routing: all three columns must be present together, resolved
+# server-side the same way node ``path`` is.
+_MANIFEST_EDGE_TRIPLE = ("from_path", "to_path", "edge_type")
+# The edge-triple route's identity is the whole quintuple, so its unresolved-key
+# reporting carries all five columns where the single-column routes carry three.
+_MISSING_EDGE_COLS = (*_MANIFEST_EDGE_TRIPLE, "data_type", "name")
 
 
 async def resolve_manifest(
-    conn, manifest: pl.DataFrame, *, attach_path: bool = True
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    attach_path: bool = True,
+    run: RunRow | None = None,
+    on_missing: OnMissing = "raise",
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a routing manifest to series metadata.
 
@@ -269,6 +399,9 @@ async def resolve_manifest(
     * ``path``      — ``Utf8`` path joined with ``/`` (e.g. ``"a/b/c"``);
       resolved to ``node_uuid`` first.
     * ``edge_uuid`` — direct lookup against ``series.edge_uuid``.
+    * ``from_path`` + ``to_path`` + ``edge_type`` — a ``Utf8`` edge identity
+      (all three columns required together), resolved to ``edge_uuid`` via the
+      edge's endpoint nodes the same way ``path`` is resolved for nodes.
 
     The manifest must also carry ``data_type`` and ``name`` columns. Returns
     the original frame plus per-row ``series_id``, ``retention``, and
@@ -282,56 +415,70 @@ async def resolve_manifest(
     attach steps don't need another PG round-trip. ``attach_path=False``
     skips that JOIN entirely — write pipelines drop those columns before
     the CH insert and don't need them.
+
+    ``on_missing`` governs unregistered series only:
+
+    * ``"raise"`` (default) — :class:`~energydb.errors.SeriesNotFoundError`
+      naming *every* unresolved triple, not just the first one hit.
+    * ``"skip"`` — unresolved rows are dropped from the resolved frame and
+      reported on ``summary.missing``, so one unregistered series can't fail a
+      1,500-series read. Read pipelines only; the write pipeline never passes
+      it, because silently dropping writes is data loss.
+
+    Structural problems (missing/ambiguous routing column, wrong dtype, null
+    routing values, missing ``data_type``/``name``) raise either way — they are
+    caller bugs, not catalog gaps.
     """
+    _check_on_missing(on_missing)
     present_routes = [c for c in _MANIFEST_ROUTES if c in manifest.columns]
+    # The edge triple is a single route spread across three columns. Treat it as
+    # present only when all three are given; a strict subset is a usage error.
+    triple_cols = [c for c in _MANIFEST_EDGE_TRIPLE if c in manifest.columns]
+    if triple_cols:
+        if len(triple_cols) != len(_MANIFEST_EDGE_TRIPLE):
+            missing = [c for c in _MANIFEST_EDGE_TRIPLE if c not in manifest.columns]
+            raise ManifestError(
+                f"Edge-triple routing requires all of {list(_MANIFEST_EDGE_TRIPLE)}; missing {missing}."
+            )
+        present_routes.append("edge_triple")
+
     if len(present_routes) == 0:
-        raise ValueError(f"Manifest must include one of {list(_MANIFEST_ROUTES)} as a routing column.")
+        raise ManifestError(
+            f"Manifest must include one of {list(_MANIFEST_ROUTES)} "
+            f"or {list(_MANIFEST_EDGE_TRIPLE)} as a routing column."
+        )
     if len(present_routes) > 1:
-        raise ValueError(f"Manifest has ambiguous routing columns {present_routes}; provide exactly one.")
+        raise ManifestError(f"Manifest has ambiguous routing columns {present_routes}; provide exactly one.")
     route = present_routes[0]
 
     missing_required = [c for c in _MANIFEST_REQUIRED if c not in manifest.columns]
     if missing_required:
-        raise ValueError(f"Manifest is missing required columns: {sorted(missing_required)}")
+        raise ManifestError(f"Manifest is missing required columns: {sorted(missing_required)}")
 
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
+    # ``run`` (write pipelines only) upserts the energydb.runs row in the same
+    # call, folded into the resolve statement as a data-modifying CTE — every
+    # route resolves in ONE round-trip.
     if route == "edge_uuid":
-        return await _resolve_manifest_by_owner(conn, manifest, owner_col="edge_uuid", attach_path=attach_path)
-    if route == "path":
-        manifest = await _attach_node_uuid_from_path(conn, manifest)
-    return await _resolve_manifest_by_owner(conn, manifest, owner_col="node_uuid", attach_path=attach_path)
-
-
-async def _attach_node_uuid_from_path(conn, manifest: pl.DataFrame) -> pl.DataFrame:
-    """Resolve every ``path`` (Utf8, joined with ``/``) to a ``node_uuid`` and attach it.
-
-    The manifest ``path`` column must be ``Utf8`` — strings like ``"a/b/c"``.
-    List-shaped paths from earlier API versions are rejected explicitly so
-    callers see a clear migration message rather than an opaque type error.
-    """
-    dtype = manifest["path"].dtype
-    if dtype == pl.List(pl.Utf8):
-        raise ValueError(
-            "Manifest 'path' column must be Utf8 joined with '/'. "
-            "Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
+        return await _resolve_manifest_by_owner(
+            conn, manifest, owner_col="edge_uuid", attach_path=attach_path, run=run, on_missing=on_missing
         )
-    if dtype != pl.Utf8:
-        raise ValueError(f"Manifest 'path' column must be Utf8 joined with '/'; got {dtype}.")
-
-    path_strs = manifest["path"].to_list()
-    unique_paths_str = list({p for p in path_strs if p is not None})
-    if not unique_paths_str:
-        return manifest.with_columns(pl.lit(None, dtype=pl.Utf8).cast(pl.Utf8).alias("node_uuid"))
-
-    miss_tuples = [tuple(p.split("/")) for p in unique_paths_str]
-    pg_map = await resolve_paths_to_uuids(conn, miss_tuples)
-    path_to_uuid_str: dict[str, str] = {
-        "/".join(path_tuple): str(node_uuid) for path_tuple, node_uuid in pg_map.items()
-    }
-
-    node_uuids = [path_to_uuid_str[p] if p is not None else None for p in path_strs]
-    return manifest.with_columns(pl.Series("node_uuid", node_uuids, dtype=pl.Utf8))
+    if route == "edge_triple":
+        # A single ``edge ⋈ node ⋈ node ⋈ series`` query keyed by the endpoint
+        # paths + edge_type. Always attaches ``edge_uuid`` so downstream edge
+        # detection and projection work like the ``edge_uuid`` route.
+        return await _resolve_manifest_by_edge_triple(
+            conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing
+        )
+    if route == "path":
+        # A single ``node ⋈ series`` query keyed by the materialized path.
+        # ``attach_path=True`` (reads) also surfaces ``node_uuid`` on the
+        # resolved frame for the post-read hierarchy attach.
+        return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing)
+    return await _resolve_manifest_by_owner(
+        conn, manifest, owner_col="node_uuid", attach_path=attach_path, run=run, on_missing=on_missing
+    )
 
 
 def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -369,6 +516,8 @@ async def _resolve_manifest_by_owner(
     *,
     owner_col: str,
     attach_path: bool,
+    run: RunRow | None = None,
+    on_missing: OnMissing = "raise",
 ) -> tuple[pl.DataFrame, ResolveSummary]:
     """Resolve a manifest routed by ``owner_col`` (``node_uuid`` or ``edge_uuid``)
     against the series table.
@@ -408,10 +557,10 @@ async def _resolve_manifest_by_owner(
     # contract; per-row null check second.
     non_null = manifest.height - manifest[owner_col].null_count()
     if non_null == 0:
-        raise ValueError(f"No {owner_col} values to resolve in manifest.")
+        raise ManifestError(f"No {owner_col} values to resolve in manifest.")
     if manifest[owner_col].null_count() > 0:
         null_row = manifest.filter(pl.col(owner_col).is_null()).row(0, named=True)
-        raise ValueError(
+        raise ManifestError(
             f"Series not registered for {owner_col}=None, "
             f"data_type={null_row['data_type']!r}, name={null_row['name']!r}."
         )
@@ -429,19 +578,25 @@ async def _resolve_manifest_by_owner(
 
     # 3. Bulk-fetch every series owned by the affected owners — one indexed
     # scan on ``ix_series_{owner_col}``. ``::text`` cast skips psycopg's
-    # per-row UUID-object parse.
+    # per-row UUID-object parse. ``run`` (write pipelines) folds the runs
+    # upsert into this same statement as a leading data-modifying CTE, same
+    # as the path route; its params bind before the owner ANY().
     unique_owners = list({t[0] for t in miss_triples})
     extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
+    cte_sql, cte_params = ("", ())
+    if run is not None:
+        cte_sql, cte_params = run_upsert_cte(run)
     rows = await (
         await conn.execute(
-            f"""
+            cte_sql
+            + f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
         FROM series s
         {join_sql}
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,
-            (unique_owners,),
+            (*cte_params, unique_owners),
         )
     ).fetchall()
     # Meta tuple layout:
@@ -454,13 +609,21 @@ async def _resolve_manifest_by_owner(
         owner, dt, name, sid, unit, ts_type, retention, *paths = row
         triple_to_meta[(owner, dt, name)] = (sid, unit, ts_type, retention, *paths)
 
-    for owner, dt, name in miss_triples:
-        if (owner, dt, name) not in triple_to_meta:
-            raise ValueError(f"Series not registered for {owner_col}={owner!r}, data_type={dt!r}, name={name!r}.")
+    unresolved = [t for t in miss_triples if t not in triple_to_meta]
+    if unresolved and on_missing == "raise":
+        raise _series_not_found_error(route=owner_col, cols=(owner_col, "data_type", "name"), unresolved=unresolved)
 
     hash_to_meta: dict[int, tuple] = {
-        hash_val: triple_to_meta[triple] for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        hash_val: triple_to_meta[triple]
+        for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        if triple in triple_to_meta
     }
+    if unresolved:
+        # ``on_missing="skip"``: drop the unresolvable rows *before* the join.
+        # The left-join would otherwise leave them carrying a null ``series_id``
+        # and ``_project_meta``'s ``.unique()`` would emit a null-id series into
+        # the read.
+        manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
 
     # 4. Build the per-hash lookup frame and attach via a single left-join.
     ks: list[int] = list(hash_to_meta.keys())
@@ -498,12 +661,253 @@ async def _resolve_manifest_by_owner(
     resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
 
     summary = ResolveSummary(
-        has_overlapping=any(m[2] == "OVERLAPPING" for m in hash_to_meta.values()),
+        overlapping_series_ids=_overlapping_ids(hash_to_meta),
+        missing=_missing_frame((owner_col, "data_type", "name"), unresolved),
+    )
+    return resolved, summary
+
+
+async def _resolve_manifest_by_path(
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    run: RunRow | None = None,
+    attach_path: bool = False,
+    on_missing: OnMissing = "raise",
+) -> tuple[pl.DataFrame, ResolveSummary]:
+    """Resolve a path-routed manifest to series in ONE round-trip.
+
+    Collapses the former two-step path resolve (:func:`resolve_paths_to_uuids`,
+    then a ``node_uuid``-keyed series scan, plus an intermediate per-row
+    ``node_uuid`` attach) into a single ``node`` ⋈ ``series`` query keyed by the
+    materialized ``path``. Mirrors :func:`_resolve_manifest_by_owner`: hash the
+    ``(path, data_type, name)`` triple, dedupe, one indexed ``ANY()`` scan,
+    attach ``series_id`` / ``retention`` / ``canonical_unit`` via a
+    ``_triple_k`` left-join.
+
+    ``attach_path=True`` (read pipelines) additionally surfaces ``node_uuid``
+    on the resolved frame for the post-read hierarchy attach. The manifest's
+    ``path`` column needs no re-attach: the resolve joins on ``n.path``
+    equality, so the manifest value IS the DB value.
+    """
+    if manifest["path"].dtype == pl.List(pl.Utf8):
+        raise ManifestError(
+            "Manifest 'path' column must be Utf8 joined with '/'. "
+            "Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
+        )
+    if manifest["path"].dtype != pl.Utf8:
+        raise ManifestError(f"Manifest 'path' column must be Utf8 joined with '/'; got {manifest['path'].dtype}.")
+    non_null = manifest.height - manifest["path"].null_count()
+    if non_null == 0:
+        raise ManifestError("No path values to resolve in manifest.")
+    if manifest["path"].null_count() > 0:
+        null_row = manifest.filter(pl.col("path").is_null()).row(0, named=True)
+        raise ManifestError(
+            f"Series not registered for path=None, data_type={null_row['data_type']!r}, name={null_row['name']!r}."
+        )
+
+    # Hash + dedupe the (path, data_type, name) triple, same as the owner path.
+    manifest = manifest.with_columns(manifest.select(["path", "data_type", "name"]).hash_rows().alias("_triple_k"))
+    triples_df = manifest.select(["path", "data_type", "name", "_triple_k"]).unique(subset=["_triple_k"])
+    miss_keys = triples_df["_triple_k"].to_list()
+    miss_triples: list[tuple[str, str, str]] = list(
+        zip(triples_df["path"].to_list(), triples_df["data_type"].to_list(), triples_df["name"].to_list(), strict=True)
+    )
+
+    unique_paths = list({t[0] for t in miss_triples})
+    # Optionally fold the runs upsert into this same statement (one round-trip)
+    # as a leading data-modifying CTE; its params bind before the path ANY().
+    cte_sql, cte_params = ("", ())
+    if run is not None:
+        cte_sql, cte_params = run_upsert_cte(run)
+    rows = await (
+        await conn.execute(
+            cte_sql
+            + """
+        SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
+               s.node_uuid::text
+        FROM node n
+        JOIN series s ON s.node_uuid = n.uuid
+        WHERE n.path = ANY(%s)
+        """,
+            (*cte_params, unique_paths),
+        )
+    ).fetchall()
+    triple_to_meta: dict[tuple[str, str, str], tuple] = {}
+    for path, dt, name, sid, unit, ts_type, retention, node_uuid in rows:
+        triple_to_meta[(path, dt, name)] = (sid, unit, ts_type, retention, node_uuid)
+
+    unresolved = [t for t in miss_triples if t not in triple_to_meta]
+    if unresolved and on_missing == "raise":
+        raise _series_not_found_error(route="path", cols=("path", "data_type", "name"), unresolved=unresolved)
+
+    hash_to_meta: dict[int, tuple] = {
+        hash_val: triple_to_meta[triple]
+        for hash_val, triple in zip(miss_keys, miss_triples, strict=True)
+        if triple in triple_to_meta
+    }
+    if unresolved:
+        # ``on_missing="skip"`` — see the note in ``_resolve_manifest_by_owner``.
+        manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
+    metas = list(hash_to_meta.values())
+    lookup_data: dict[str, list] = {
+        "_triple_k": list(hash_to_meta.keys()),
+        "series_id": [m[0] for m in metas],
+        "retention": [m[3] for m in metas],
+        "canonical_unit": [m[1] for m in metas],
+    }
+    lookup_schema: dict[str, Any] = {
+        "_triple_k": pl.UInt64,
+        "series_id": pl.Int64,
+        "retention": pl.Utf8,
+        "canonical_unit": pl.Utf8,
+    }
+    if attach_path:
+        lookup_data["node_uuid"] = [m[4] for m in metas]
+        lookup_schema["node_uuid"] = pl.Utf8
+    lookup_df = pl.DataFrame(lookup_data, schema=lookup_schema)
+    overlap = [c for c in lookup_df.columns if c != "_triple_k" and c in manifest.columns]
+    if overlap:
+        manifest = manifest.drop(overlap)
+    resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
+    summary = ResolveSummary(
+        overlapping_series_ids=_overlapping_ids(hash_to_meta),
+        missing=_missing_frame(("path", "data_type", "name"), unresolved),
+    )
+    return resolved, summary
+
+
+async def _resolve_manifest_by_edge_triple(
+    conn,
+    manifest: pl.DataFrame,
+    *,
+    run: RunRow | None = None,
+    attach_path: bool = False,
+    on_missing: OnMissing = "raise",
+) -> tuple[pl.DataFrame, ResolveSummary]:
+    """Resolve an edge-triple-routed manifest to series in ONE round-trip.
+
+    The edge analogue of :func:`_resolve_manifest_by_path`: instead of routing
+    by a single materialized ``node.path``, route by the ``(from_path, to_path,
+    edge_type)`` identity, joining the edge to its endpoint nodes' materialized
+    paths. Hashes the ``(from_path, to_path, edge_type, data_type, name)``
+    quintuple, dedupes, and issues one ``edge ⋈ node ⋈ node ⋈ series`` query
+    with a single-column ``ANY()`` per triple component (a cartesian superset,
+    trimmed back to the exact quintuples by the ``_triple_k`` left-join).
+
+    Always surfaces ``edge_uuid`` on the resolved frame regardless of
+    ``attach_path`` — downstream edge detection (:func:`_finish_read`) and
+    projection (:func:`_project_meta`) key off it. ``from_path`` / ``to_path`` /
+    ``edge_type`` need no re-attach: the join is on path/type equality, so the
+    manifest values ARE the DB values.
+    """
+    for col in _MANIFEST_EDGE_TRIPLE:
+        if manifest[col].dtype == pl.List(pl.Utf8):
+            raise ManifestError(
+                f"Manifest {col!r} column must be Utf8 joined with '/'. "
+                f"Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
+            )
+        if manifest[col].dtype != pl.Utf8:
+            raise ManifestError(f"Manifest {col!r} column must be Utf8; got {manifest[col].dtype}.")
+
+    non_null = (
+        manifest.height - manifest.filter(pl.any_horizontal(pl.col(c).is_null() for c in _MANIFEST_EDGE_TRIPLE)).height
+    )
+    if non_null == 0:
+        raise ManifestError("No edge-triple values to resolve in manifest.")
+    null_mask = pl.any_horizontal(pl.col(c).is_null() for c in _MANIFEST_EDGE_TRIPLE)
+    if manifest.filter(null_mask).height > 0:
+        null_row = manifest.filter(null_mask).row(0, named=True)
+        raise ManifestError(
+            f"Series not registered for from_path={null_row['from_path']!r}, "
+            f"to_path={null_row['to_path']!r}, edge_type={null_row['edge_type']!r}, "
+            f"data_type={null_row['data_type']!r}, name={null_row['name']!r}."
+        )
+
+    key_cols = [*_MANIFEST_EDGE_TRIPLE, "data_type", "name"]
+    manifest = manifest.with_columns(manifest.select(key_cols).hash_rows().alias("_triple_k"))
+    quints_df = manifest.select([*key_cols, "_triple_k"]).unique(subset=["_triple_k"])
+    miss_keys = quints_df["_triple_k"].to_list()
+    miss_quints: list[tuple[str, str, str, str, str]] = list(
+        zip(
+            quints_df["from_path"].to_list(),
+            quints_df["to_path"].to_list(),
+            quints_df["edge_type"].to_list(),
+            quints_df["data_type"].to_list(),
+            quints_df["name"].to_list(),
+            strict=True,
+        )
+    )
+
+    unique_from = list({q[0] for q in miss_quints})
+    unique_to = list({q[1] for q in miss_quints})
+    unique_etype = list({q[2] for q in miss_quints})
+    # Fold the runs upsert into this same statement (one round-trip) as a leading
+    # data-modifying CTE; its params bind before the triple ANY() params.
+    cte_sql, cte_params = ("", ())
+    if run is not None:
+        cte_sql, cte_params = run_upsert_cte(run)
+    rows = await (
+        await conn.execute(
+            cte_sql
+            + """
+        SELECT fn.path, tn.path, e.edge_type, s.data_type, s.name,
+               s.series_id, s.canonical_unit, s.timeseries_type, s.retention, e.uuid::text
+        FROM edge e
+        JOIN node fn ON fn.uuid = e.from_node_uuid
+        JOIN node tn ON tn.uuid = e.to_node_uuid
+        JOIN series s ON s.edge_uuid = e.uuid
+        WHERE fn.path = ANY(%s) AND tn.path = ANY(%s) AND e.edge_type = ANY(%s)
+        """,
+            (*cte_params, unique_from, unique_to, unique_etype),
+        )
+    ).fetchall()
+    quint_to_meta: dict[tuple[str, str, str, str, str], tuple] = {}
+    for fp, tp, et, dt, name, sid, unit, ts_type, retention, edge_uuid in rows:
+        quint_to_meta[(fp, tp, et, dt, name)] = (sid, unit, ts_type, retention, edge_uuid)
+
+    unresolved = [q for q in miss_quints if q not in quint_to_meta]
+    if unresolved and on_missing == "raise":
+        raise _series_not_found_error(route="edge_triple", cols=_MISSING_EDGE_COLS, unresolved=unresolved)
+
+    hash_to_meta: dict[int, tuple] = {
+        hash_val: quint_to_meta[quint]
+        for hash_val, quint in zip(miss_keys, miss_quints, strict=True)
+        if quint in quint_to_meta
+    }
+    if unresolved:
+        # ``on_missing="skip"`` — see the note in ``_resolve_manifest_by_owner``.
+        manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
+    metas = list(hash_to_meta.values())
+    lookup_df = pl.DataFrame(
+        {
+            "_triple_k": list(hash_to_meta.keys()),
+            "series_id": [m[0] for m in metas],
+            "retention": [m[3] for m in metas],
+            "canonical_unit": [m[1] for m in metas],
+            "edge_uuid": [m[4] for m in metas],
+        },
+        schema={
+            "_triple_k": pl.UInt64,
+            "series_id": pl.Int64,
+            "retention": pl.Utf8,
+            "canonical_unit": pl.Utf8,
+            "edge_uuid": pl.Utf8,
+        },
+    )
+    overlap = [c for c in lookup_df.columns if c != "_triple_k" and c in manifest.columns]
+    if overlap:
+        manifest = manifest.drop(overlap)
+    resolved = manifest.join(lookup_df, on="_triple_k", how="left").drop("_triple_k")
+    summary = ResolveSummary(
+        overlapping_series_ids=_overlapping_ids(hash_to_meta),
+        missing=_missing_frame(_MISSING_EDGE_COLS, unresolved),
     )
     return resolved, summary
 
 
 __all__ = [
+    "OnMissing",
     "Path",
     "ResolveSummary",
     "resolve_edge_uuid",
