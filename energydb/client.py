@@ -531,6 +531,64 @@ class AsyncClient:
             for r in rows
         ]
 
+    async def list_nodes_raw(
+        self,
+        *,
+        node_type: str | list[str] | None = None,
+        parents: list[UUID] | None = None,
+        after: tuple[str, UUID] | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """List raw node rows with SQL-side filtering and keyset pagination.
+
+        Filters compose with AND: ``node_type`` (one string or a list),
+        ``parents`` (direct children of any of the given nodes). On a
+        namespaced view the rows are additionally constrained to the view's
+        namespace — explicitly, independent of whether RLS policies are
+        installed. ``after`` is a ``(name, uuid)`` keyset cursor matching
+        the ``ORDER BY name, uuid::text`` ordering; ``limit`` caps the page.
+        Row shape matches :meth:`get_node_raw` / :meth:`get_subtree_raw`.
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+        if self._namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(self._namespace)
+        if node_type is not None:
+            conditions.append("node_type = ANY(%s)")
+            params.append([node_type] if isinstance(node_type, str) else list(node_type))
+        if parents is not None:
+            conditions.append("parent_uuid = ANY(%s)")
+            params.append(list(parents))
+        if after is not None:
+            conditions.append("(name, uuid::text) > (%s, %s)")
+            params.extend([after[0], str(after[1])])
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        sql = (
+            "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
+            f"FROM node WHERE {where} ORDER BY name, uuid::text"
+        )
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+        async with self._conn() as conn:
+            # Dynamic WHERE from the allowlisted fragments above — same
+            # ty-ignored f-string story as query_nodes.
+            rows = await (await conn.execute(sql, params)).fetchall()  # ty: ignore[invalid-argument-type]
+        return [
+            {
+                "uuid": r[0],
+                "node_type": r[1],
+                "name": r[2],
+                "data": r[3],
+                "parent_uuid": r[4],
+                "path": r[5],
+                "created_at": r[6],
+                "updated_at": r[7],
+            }
+            for r in rows
+        ]
+
     async def list_series(self, owner_uuid: UUID, *, owner_col: str = "node_uuid") -> list[dict]:
         """List the series catalog owned by a node (or edge).
 
