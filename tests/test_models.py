@@ -1,17 +1,28 @@
-"""Tests for energydb SQLAlchemy models (no DB required)."""
+"""Tests for energydb SQLAlchemy models (no DB required).
 
-from energydb.models import Base, Edge, Node, Run, Series
+Schema-agnostic: ENERGYDB_SCHEMA is import-time configuration (the platform
+runs in ``public`` → ``SCHEMA is None``; the integration suite isolates into
+a named schema), so expectations derive from ``SCHEMA`` instead of
+hardcoding either layout.
+"""
+
+from energydb.models import SCHEMA, Base, Edge, Node, Run, Series
+
+
+def _metadata_key(name: str) -> str:
+    return f"{SCHEMA}.{name}" if SCHEMA else name
 
 
 class TestNodeModel:
     def test_table_name(self):
         assert Node.__tablename__ == "node"
-        assert Node.__table__.schema == "energydb"
+        assert Node.__table__.schema == SCHEMA
 
     def test_columns(self):
         col_names = {c.name for c in Node.__table__.columns}
         expected = {
             "uuid",
+            "namespace",
             "node_type",
             "name",
             "parent_uuid",
@@ -37,12 +48,13 @@ class TestNodeModel:
 class TestEdgeModel:
     def test_table_name(self):
         assert Edge.__tablename__ == "edge"
-        assert Edge.__table__.schema == "energydb"
+        assert Edge.__table__.schema == SCHEMA
 
     def test_columns(self):
         col_names = {c.name for c in Edge.__table__.columns}
         assert col_names == {
             "uuid",
+            "namespace",
             "edge_type",
             "name",
             "from_node_uuid",
@@ -56,12 +68,13 @@ class TestEdgeModel:
 class TestSeriesModel:
     def test_table_name(self):
         assert Series.__tablename__ == "series"
-        assert Series.__table__.schema == "energydb"
+        assert Series.__table__.schema == SCHEMA
 
     def test_columns(self):
         col_names = {c.name for c in Series.__table__.columns}
         assert col_names == {
             "series_id",
+            "namespace",
             "node_uuid",
             "edge_uuid",
             "data_type",
@@ -103,7 +116,7 @@ class TestSeriesModel:
 class TestRunModel:
     def test_table_name(self):
         assert Run.__tablename__ == "runs"
-        assert Run.__table__.schema == "energydb"
+        assert Run.__table__.schema == SCHEMA
 
     def test_columns(self):
         col_names = {c.name for c in Run.__table__.columns}
@@ -121,8 +134,30 @@ class TestRunModel:
         assert [c.name for c in Run.__table__.primary_key.columns] == ["run_id"]
 
 
+class TestNamespaceTenancy:
+    """The namespace partition key is structural — composite FKs make
+    cross-namespace children/edges/series unrepresentable."""
+
+    def test_namespace_columns_not_nullable(self):
+        for model in (Node, Edge, Series):
+            col = model.__table__.c.namespace
+            assert col.nullable is False
+            assert col.server_default is not None  # GUC write-stamp default
+
+    def test_composite_same_namespace_fkeys(self):
+        node_names = {c.name for c in Node.__table__.constraints if getattr(c, "name", None)}
+        assert "node_uuid_namespace_uniq" in node_names
+        assert "node_parent_namespace_fkey" in node_names
+        assert "node_path_uniq" in node_names  # now (namespace, path)
+        edge_names = {c.name for c in Edge.__table__.constraints if getattr(c, "name", None)}
+        assert "edge_uuid_namespace_uniq" in edge_names
+        assert "edge_from_node_namespace_fkey" in edge_names
+        assert "edge_to_node_namespace_fkey" in edge_names
+        series_names = {c.name for c in Series.__table__.constraints if getattr(c, "name", None)}
+        assert "series_node_namespace_fkey" in series_names
+        assert "series_edge_namespace_fkey" in series_names
+
+
 def test_base_has_expected_tables():
-    assert "energydb.node" in Base.metadata.tables
-    assert "energydb.edge" in Base.metadata.tables
-    assert "energydb.series" in Base.metadata.tables
-    assert "energydb.runs" in Base.metadata.tables
+    for name in ("node", "edge", "series", "runs"):
+        assert _metadata_key(name) in Base.metadata.tables

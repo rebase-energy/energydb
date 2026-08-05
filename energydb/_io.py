@@ -72,7 +72,7 @@ class WriteResult(int):
 
 
 async def write_manifest(
-    pool,
+    client,
     td,
     df: pl.DataFrame,
     *,
@@ -101,7 +101,7 @@ async def write_manifest(
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
 
-    async with pool.connection() as conn:
+    async with client._conn() as conn:
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             # Writes drop path / edge meta before the CH insert anyway, so
             # skip the hierarchy JOIN — saves ~20ms PG-side at scale=200.
@@ -154,7 +154,7 @@ async def write_manifest(
 
 
 async def _execute_read(
-    pool,
+    client,
     meta: pl.DataFrame,
     td_call: Callable[[list[int], list[str]], pl.DataFrame],
     *,
@@ -186,8 +186,8 @@ async def _execute_read(
     if output == "by_path":
         with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
             if is_edge:
-                return partition_edge_by_path(pool, result, meta)
-            return partition_node_by_path(pool, result, meta)
+                return partition_edge_by_path(client, result, meta)
+            return partition_node_by_path(client, result, meta)
 
     if result.is_empty():
         # CH returned no rows — drop the internal series_id and bail. The
@@ -197,12 +197,12 @@ async def _execute_read(
 
     with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
         if is_edge:
-            return attach_edge_hierarchy(pool, result, meta)
-        return attach_node_hierarchy(pool, result, meta)
+            return attach_edge_hierarchy(client, result, meta)
+        return attach_node_hierarchy(client, result, meta)
 
 
 async def _read_pipeline(
-    pool,
+    client,
     manifest: pl.DataFrame,
     td_call: Callable[[list[int], list[str]], pl.DataFrame],
     *,
@@ -217,15 +217,15 @@ async def _read_pipeline(
     """
     is_edge = "edge_uuid" in manifest.columns
     with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-        async with pool.connection() as conn:
+        async with client._conn() as conn:
             resolved, _summary = await resolve_manifest(conn, manifest)
     with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
         meta = _meta_from_resolved(resolved, is_edge=is_edge)
-    return await _execute_read(pool, meta, td_call, unit=unit, output=output)
+    return await _execute_read(client, meta, td_call, unit=unit, output=output)
 
 
 async def read_resolved(
-    pool,
+    client,
     td,
     meta: pl.DataFrame,
     *,
@@ -257,11 +257,11 @@ async def read_resolved(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return await _execute_read(pool, meta, _call, unit=unit, output=output)
+    return await _execute_read(client, meta, _call, unit=unit, output=output)
 
 
 async def read_relative_resolved(
-    pool,
+    client,
     td,
     meta: pl.DataFrame,
     *,
@@ -274,7 +274,7 @@ async def read_relative_resolved(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return await _execute_read(pool, meta, _call, unit=unit, output=output)
+    return await _execute_read(client, meta, _call, unit=unit, output=output)
 
 
 def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
@@ -301,7 +301,7 @@ def _meta_from_resolved(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFram
 
 
 async def read_manifest(
-    pool,
+    client,
     td,
     manifest: pl.DataFrame,
     *,
@@ -333,11 +333,11 @@ async def read_manifest(
             include_knowledge_time=include_knowledge_time,
         )
 
-    return await _read_pipeline(pool, manifest, _call, unit=unit, output=output)
+    return await _read_pipeline(client, manifest, _call, unit=unit, output=output)
 
 
 async def read_relative_manifest(
-    pool,
+    client,
     td,
     manifest: pl.DataFrame,
     *,
@@ -355,7 +355,7 @@ async def read_relative_manifest(
     def _call(series_ids: list[int], retentions: list[str]) -> pl.DataFrame:
         return td.read_relative(series_ids=series_ids, retention=retentions, **td_kwargs)
 
-    return await _read_pipeline(pool, manifest, _call, unit=unit, output=output)
+    return await _read_pipeline(client, manifest, _call, unit=unit, output=output)
 
 
 def apply_per_series_unit(

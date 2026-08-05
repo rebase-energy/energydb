@@ -55,7 +55,12 @@ class Transaction:
         return f"Transaction({state}, {len(self._node_changes)} node + {len(self._edge_changes)} edge changes pending)"
 
     async def __aenter__(self) -> Transaction:
-        self._pool_cm = self._client._pool.connection()
+        # Borrow via the client's checkout point: on a namespaced view this
+        # binds the transaction-local namespace GUC, which covers the whole
+        # batch because the txn commits exactly once (at .commit()). Any
+        # statement issued after commit() would run outside that binding —
+        # commit is terminal, so scopes must not be used past it.
+        self._pool_cm = self._client._conn()
         self._conn = await self._pool_cm.__aenter__()
         return self
 

@@ -72,7 +72,7 @@ def find(result: dict, **filters):
 _MISSING = object()
 
 
-def attach_node_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
+def attach_node_hierarchy(client, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
     """Attach ``path`` (Utf8) to a node-routed read result.
 
     *meta* carries ``(series_id, path, data_type, name)`` from the resolve
@@ -80,10 +80,10 @@ def attach_node_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.
     extra PG round-trip is needed. ``data_type`` / ``name`` are preserved
     on every row; ``series_id`` is dropped from the public result.
 
-    ``pool`` is unused (left in the signature for symmetry with the edge
+    ``client`` is unused (left in the signature for symmetry with the edge
     variant and to keep call sites stable).
     """
-    del pool  # no PG round-trip needed; path rides on meta
+    del client  # no PG round-trip needed; path rides on meta
     if result.is_empty() or meta.is_empty():
         return result
 
@@ -91,7 +91,7 @@ def attach_node_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.
     return result.join(sid_to_path, on="series_id", how="left").drop("series_id")
 
 
-def attach_edge_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
+def attach_edge_hierarchy(client, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
     """Attach ``from_path``, ``to_path``, ``edge_type`` to an edge-routed result.
 
     *meta* carries the endpoint paths and edge type from the resolve step's
@@ -100,7 +100,7 @@ def attach_edge_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.
     ``series_id``, ``edge_uuid``, and the edge's own ``name`` (intentionally
     distinct from series ``name``) are dropped from the public result.
     """
-    del pool  # no PG round-trip needed; endpoint paths ride on meta
+    del client  # no PG round-trip needed; endpoint paths ride on meta
     if result.is_empty() or meta.is_empty():
         return result
 
@@ -115,7 +115,7 @@ def attach_edge_hierarchy(pool, result: pl.DataFrame, meta: pl.DataFrame) -> pl.
 # ---------------------------------------------------------------------------
 
 
-def partition_node_by_path(pool, result: pl.DataFrame, meta: pl.DataFrame) -> dict[SeriesKey, pl.DataFrame]:
+def partition_node_by_path(client, result: pl.DataFrame, meta: pl.DataFrame) -> dict[SeriesKey, pl.DataFrame]:
     """Partition a node-routed CH result into ``{SeriesKey: df}``.
 
     Skips the per-row broadcast that ``attach_node_hierarchy`` does. Each
@@ -131,7 +131,7 @@ def partition_node_by_path(pool, result: pl.DataFrame, meta: pl.DataFrame) -> di
     get an empty sub-frame with the documented schema — callers can index
     by key without ``KeyError``.
     """
-    del pool  # no PG round-trip needed; path rides on meta
+    del client  # no PG round-trip needed; path rides on meta
     if meta.is_empty():
         return {}
 
@@ -145,14 +145,14 @@ def partition_node_by_path(pool, result: pl.DataFrame, meta: pl.DataFrame) -> di
     return _build_partition(result, sid_to_key)
 
 
-def partition_edge_by_path(pool, result: pl.DataFrame, meta: pl.DataFrame) -> dict[EdgeSeriesKey, pl.DataFrame]:
+def partition_edge_by_path(client, result: pl.DataFrame, meta: pl.DataFrame) -> dict[EdgeSeriesKey, pl.DataFrame]:
     """Partition an edge-routed CH result into ``{EdgeSeriesKey: df}``.
 
     Same shape as :func:`partition_node_by_path` for the data side; the key
     is :class:`EdgeSeriesKey`, extended with the edge endpoint paths and
     ``edge_type``. Tuple-compatible for backwards-compat positional access.
     """
-    del pool  # no PG round-trip needed; endpoint paths ride on meta
+    del client  # no PG round-trip needed; endpoint paths ride on meta
     if meta.is_empty():
         return {}
 

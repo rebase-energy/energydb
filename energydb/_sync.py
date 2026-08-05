@@ -165,6 +165,11 @@ class Client:
     to use immediately. Always call :meth:`close` (or use it as a context
     manager) to release the pool and stop the background loop.
 
+    ``client.namespace(ns)`` works here too: the reflection proxy wraps the
+    returned :class:`AsyncClient` view, so the result is a sync,
+    namespace-bound view sharing this client's pool (and, like the async
+    view, refuses lifecycle/schema operations).
+
     >>> with Client(pg_conninfo=..., ch_url=...) as client:
     ...     client.create_node(node_type="site", name="S1")
     ...     row = client.get_node(uuid=...).get_raw()

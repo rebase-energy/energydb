@@ -25,11 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 if TYPE_CHECKING:
+    import psycopg
+
     from energydb._transaction import Transaction
 
 import pandas as pd
@@ -69,6 +73,14 @@ class AsyncClient:
     :class:`energydb.Client`, a thin blocking facade over this class.
     """
 
+    # Namespace binding, as *class-level defaults* so that instances built
+    # without __init__ (test fixtures, :meth:`namespace` clones) behave like
+    # root clients unless overridden. ``None`` → no GUC set on checkouts.
+    # Views created via :meth:`namespace` shadow both per-instance and never
+    # own the (shared) pool's lifecycle.
+    _namespace: str | None = None
+    _owns_pool: bool = True
+
     def __init__(
         self,
         *,
@@ -107,7 +119,55 @@ class AsyncClient:
 
     async def open(self) -> None:
         """Open the async connection pool. Await once before first use."""
+        self._require_root("open")
         await self._pool.open()
+
+    # ------------------------------------------------------------------
+    # Namespacing
+    # ------------------------------------------------------------------
+
+    def namespace(self, ns: str) -> AsyncClient:
+        """Return a view of this client bound to one namespace.
+
+        The view shares the parent's connection pool and ClickHouse client;
+        it is a cheap, disposable dict-copy — create one per request. Every
+        PG round-trip made through the view first binds the transaction-local
+        ``energydb.namespace`` GUC (see :meth:`_conn`), which row-level
+        security policies — when installed — use to filter every table to
+        that namespace. Lifecycle and schema operations (:meth:`open`,
+        :meth:`close`, :meth:`create`, :meth:`delete`) stay with the root
+        client and raise on a view.
+        """
+        if not ns:
+            raise ValueError("namespace must be a non-empty string")
+        clone = object.__new__(type(self))
+        clone.__dict__ = {**self.__dict__, "_namespace": ns, "_owns_pool": False}
+        return clone
+
+    def _require_root(self, op: str) -> None:
+        """Raise unless called on a root client (namespaced views share the
+        pool and must never manage its lifecycle or touch schema DDL)."""
+        if not self._owns_pool:
+            raise RuntimeError(f"{op}() is not available on a namespaced view — call it on the root client")
+
+    @asynccontextmanager
+    async def _conn(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
+        """Borrow a pooled connection — the single checkout point for every
+        PG round-trip below (and in ``scope`` / ``_io`` / ``_transaction``).
+
+        On a namespaced view, the transaction-local ``energydb.namespace``
+        GUC is bound first. ``set_config(..., is_local := true)`` is
+        ``SET LOCAL`` in function form — parameterizable and server-side
+        preparable — so the value dies with the transaction and nothing
+        leaks when the connection returns to the shared pool.
+        """
+        async with self._pool.connection() as conn:
+            if self._namespace is not None:
+                await conn.execute(
+                    "SELECT set_config('energydb.namespace', %s, true)",
+                    (self._namespace,),
+                )
+            yield conn
 
     def _safe_dsn(self) -> str:
         """The DSN with the userinfo segment (user:pass) replaced by ``***``.
@@ -124,7 +184,8 @@ class AsyncClient:
         return dsn
 
     def __repr__(self) -> str:
-        return f"AsyncClient(pg={self._safe_dsn()!r})"
+        ns = f", namespace={self._namespace!r}" if self._namespace is not None else ""
+        return f"AsyncClient(pg={self._safe_dsn()!r}{ns})"
 
     # ------------------------------------------------------------------
     # Schema management
@@ -137,6 +198,7 @@ class AsyncClient:
         SQLAlchemy's ``create_all`` and TimeDB's create are synchronous, so they
         run in a worker thread to keep the event loop free.
         """
+        self._require_root("create")
         await asyncio.to_thread(self._create_blocking)
 
     def _create_blocking(self) -> None:
@@ -155,6 +217,7 @@ class AsyncClient:
         own four tables — never the shared ``public`` schema, which would take
         the host application's tables with it.
         """
+        self._require_root("delete")
         async with self._pool.connection() as conn:
             if SCHEMA is None:
                 await conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
@@ -164,6 +227,7 @@ class AsyncClient:
         await asyncio.to_thread(self.td.delete)
 
     async def close(self) -> None:
+        self._require_root("close")
         await self._pool.close()
 
     # ------------------------------------------------------------------
@@ -280,7 +344,7 @@ class AsyncClient:
         Returns the ``uuid`` of the tree's root, except when
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
         """
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             parent_uuid = await resolve_node_uuid(conn, _coerce_path((), kwarg=under)) if under is not None else None
             root_uuid, diff = await register_tree_under(
                 conn,
@@ -312,7 +376,7 @@ class AsyncClient:
         if type is not None:
             where_filters["node_type"] = type
 
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             filter_conds, filter_params = build_filter_conditions(where_filters, type_col="node_type")
             conditions: list[str] = list(filter_conds)
             params: list[Any] = list(filter_params)
@@ -329,7 +393,10 @@ class AsyncClient:
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = await (
                 await conn.execute(
-                    f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",
+                    # Dynamic WHERE built from build_filter_conditions (params
+                    # stay bound). psycopg's LiteralString typing rightly
+                    # dislikes this; proper fix is sql.Composed end-to-end.
+                    f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
                     params,
                 )
             ).fetchall()
@@ -348,7 +415,7 @@ class AsyncClient:
         it walks the structure and validates endpoints against the tree's
         index in one pass.
         """
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             edge_uuid = await create_edge(conn, edm_obj, tree_root=None)
             await conn.commit()
         return edge_uuid
@@ -376,7 +443,7 @@ class AsyncClient:
         ``NodeScope.children()`` — not the EDM readers, which require a
         registered type.
         """
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             if parent is None:
                 parent_uuid = None
             elif isinstance(parent, UUID):
@@ -401,7 +468,7 @@ class AsyncClient:
         the node does not exist. Safe for any ``node_type`` string, unlike
         :meth:`get_node` / :meth:`get_tree`.
         """
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             row = await (
                 await conn.execute(
                     "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
@@ -429,7 +496,7 @@ class AsyncClient:
         dict is ``{uuid, node_type, name, data, parent_uuid, path}``. Includes
         the root itself; empty list if the root does not exist.
         """
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             root = await (
                 await conn.execute(
                     "SELECT path FROM node WHERE uuid = %s",
@@ -473,10 +540,12 @@ class AsyncClient:
         """
         if owner_col not in ("node_uuid", "edge_uuid"):
             raise ValueError("owner_col must be 'node_uuid' or 'edge_uuid'")
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             rows = await (
                 await conn.execute(
-                    f"SELECT name, data_type, canonical_unit, timeseries_type, description "
+                    # owner_col is allowlist-validated above; see query_nodes
+                    # on why this stays a ty-ignored f-string for now.
+                    f"SELECT name, data_type, canonical_unit, timeseries_type, description "  # ty: ignore[invalid-argument-type]
                     f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
                     (owner_uuid,),
                 )
@@ -509,7 +578,7 @@ class AsyncClient:
         if type is not None:
             where_filters["edge_type"] = type
 
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             filter_conds, filter_params = build_filter_conditions(where_filters, type_col="edge_type")
             conditions: list[str] = list(filter_conds)
             params: list[Any] = list(filter_params)
@@ -528,7 +597,8 @@ class AsyncClient:
             where = " AND ".join(conditions) if conditions else "TRUE"
             rows = await (
                 await conn.execute(
-                    f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "
+                    # Same dynamic-WHERE story as query_nodes.
+                    f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "  # ty: ignore[invalid-argument-type]
                     f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
                     params,
                 )
@@ -572,7 +642,7 @@ class AsyncClient:
         outside the tree shape — query them separately with
         :meth:`get_edge` or :meth:`query_edges`.
         """
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             if uuid is not None:
                 root_uuid = uuid
             elif names_or_path:
@@ -802,7 +872,7 @@ class AsyncClient:
         run_ids = await asyncio.to_thread(self.td.read_run_series, series_id=series_id)
         if not run_ids:
             return []
-        async with self._pool.connection() as conn:
+        async with self._conn() as conn:
             return await runs_mod.get_runs(conn, run_ids)
 
     # ------------------------------------------------------------------

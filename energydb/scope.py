@@ -261,10 +261,6 @@ class _BaseScope:
     # -- shared properties / connection management ---------------------
 
     @property
-    def _pool(self):
-        return self._client._pool
-
-    @property
     def _td(self):
         return self._client.td
 
@@ -272,13 +268,14 @@ class _BaseScope:
     async def _use_conn(self):
         """Yield a DB connection. Inside a txn, use the txn's connection
         (caller MUST NOT call ``.commit()`` / ``.rollback()``). Otherwise
-        borrow from the pool; mutators are responsible for explicit
+        borrow via the client's checkout point (which binds the namespace
+        GUC on namespaced views); mutators are responsible for explicit
         ``commit()`` or ``rollback()``.
         """
         if self._txn is not None:
             yield self._txn._conn
             return
-        async with self._pool.connection() as conn:
+        async with self._client._conn() as conn:
             yield conn
 
     # -- subclass contract (overridden in NodeScope / EdgeScope) -------
@@ -483,7 +480,7 @@ class _BaseScope:
         # Take the polars result first so the auto-strip is a single dtype op;
         # convert to the requested backend at the boundary.
         result = await read_resolved(
-            self._pool,
+            self._client,
             self._td,
             meta,
             unit=unit,
@@ -548,7 +545,7 @@ class _BaseScope:
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read_from_meta")
         result = await read_resolved(
-            self._pool,
+            self._client,
             self._td,
             meta,
             unit=unit,
@@ -596,7 +593,7 @@ class _BaseScope:
             )
             return to_backend(empty, backend)
         result = await read_relative_resolved(
-            self._pool,
+            self._client,
             self._td,
             meta,
             unit=unit,

@@ -44,27 +44,46 @@ class Base(DeclarativeBase):
     pass
 
 
+# Namespace: the generic tenancy partition key. Rows created through a
+# namespaced client view (``AsyncClient.namespace(...)``) are stamped
+# automatically — the view's ``_conn()`` binds the transaction-local
+# ``energydb.namespace`` GUC, and this server default reads it back. Rows
+# created through a root client (standalone library users) land in
+# ``'default'``. The same GUC doubles as the row filter if the host
+# application enables RLS. Write paths therefore never mention the column.
+NAMESPACE_DEFAULT = sa.text("COALESCE(NULLIF(current_setting('energydb.namespace', true), ''), 'default')")
+
+
 class Node(Base):
     __tablename__ = "node"
 
     uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
+    namespace = sa.Column(sa.Text, nullable=False, server_default=NAMESPACE_DEFAULT)
     node_type = sa.Column(sa.Text, nullable=False)
     name = sa.Column(sa.Text, nullable=False)
-    parent_uuid = sa.Column(
-        UUID(as_uuid=True),
-        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
-        nullable=True,
-    )
+    parent_uuid = sa.Column(UUID(as_uuid=True), nullable=True)
     path = sa.Column(sa.Text, nullable=False)
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
+        # FK target for every composite "same namespace" constraint below.
+        sa.UniqueConstraint("uuid", "namespace", name="node_uuid_namespace_uniq"),
+        # A child lives in its parent's namespace — structurally. (Roots have
+        # parent_uuid NULL, which composite FKs skip.)
+        sa.ForeignKeyConstraint(
+            ["parent_uuid", "namespace"],
+            [_fk("node.uuid"), _fk("node.namespace")],
+            ondelete="CASCADE",
+            name="node_parent_namespace_fkey",
+        ),
         sa.UniqueConstraint("parent_uuid", "name", name="node_child_uniq"),
-        sa.UniqueConstraint("path", name="node_path_uniq"),
+        # Path- and root-name-uniqueness are per namespace.
+        sa.UniqueConstraint("namespace", "path", name="node_path_uniq"),
         sa.Index(
             "ix_node_root_uniq",
+            "namespace",
             "name",
             unique=True,
             postgresql_where=sa.text("parent_uuid IS NULL"),
@@ -73,9 +92,11 @@ class Node(Base):
         sa.Index("ix_node_data_gin", "data", postgresql_using="gin"),
         sa.Index(
             "ix_node_path_prefix",
+            "namespace",
             "path",
             postgresql_ops={"path": "text_pattern_ops"},
         ),
+        sa.Index("ix_node_namespace_type", "namespace", "node_type"),
         sa.CheckConstraint("name !~ '/' AND length(name) > 0", name="node_name_valid"),
         sa.CheckConstraint("length(path) > 0", name="node_path_nonempty"),
         {"schema": SCHEMA},
@@ -86,23 +107,31 @@ class Edge(Base):
     __tablename__ = "edge"
 
     uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
+    namespace = sa.Column(sa.Text, nullable=False, server_default=NAMESPACE_DEFAULT)
     edge_type = sa.Column(sa.Text, nullable=False)
     name = sa.Column(sa.Text, nullable=True)
-    from_node_uuid = sa.Column(
-        UUID(as_uuid=True),
-        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
-        nullable=False,
-    )
-    to_node_uuid = sa.Column(
-        UUID(as_uuid=True),
-        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
-        nullable=False,
-    )
+    from_node_uuid = sa.Column(UUID(as_uuid=True), nullable=False)
+    to_node_uuid = sa.Column(UUID(as_uuid=True), nullable=False)
     data = sa.Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
+        sa.UniqueConstraint("uuid", "namespace", name="edge_uuid_namespace_uniq"),
+        # Both endpoints must live in the edge's own namespace — a
+        # cross-namespace edge is unrepresentable, not merely checked.
+        sa.ForeignKeyConstraint(
+            ["from_node_uuid", "namespace"],
+            [_fk("node.uuid"), _fk("node.namespace")],
+            ondelete="CASCADE",
+            name="edge_from_node_namespace_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["to_node_uuid", "namespace"],
+            [_fk("node.uuid"), _fk("node.namespace")],
+            ondelete="CASCADE",
+            name="edge_to_node_namespace_fkey",
+        ),
         sa.UniqueConstraint("edge_type", "from_node_uuid", "to_node_uuid", name="edge_uniq"),
         # NULL names are allowed; CHECK runs only when name IS NOT NULL.
         sa.CheckConstraint(
@@ -128,16 +157,9 @@ class Series(Base):
     __tablename__ = "series"
 
     series_id = sa.Column(sa.BigInteger, sa.Identity(always=False), primary_key=True)
-    node_uuid = sa.Column(
-        UUID(as_uuid=True),
-        sa.ForeignKey(_fk("node.uuid"), ondelete="CASCADE"),
-        nullable=True,
-    )
-    edge_uuid = sa.Column(
-        UUID(as_uuid=True),
-        sa.ForeignKey(_fk("edge.uuid"), ondelete="CASCADE"),
-        nullable=True,
-    )
+    namespace = sa.Column(sa.Text, nullable=False, server_default=NAMESPACE_DEFAULT)
+    node_uuid = sa.Column(UUID(as_uuid=True), nullable=True)
+    edge_uuid = sa.Column(UUID(as_uuid=True), nullable=True)
     data_type = sa.Column(sa.Text, nullable=False)
     name = sa.Column(sa.Text, nullable=False)
     canonical_unit = sa.Column(sa.Text, nullable=False)
@@ -148,6 +170,19 @@ class Series(Base):
 
     __table_args__ = (
         sa.CheckConstraint("(node_uuid IS NULL) <> (edge_uuid IS NULL)", name="series_owner_xor"),
+        # A series lives in its owner's namespace — structurally.
+        sa.ForeignKeyConstraint(
+            ["node_uuid", "namespace"],
+            [_fk("node.uuid"), _fk("node.namespace")],
+            ondelete="CASCADE",
+            name="series_node_namespace_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["edge_uuid", "namespace"],
+            [_fk("edge.uuid"), _fk("edge.namespace")],
+            ondelete="CASCADE",
+            name="series_edge_namespace_fkey",
+        ),
         sa.UniqueConstraint("node_uuid", "data_type", "name", name="series_node_uniq"),
         sa.UniqueConstraint("edge_uuid", "data_type", "name", name="series_edge_uniq"),
         sa.CheckConstraint("timeseries_type IN ('FLAT','OVERLAPPING')", name="valid_timeseries_type"),
