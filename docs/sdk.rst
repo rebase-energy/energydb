@@ -979,6 +979,49 @@ Run ids are client-side BIGINTs (top 63 bits of a UUID7), time-sortable, and
 fit cleanly in ``Int64``.
 
 
+Namespaces (multi-tenancy)
+--------------------------
+
+*New in 0.10.0.* One energydb database can serve many tenants. Every row in
+``node`` / ``edge`` / ``series`` carries a ``namespace`` label, and
+:meth:`~energydb.Client.namespace` returns a *view* of the client bound to one
+tenant:
+
+.. code-block:: python
+
+   root = Client()                     # root client: sees everything
+   acme = root.namespace("acme")       # view: sees and stamps only "acme"
+
+Namespacing is **opt-in and invisible to single-tenant users**: a root client
+never sets the label, rows it creates land in ``'default'``, and nothing else
+about its behavior changes.
+
+How a view works:
+
+- It **shares the root client's connection pool and ClickHouse client** — no
+  extra connections. Rebinding is cheap; call ``namespace()`` per request if
+  you like.
+- On checkout it binds the ``energydb.namespace`` GUC (transaction-local for
+  transactional work), which a server-side column default reads back to stamp
+  new rows. Write paths never mention the column.
+- **Row filtering is enforced by PostgreSQL Row-Level Security when the host
+  application enables it** — the library ships no policies of its own. Until
+  RLS is enabled, a view stamps rows but does not hide other tenants' rows.
+- Lifecycle operations (``open`` / ``create`` / ``delete`` / ``close`` /
+  ``setup_ch_meta_engine``) are **root-only** and raise
+  :class:`~energydb.errors.ValidationError` on a view.
+- Engine-parallel reads are disabled on views (the ClickHouse meta engine
+  reads PostgreSQL with credentials that bypass RLS); reads fall back to the
+  sequential path.
+
+One deployment caveat: the autocommit read path binds the GUC at *session*
+level and clears it before the connection returns to the pool. Behind a
+transaction-mode connection pooler (PgBouncer), session state is not
+guaranteed to follow your queries — run **namespaced** deployments against a
+direct PostgreSQL connection. Root clients have no such constraint; since
+0.10.0 they are fully pooler-safe.
+
+
 .. _sdk-error-handling:
 
 Error Handling
@@ -1178,9 +1221,18 @@ Best Practices
 Upgrading to 0.10.0
 -------------------
 
-No migration required: no schema change, no ClickHouse engine-table
-re-provisioning, and no API change. One thing is worth knowing:
+No migration required for an existing database: no ClickHouse engine-table
+re-provisioning, and every API change is additive. Three things are worth
+knowing:
 
+- **Namespaces** (see `Namespaces (multi-tenancy)`_) are new and opt-in. A
+  client that never calls :meth:`~energydb.Client.namespace` behaves exactly
+  as on 0.9.0. ``create()`` on a **new** database now emits namespace-aware
+  DDL (a ``namespace`` column on ``node``/``edge``/``series``, composite
+  keys); an **existing** 0.9.0-shaped database keeps working unchanged — no
+  root-client query references the column — but the library ships no
+  migration to add namespacing to existing data; adopting multi-tenancy on an
+  existing database is the host application's project.
 - **energydb no longer touches the connection's** ``search_path``. Every
   relation reference is written out in the SQL instead — see `Schema
   resolution`_ above. This supersedes the 0.9.0 startup-option transport, which
@@ -1189,6 +1241,10 @@ re-provisioning, and no API change. One thing is worth knowing:
   If you were pinned to an unpooled endpoint because of that, you no longer are.
   ``ENERGYDB_SCHEMA`` semantics are unchanged, and ``SHOW search_path`` now
   echoes whatever your server or role says — energydb stopped setting it.
+- **New methods**, all additive: :meth:`~energydb.Client.namespace`,
+  :meth:`~energydb.Client.list_nodes_raw` (keyset-paginated raw node listing),
+  and the resolve-then-read split ``scope.resolve()`` /
+  ``scope.read_from_meta()`` for authorize-before-read flows.
 
 
 Upgrading to 0.9.0
