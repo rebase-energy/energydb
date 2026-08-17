@@ -18,6 +18,7 @@ import pytest
 from energydatamodel.reference import Reference
 from energydb import Client
 from energydb.client import AsyncClient
+from energydb.models import SQL_SCHEMA_PREFIX as P
 
 # ---------------------------------------------------------------------------
 # Unit tests — mocked pool / td
@@ -67,13 +68,21 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
     return conn
 
 
+def _target_table(sql: str) -> str:
+    """The relation an ``INSERT INTO`` targets, schema prefix stripped.
+
+    energydb's SQL is schema-qualified, so the target reads ``energydb.node``
+    under ``ENERGYDB_SCHEMA=energydb`` and plain ``node`` by default. These
+    assertions are about *which* table, not how it is spelled."""
+    return sql.split("INSERT INTO ")[1].split(" ")[0].removeprefix(P)
+
+
 def _batches(conn: MagicMock) -> dict[str, list[tuple]]:
     """The rows passed to each batched INSERT, keyed by target table."""
     out: dict[str, list[tuple]] = {}
     for call in conn._batch_cursor.executemany.call_args_list:
         sql, rows = call.args
-        table = sql.split("INSERT INTO ")[1].split(" ")[0]
-        out[table] = list(rows)
+        out[_target_table(sql)] = list(rows)
     return out
 
 
@@ -256,7 +265,7 @@ class TestRegisterTree:
                 # resolve_node_uuid materialized-path lookup uses fetchone.
                 res.fetchone = AsyncMock(return_value=(parent_uuid,))
                 res.fetchall = AsyncMock(return_value=[])
-            elif "SELECT path FROM node WHERE uuid" in sql:
+            elif f"SELECT path FROM {P}node WHERE uuid" in sql:
                 res.fetchone = AsyncMock(return_value=("Region/Site",))
                 res.fetchall = AsyncMock(return_value=[])
             else:
@@ -293,7 +302,7 @@ class TestTwoPassWalk:
         assert [(r[0], r[2], r[3], r[4]) for r in batches["edge"]] == [(line.id, "L1", bus_a.id, bus_b.id)]
         # nodes are inserted before edges (FK on the endpoints)
         calls = conn._batch_cursor.executemany.call_args_list
-        tables = [c.args[0].split("INSERT INTO ")[1].split(" ")[0] for c in calls]
+        tables = [_target_table(c.args[0]) for c in calls]
         assert tables.index("node") < tables.index("edge")
 
 

@@ -39,7 +39,6 @@ if TYPE_CHECKING:
 
 import pandas as pd
 import polars as pl
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
@@ -68,6 +67,7 @@ from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
 from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
 from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import (
     OnMissing,
     Path,
@@ -80,35 +80,6 @@ from energydb.scope import EdgeScope, NodeScope, _coerce_path
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
 logger = logging.getLogger(__name__)
-
-
-def _pool_conninfo(conninfo: str) -> str:
-    """``conninfo`` plus a startup ``options`` carrying energydb's search path.
-
-    The search path used to be a ``SET`` + ``commit()`` in the pool's ``configure``
-    callback — one extra round-trip on every checkout (the commit was needed
-    because an uncommitted ``SET`` leaves the connection in a transaction, which
-    ``psycopg_pool`` rejects). As a libpq startup option it travels in the startup
-    packet instead: set once per connection, zero per-checkout cost.
-
-    Only the pool sees this. ``self._dsn`` keeps the caller's URI, because
-    :meth:`AsyncClient._sqlalchemy_url`, :func:`engine_table_ddl` and
-    :meth:`AsyncClient._safe_dsn` all parse it as one and ``make_conninfo``
-    emits key=value.
-
-    A caller's own ``options`` are preserved and appended to, never clobbered.
-    The search path itself mirrors the previous ``SET`` exactly: ``"{schema},
-    public"`` for a named schema, plain ``"public"`` by default (rather than
-    ``public,public``, which would make ``SHOW search_path`` confusing).
-
-    Caveat: startup options travel in the libpq startup packet, so a connection
-    pooler in transaction-pooling mode may not honour them per-client. energydb's
-    supported deployments (direct PostgreSQL / Neon) do.
-    """
-    search_path = f"{SCHEMA},public" if SCHEMA else "public"
-    existing = conninfo_to_dict(conninfo).get("options") or ""
-    options = f"{existing} -c search_path={search_path}".strip() if existing else f"-c search_path={search_path}"
-    return make_conninfo(conninfo, options=options)
 
 
 class AsyncClient:
@@ -162,12 +133,13 @@ class AsyncClient:
             # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
             # (PG parse+plan stage skipped on subsequent calls).
             # Client-side attribute only: no round-trip, no transaction opened,
-            # hence no commit (the search path now rides the startup packet —
-            # see :func:`_pool_conninfo`).
+            # hence no commit. Nothing else belongs here: energydb's SQL is
+            # schema-qualified, so a connection needs no session state to
+            # resolve relation names (see ``models.SQL_SCHEMA_PREFIX``).
             conn.prepare_threshold = 1
 
         self._pool = AsyncConnectionPool(
-            conninfo=_pool_conninfo(conninfo),
+            conninfo=conninfo,
             min_size=1,
             max_size=10,
             open=False,
@@ -571,7 +543,7 @@ class AsyncClient:
                 where = " AND ".join(filter_conds) if filter_conds else "TRUE"
                 rows = await (
                     await conn.execute(
-                        f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
+                        f"SELECT uuid, node_type, name, data FROM {P}node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
                         list(filter_params),
                     )
                 ).fetchall()
@@ -584,7 +556,7 @@ class AsyncClient:
                 subtree_on, prefix_params = self._subtree_on("n", joined)
                 sql = f"""
                     SELECT n.uuid, n.node_type, n.name, n.data
-                    FROM node r LEFT JOIN node n
+                    FROM {P}node r LEFT JOIN {P}node n
                       ON {subtree_on}{extra}
                     WHERE {addr}
                     ORDER BY n.name
@@ -666,8 +638,8 @@ class AsyncClient:
         async with self._read_conn() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
-                    "FROM node WHERE uuid = %s",
+                    "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "  # ty: ignore[invalid-argument-type]
+                    f"FROM {P}node WHERE uuid = %s",
                     (node_uuid,),
                 )
             ).fetchone()
@@ -695,7 +667,7 @@ class AsyncClient:
         async with self._read_conn() as conn:
             sql = rf"""
                 SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid, c.path, c.created_at, c.updated_at
-                FROM node r JOIN node c
+                FROM {P}node r JOIN {P}node c
                   ON (c.path = r.path OR c.path LIKE {derived_prefix_like("r.path")} ESCAPE '\')
                 WHERE r.uuid = %s
                 ORDER BY c.path
@@ -752,7 +724,7 @@ class AsyncClient:
         where = " AND ".join(conditions) if conditions else "TRUE"
         sql = (
             "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
-            f"FROM node WHERE {where} ORDER BY name, uuid::text"
+            f"FROM {P}node WHERE {where} ORDER BY name, uuid::text"
         )
         if limit is not None:
             sql += " LIMIT %s"
@@ -793,7 +765,7 @@ class AsyncClient:
             rows = await (
                 await conn.execute(
                     f"SELECT series_id, name, data_type, canonical_unit, timeseries_type, description "  # ty: ignore[invalid-argument-type]
-                    f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
+                    f"FROM {P}series WHERE {owner_col} = %s ORDER BY data_type, name",
                     (owner_uuid,),
                 )
             ).fetchall()
@@ -836,7 +808,7 @@ class AsyncClient:
                 rows = await (
                     await conn.execute(
                         f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "  # ty: ignore[invalid-argument-type]
-                        f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
+                        f"FROM {P}edge WHERE {where} ORDER BY name NULLS LAST",
                         list(filter_params),
                     )
                 ).fetchall()
@@ -849,10 +821,10 @@ class AsyncClient:
                 subtree_on, prefix_params = self._subtree_on("m", joined)
                 sql = f"""
                     SELECT DISTINCT e.uuid, e.edge_type, e.name, e.data, e.from_node_uuid, e.to_node_uuid
-                    FROM node r
-                    LEFT JOIN node m
+                    FROM {P}node r
+                    LEFT JOIN {P}node m
                       ON {subtree_on}
-                    LEFT JOIN edge e
+                    LEFT JOIN {P}edge e
                       ON (e.from_node_uuid = m.uuid OR e.to_node_uuid = m.uuid){extra}
                     WHERE {addr}
                     ORDER BY e.name NULLS LAST
@@ -916,12 +888,12 @@ class AsyncClient:
         # scan are inlined); with ``include_series`` a second, independent
         # statement joins the series — both ride ONE pipeline flush.
         subtree_on, prefix_params = self._subtree_on("n", joined)
-        subtree_from = f"FROM node r JOIN node n ON {subtree_on}"
+        subtree_from = f"FROM {P}node r JOIN {P}node n ON {subtree_on}"
         params = [*prefix_params, addr_param]
         nodes_sql = f"SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid, r.uuid {subtree_from} WHERE {addr}"
         series_sql = (
             f"SELECT s.node_uuid, s.data_type, s.name, s.canonical_unit, s.timeseries_type, s.description "
-            f"{subtree_from} JOIN series s ON s.node_uuid = n.uuid WHERE {addr}"
+            f"{subtree_from} JOIN {P}series s ON s.node_uuid = n.uuid WHERE {addr}"
         )
         async with self._read_conn() as conn:
             if include_series:

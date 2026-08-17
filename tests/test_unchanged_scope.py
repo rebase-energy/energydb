@@ -22,6 +22,7 @@ import pytest
 from energydb import Client
 from energydb._io import _check_unchanged_scope
 from energydb.errors import UnchangedScopeError, ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import ResolveSummary
 
 # ``missing`` is the on_missing="skip" report; irrelevant to scope selection, so
@@ -127,7 +128,9 @@ def _run_ids(client: Client) -> set[int]:
 def _pg_run_count(client: Client) -> int:
     async def _count():
         async with client._async._pool.connection() as conn:
-            row = await (await conn.execute("SELECT count(*) FROM runs")).fetchone()
+            # Schema-qualified like every energydb query: the pool sets no
+            # search_path, so an unqualified name would not resolve here.
+            row = await (await conn.execute(f"SELECT count(*) FROM {P}runs")).fetchone()
             return int(row[0])
 
     return client._portal.run(_count())

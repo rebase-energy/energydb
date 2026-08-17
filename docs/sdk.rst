@@ -91,6 +91,27 @@ For programmatic use, instantiate the client with explicit settings:
        ch_url="http://default:devpassword@localhost:8123/default",
    )
 
+Schema resolution
+~~~~~~~~~~~~~~~~~
+
+energydb never sets, reads, or depends on the connection's ``search_path``.
+Every statement it issues names its relations in the SQL text itself:
+``energydb.node`` under ``ENERGYDB_SCHEMA=energydb``, and plain ``node`` under
+the default ``public`` — where it resolves alongside the host application's own
+unqualified tables through the server's own default search path.
+
+Resolution is therefore a property of the query, not of per-connection session
+state, which is what makes energydb correct behind a **transaction-mode
+connection pooler** (PgBouncer, Neon's pooled ``-pooler`` endpoints). Such a
+pooler may serve each transaction from a different server connection, and
+rejects the libpq ``options`` startup parameter outright — so any scheme that
+carries the schema in session state either fails to connect or resolves against
+state some other client set. Point energydb at a pooled endpoint or a direct
+one; both behave identically.
+
+``SHOW search_path`` reports whatever your server, role, or proxy configures.
+energydb does not change it and does not depend on what it says.
+
 
 Schema Management
 -----------------
@@ -1154,6 +1175,22 @@ Best Practices
 
 .. _sdk-upgrading:
 
+Upgrading to 0.10.0
+-------------------
+
+No migration required: no schema change, no ClickHouse engine-table
+re-provisioning, and no API change. One thing is worth knowing:
+
+- **energydb no longer touches the connection's** ``search_path``. Every
+  relation reference is written out in the SQL instead — see `Schema
+  resolution`_ above. This supersedes the 0.9.0 startup-option transport, which
+  a PgBouncer-based pooler rejects (Neon's pooled endpoints fail *every*
+  connection with ``unsupported startup parameter in options: search_path``).
+  If you were pinned to an unpooled endpoint because of that, you no longer are.
+  ``ENERGYDB_SCHEMA`` semantics are unchanged, and ``SHOW search_path`` now
+  echoes whatever your server or role says — energydb stopped setting it.
+
+
 Upgrading to 0.9.0
 ------------------
 
@@ -1172,9 +1209,10 @@ re-provisioning. Four things are worth knowing:
   a traceback. Alerting that matched on that warning will stop firing for
   this cause — deliberately.
 - **``SHOW search_path`` echoes ``myschema,public``** (no space), because the
-  search path now travels in the libpq startup packet rather than a ``SET``
-  statement. Resolution is identical; only the spelling differs, which
-  matters solely to a deployment smoke-test that string-matches it.
+  search path travels in the libpq startup packet rather than a ``SET``
+  statement. *Superseded by 0.10.0*, which stops setting the search path at
+  all — and which you want instead if anything between you and PostgreSQL
+  pools connections.
 
 Existing ``except ValueError`` handlers keep working: every class in
 :mod:`energydb.errors` also subclasses ``ValueError``.

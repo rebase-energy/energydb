@@ -31,10 +31,26 @@ from energydb._ch_meta_engine import series_meta_view_ddl
 # application's tables in ``public``; a named schema isolates them. ``SCHEMA``
 # is ``None`` for ``"public"`` so the ORM tables carry no explicit schema —
 # identical to unqualified host tables, which keeps Alembic autogenerate from
-# churning on a redundant ``schema="public"`` qualifier. Raw SQL relies on the
-# session ``search_path`` (set per connection in ``Client``).
+# churning on a redundant ``schema="public"`` qualifier.
 _SCHEMA_ENV = os.environ.get("ENERGYDB_SCHEMA", "public")
 SCHEMA: str | None = None if _SCHEMA_ENV == "public" else _SCHEMA_ENV
+
+# The schema prefix every raw-SQL relation reference is written with:
+# ``f"SELECT ... FROM {SQL_SCHEMA_PREFIX}node"``. Relation names then resolve
+# from the SQL text itself, so energydb never sets, needs, or reads the
+# connection's schema search path — which is what makes it correct behind a
+# transaction-mode pooler (PgBouncer / Neon pooled endpoints), where
+# per-connection session state is not the client's to rely on.
+#
+# ``""`` for the default schema: unqualified names then resolve through the
+# *server-side* default (``"$user", public``), exactly like the host
+# application's own unqualified tables — and byte-identically to the SQL
+# energydb emitted before the prefix existed.
+#
+# ``SCHEMA`` goes in unquoted, matching the repo-wide convention (``CREATE
+# SCHEMA IF NOT EXISTS {SCHEMA}``, :func:`_fk`); lowercase simple identifiers
+# are an accepted constraint of ``ENERGYDB_SCHEMA``.
+SQL_SCHEMA_PREFIX: str = f"{SCHEMA}." if SCHEMA else ""
 
 
 def _fk(target: str) -> str:
@@ -239,7 +255,7 @@ if SCHEMA is not None:
 # with its engine-table counterpart in ``_ch_meta_engine``; created after the tables
 # by ``Client.create()`` and (re)created idempotently by ``Client.setup_ch_meta_engine()``
 # since Alembic autogenerate does not track views.
-CREATE_SERIES_META_VIEW, DROP_SERIES_META_VIEW = series_meta_view_ddl(f"{SCHEMA}." if SCHEMA else "")
+CREATE_SERIES_META_VIEW, DROP_SERIES_META_VIEW = series_meta_view_ddl(SQL_SCHEMA_PREFIX)
 
 event.listen(Base.metadata, "after_create", sa.DDL(CREATE_SERIES_META_VIEW))
 event.listen(Base.metadata, "before_drop", sa.DDL(DROP_SERIES_META_VIEW))

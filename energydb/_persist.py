@@ -33,6 +33,7 @@ from uuid6 import uuid7
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.errors import AlreadyExistsError, NodeNotFoundError, ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.serialization import serialize_edge, serialize_node
 from energydb.series import SERIES_INSERT_COLUMNS, prepare_series_row, validate_name
 from energydb.units import compute_unit_factor
@@ -67,7 +68,7 @@ async def create_node_raw(
     else:
         parent_row = await (
             await conn.execute(
-                "SELECT path FROM node WHERE uuid = %s",
+                f"SELECT path FROM {P}node WHERE uuid = %s",
                 (parent_uuid,),
             )
         ).fetchone()
@@ -76,7 +77,7 @@ async def create_node_raw(
         path = f"{parent_row[0]}/{name}"
 
     await conn.execute(
-        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+        f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
         (uuid_val, node_type, name, parent_uuid, path, Jsonb(data or {})),
     )
     return uuid_val
@@ -111,8 +112,8 @@ async def create_edge(
 
     row = await (
         await conn.execute(
-            """
-        INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
+            f"""
+        INSERT INTO {P}edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (uuid) DO UPDATE
           SET name           = EXCLUDED.name,
@@ -130,7 +131,7 @@ async def create_edge(
     if row is None:
         existing = await (
             await conn.execute(
-                "SELECT edge_type FROM edge WHERE uuid = %s",
+                f"SELECT edge_type FROM {P}edge WHERE uuid = %s",
                 (uuid_val,),
             )
         ).fetchone()
@@ -242,7 +243,7 @@ async def register_tree_under(
     # lookup is the graft parent's path (which doubles as its existence check).
     parent_path: str | None = None
     if parent_uuid is not None:
-        parent_row = await (await conn.execute("SELECT path FROM node WHERE uuid = %s", (parent_uuid,))).fetchone()
+        parent_row = await (await conn.execute(f"SELECT path FROM {P}node WHERE uuid = %s", (parent_uuid,))).fetchone()
         if parent_row is None:
             raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
         parent_path = parent_row[0]
@@ -278,18 +279,18 @@ async def register_tree_under(
     # relying on executemany's per-call internal pipelining.
     async with conn.pipeline(), conn.cursor() as cur:
         await cur.executemany(
-            "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+            f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
             node_rows,
         )
         if edge_rows:
             await cur.executemany(
-                "INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data) "
+                f"INSERT INTO {P}edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",
                 edge_rows,
             )
         if series_rows:
             await cur.executemany(
-                f"INSERT INTO series ({', '.join(SERIES_INSERT_COLUMNS)}) "
+                f"INSERT INTO {P}series ({', '.join(SERIES_INSERT_COLUMNS)}) "
                 f"VALUES ({', '.join(['%s'] * len(SERIES_INSERT_COLUMNS))})",
                 series_rows,
             )
@@ -421,8 +422,8 @@ async def _existing_uuids(conn, node_uuids: list[UUID], edge_uuids: list[UUID]) 
     """
     rows = await (
         await conn.execute(
-            "SELECT 0 AS kind, uuid FROM node WHERE uuid = ANY(%s) "
-            "UNION ALL SELECT 1, uuid FROM edge WHERE uuid = ANY(%s)",
+            f"SELECT 0 AS kind, uuid FROM {P}node WHERE uuid = ANY(%s) "
+            f"UNION ALL SELECT 1, uuid FROM {P}edge WHERE uuid = ANY(%s)",
             (node_uuids, edge_uuids),
         )
     ).fetchall()
@@ -434,7 +435,7 @@ async def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnaps
         return {}
     rows = await (
         await conn.execute(
-            "SELECT uuid, node_type, name, parent_uuid, data FROM node WHERE uuid = ANY(%s)",
+            f"SELECT uuid, node_type, name, parent_uuid, data FROM {P}node WHERE uuid = ANY(%s)",
             (uuids,),
         )
     ).fetchall()
@@ -448,7 +449,7 @@ async def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnaps
         return {}
     rows = await (
         await conn.execute(
-            "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM edge WHERE uuid = ANY(%s)",
+            f"SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM {P}edge WHERE uuid = ANY(%s)",
             (uuids,),
         )
     ).fetchall()

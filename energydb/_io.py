@@ -39,6 +39,7 @@ from energydb._join import (
 from energydb._persist import apply_manifest_unit_conversion
 from energydb.errors import UnchangedScopeError, ValidationError
 from energydb.models import SCHEMA
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import OnMissing, ResolveSummary, _check_on_missing, resolve_manifest
 from energydb.units import compute_unit_factor
 
@@ -239,7 +240,7 @@ async def write_manifest(
                         # failure.
                         if run_id is None:
                             with contextlib.suppress(Exception):
-                                await conn.execute("DELETE FROM runs WHERE run_id = %s", (rid,))
+                                await conn.execute(f"DELETE FROM {P}runs WHERE run_id = %s", (rid,))
                         raise
             finally:
                 if client._namespace is not None:

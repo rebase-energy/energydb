@@ -37,6 +37,7 @@ from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.errors import EdgeNotFoundError, NodeNotFoundError, NotFoundError, ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import (
     Path,
     _like_escape,
@@ -847,15 +848,15 @@ class NodeScope(_BaseScope):
         if self._path:
             joined = "/".join(self._path)
             if self._node_uuid is None:
-                return "node n", [], "n.path = %s", [joined]
+                return f"{P}node n", [], "n.path = %s", [joined]
             return (
-                "node n JOIN node s ON n.path = s.path || '/' || %s",
+                f"{P}node n JOIN {P}node s ON n.path = s.path || '/' || %s",
                 [joined],
                 "s.uuid = %s",
                 [self._node_uuid],
             )
         if self._node_uuid is not None:
-            return "node n", [], "n.uuid = %s", [self._node_uuid]
+            return f"{P}node n", [], "n.uuid = %s", [self._node_uuid]
         raise ValidationError("NodeScope has no path or uuid to resolve.")
 
     def _missing_error(self) -> NodeNotFoundError:
@@ -884,7 +885,7 @@ class NodeScope(_BaseScope):
             extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
             root_path_row = await (
                 await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
+                    f"SELECT path FROM {P}node WHERE uuid = %s",
                     (root_uuid,),
                 )
             ).fetchone()
@@ -892,7 +893,7 @@ class NodeScope(_BaseScope):
                 return []
             root_path = root_path_row[0]
             sql = rf"""
-                SELECT uuid FROM node
+                SELECT uuid FROM {P}node
                 WHERE (path = %s OR path LIKE %s || '/%%' ESCAPE '\')
                   {extra}
             """
@@ -960,7 +961,7 @@ class NodeScope(_BaseScope):
             rows = await (
                 await conn.execute(
                     f"SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid "
-                    f"FROM {frm} LEFT JOIN node c ON c.parent_uuid = n.uuid{type_cond} "
+                    f"FROM {frm} LEFT JOIN {P}node c ON c.parent_uuid = n.uuid{type_cond} "
                     f"WHERE {where} ORDER BY c.name",
                     [*frm_params, *type_params, *where_params],
                 )
@@ -994,7 +995,7 @@ class NodeScope(_BaseScope):
                 await conn.execute(
                     rf"""
                 SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid
-                FROM {frm} LEFT JOIN node c
+                FROM {frm} LEFT JOIN {P}node c
                   ON c.path LIKE {prefix} ESCAPE '\'
                  AND (%s::text IS NULL OR c.node_type = %s::text)
                 WHERE {where}
@@ -1034,10 +1035,10 @@ class NodeScope(_BaseScope):
             # the renamed row itself.
             row = await (
                 await conn.execute(
-                    """
+                    f"""
                 SELECT n.path AS old_path, p.path AS parent_path
-                FROM node n
-                LEFT JOIN node p ON p.uuid = n.parent_uuid
+                FROM {P}node n
+                LEFT JOIN {P}node p ON p.uuid = n.parent_uuid
                 WHERE n.uuid = %s
                 """,
                     (node_uuid,),
@@ -1049,8 +1050,8 @@ class NodeScope(_BaseScope):
             new_path = f"{parent_path}/{new_name}" if parent_path else new_name
 
             await conn.execute(
-                r"""
-                UPDATE node
+                rf"""
+                UPDATE {P}node
                 SET path = %s || substring(path FROM length(%s) + 1),
                     name = CASE WHEN path = %s THEN %s ELSE name END,
                     updated_at = now()
@@ -1073,7 +1074,7 @@ class NodeScope(_BaseScope):
 
         async def _do(conn, node_uuid: UUID) -> None:
             await conn.execute(
-                f"UPDATE node SET {op}, updated_at = now() WHERE uuid = %s",
+                f"UPDATE {P}node SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), node_uuid),
             )
 
@@ -1081,7 +1082,7 @@ class NodeScope(_BaseScope):
 
     async def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
         async def _do(conn, node_uuid: UUID) -> None:
-            await conn.execute("DELETE FROM node WHERE uuid = %s", (node_uuid,))
+            await conn.execute(f"DELETE FROM {P}node WHERE uuid = %s", (node_uuid,))
 
         return await self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
 
@@ -1120,7 +1121,7 @@ class NodeScope(_BaseScope):
             # the bind-param LIKE-escape (the SQL ``_like_esc`` helper is gone).
             subj_row = await (
                 await conn.execute(
-                    "SELECT path FROM node WHERE uuid = %s",
+                    f"SELECT path FROM {P}node WHERE uuid = %s",
                     (node_uuid,),
                 )
             ).fetchone()
@@ -1129,9 +1130,9 @@ class NodeScope(_BaseScope):
             subj_path = subj_row[0]
             cycle_row = await (
                 await conn.execute(
-                    r"""
+                    rf"""
                 SELECT EXISTS (
-                    SELECT 1 FROM node cand
+                    SELECT 1 FROM {P}node cand
                     WHERE cand.uuid = %s
                       AND (cand.path = %s OR cand.path LIKE %s || '/%%' ESCAPE '\')
                 )
@@ -1147,12 +1148,12 @@ class NodeScope(_BaseScope):
             # (``new_parent_uuid IS NULL``) returns ``new_parent_path = None``.
             row = await (
                 await conn.execute(
-                    """
+                    f"""
                 SELECT n.path AS old_path,
                        parent.path AS new_parent_path,
                        n.name AS own_name
-                FROM node n
-                LEFT JOIN node parent ON parent.uuid = %s
+                FROM {P}node n
+                LEFT JOIN {P}node parent ON parent.uuid = %s
                 WHERE n.uuid = %s
                 """,
                     (new_parent_uuid, node_uuid),
@@ -1164,8 +1165,8 @@ class NodeScope(_BaseScope):
             new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
 
             await conn.execute(
-                r"""
-                UPDATE node
+                rf"""
+                UPDATE {P}node
                 SET parent_uuid = CASE WHEN uuid = %s THEN %s ELSE parent_uuid END,
                     path = %s || substring(path FROM length(%s) + 1),
                     updated_at = now()
@@ -1374,14 +1375,14 @@ class EdgeScope(_BaseScope):
         ``(uuid, edge_type, name, data, from_node_uuid, to_node_uuid)``.
         """
         if self._edge_uuid is not None:
-            sql = "SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM edge WHERE uuid = %s"
+            sql = f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM {P}edge WHERE uuid = %s"
             params: list[Any] = [self._edge_uuid]
         elif self._from_path is not None and self._to_path is not None and self._edge_type is not None:
             sql = (
                 "SELECT e.uuid, e.edge_type, e.name, e.data, e.from_node_uuid, e.to_node_uuid "
-                "FROM edge e "
-                "JOIN node fn ON fn.uuid = e.from_node_uuid "
-                "JOIN node tn ON tn.uuid = e.to_node_uuid "
+                f"FROM {P}edge e "
+                f"JOIN {P}node fn ON fn.uuid = e.from_node_uuid "
+                f"JOIN {P}node tn ON tn.uuid = e.to_node_uuid "
                 "WHERE fn.path = %s AND tn.path = %s AND e.edge_type = %s"
             )
             params = ["/".join(self._from_path), "/".join(self._to_path), self._edge_type]
@@ -1477,7 +1478,7 @@ class EdgeScope(_BaseScope):
     async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
         async def _do(conn, edge_uuid: UUID) -> None:
             await conn.execute(
-                "UPDATE edge SET name = %s, updated_at = now() WHERE uuid = %s",
+                f"UPDATE {P}edge SET name = %s, updated_at = now() WHERE uuid = %s",
                 (new_name, edge_uuid),
             )
 
@@ -1494,7 +1495,7 @@ class EdgeScope(_BaseScope):
 
         async def _do(conn, edge_uuid: UUID) -> None:
             await conn.execute(
-                f"UPDATE edge SET {op}, updated_at = now() WHERE uuid = %s",
+                f"UPDATE {P}edge SET {op}, updated_at = now() WHERE uuid = %s",
                 (Jsonb(data), edge_uuid),
             )
 
@@ -1520,7 +1521,7 @@ class EdgeScope(_BaseScope):
             if new_from_uuid == new_to_uuid:
                 raise ValidationError("Edge endpoints must be distinct nodes.")
             await conn.execute(
-                "UPDATE edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
+                f"UPDATE {P}edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
                 (new_from_uuid, new_to_uuid, edge_uuid),
             )
 
@@ -1528,7 +1529,7 @@ class EdgeScope(_BaseScope):
 
     async def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
         async def _do(conn, edge_uuid: UUID) -> None:
-            await conn.execute("DELETE FROM edge WHERE uuid = %s", (edge_uuid,))
+            await conn.execute(f"DELETE FROM {P}edge WHERE uuid = %s", (edge_uuid,))
 
         return await self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
 

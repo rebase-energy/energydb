@@ -26,6 +26,7 @@ from energydb.errors import (
     SeriesNotFoundError,
     ValidationError,
 )
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.runs import RunRow, run_upsert_cte
 
 # What to do with a manifest triple that has no registered series. ``"raise"``
@@ -180,7 +181,7 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
     if start_uuid is None:
         row = await (
             await conn.execute(
-                "SELECT uuid FROM node WHERE path = %s",
+                f"SELECT uuid FROM {P}node WHERE path = %s",
                 (joined,),
             )
         ).fetchone()
@@ -188,8 +189,8 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
         # One round-trip: derive the start node's path inline and compose.
         row = await (
             await conn.execute(
-                """
-            SELECT n.uuid FROM node n, node s
+                f"""
+            SELECT n.uuid FROM {P}node n, {P}node s
             WHERE s.uuid = %s AND n.path = s.path || '/' || %s
             """,
                 (start_uuid, joined),
@@ -225,7 +226,7 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
     joined_keys = ["/".join(p) for p in unique]
     rows = await (
         await conn.execute(
-            "SELECT path, uuid FROM node WHERE path = ANY(%s)",
+            f"SELECT path, uuid FROM {P}node WHERE path = ANY(%s)",
             (joined_keys,),
         )
     ).fetchall()
@@ -305,7 +306,7 @@ async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     """
     row = await (
         await conn.execute(
-            "SELECT path FROM node WHERE uuid = %s",
+            f"SELECT path FROM {P}node WHERE uuid = %s",
             (node_uuid,),
         )
     ).fetchone()
@@ -314,8 +315,8 @@ async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     prefix = row[0]
     rows = await (
         await conn.execute(
-            r"""
-        SELECT uuid FROM node
+            rf"""
+        SELECT uuid FROM {P}node
         WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
         """,
             (prefix, _like_escape(prefix)),
@@ -333,7 +334,7 @@ async def resolve_path(conn, node_uuid: UUID) -> Path:
     """Return the full path tuple from root → node."""
     row = await (
         await conn.execute(
-            "SELECT path FROM node WHERE uuid = %s",
+            f"SELECT path FROM {P}node WHERE uuid = %s",
             (node_uuid,),
         )
     ).fetchone()
@@ -354,7 +355,7 @@ async def resolve_edge_uuid(conn, from_path: Path, to_path: Path, edge_type: str
     to_uuid = paths[tuple(to_path)]
     rows = await (
         await conn.execute(
-            "SELECT uuid FROM edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
+            f"SELECT uuid FROM {P}edge WHERE edge_type = %s AND from_node_uuid = %s AND to_node_uuid = %s",
             (edge_type, from_uuid, to_uuid),
         )
     ).fetchall()
@@ -498,13 +499,13 @@ def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
 # JOIN-to-owner-row from the core series scan lets writes opt out of the
 # hierarchy attach entirely — saves ~20ms PG-side at scale=200.
 _OWNER_PATH_SELECT = {
-    ("node_uuid", True): (", n.path AS path", " LEFT JOIN node n ON n.uuid = s.node_uuid"),
+    ("node_uuid", True): (", n.path AS path", f" LEFT JOIN {P}node n ON n.uuid = s.node_uuid"),
     ("node_uuid", False): ("", ""),
     ("edge_uuid", True): (
         ", e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path",
-        " LEFT JOIN edge e  ON e.uuid = s.edge_uuid"
-        " LEFT JOIN node fn ON fn.uuid = e.from_node_uuid"
-        " LEFT JOIN node tn ON tn.uuid = e.to_node_uuid",
+        f" LEFT JOIN {P}edge e  ON e.uuid = s.edge_uuid"
+        f" LEFT JOIN {P}node fn ON fn.uuid = e.from_node_uuid"
+        f" LEFT JOIN {P}node tn ON tn.uuid = e.to_node_uuid",
     ),
     ("edge_uuid", False): ("", ""),
 }
@@ -592,7 +593,7 @@ async def _resolve_manifest_by_owner(
             + f"""
         SELECT s.{owner_col}::text, s.data_type, s.name, s.series_id,
                s.canonical_unit, s.timeseries_type, s.retention{extra_cols}
-        FROM series s
+        FROM {P}series s
         {join_sql}
         WHERE s.{owner_col} = ANY(%s::uuid[])
         """,
@@ -723,11 +724,11 @@ async def _resolve_manifest_by_path(
     rows = await (
         await conn.execute(
             cte_sql
-            + """
+            + f"""
         SELECT n.path, s.data_type, s.name, s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
                s.node_uuid::text
-        FROM node n
-        JOIN series s ON s.node_uuid = n.uuid
+        FROM {P}node n
+        JOIN {P}series s ON s.node_uuid = n.uuid
         WHERE n.path = ANY(%s)
         """,
             (*cte_params, unique_paths),
@@ -850,13 +851,13 @@ async def _resolve_manifest_by_edge_triple(
     rows = await (
         await conn.execute(
             cte_sql
-            + """
+            + f"""
         SELECT fn.path, tn.path, e.edge_type, s.data_type, s.name,
                s.series_id, s.canonical_unit, s.timeseries_type, s.retention, e.uuid::text
-        FROM edge e
-        JOIN node fn ON fn.uuid = e.from_node_uuid
-        JOIN node tn ON tn.uuid = e.to_node_uuid
-        JOIN series s ON s.edge_uuid = e.uuid
+        FROM {P}edge e
+        JOIN {P}node fn ON fn.uuid = e.from_node_uuid
+        JOIN {P}node tn ON tn.uuid = e.to_node_uuid
+        JOIN {P}series s ON s.edge_uuid = e.uuid
         WHERE fn.path = ANY(%s) AND tn.path = ANY(%s) AND e.edge_type = ANY(%s)
         """,
             (*cte_params, unique_from, unique_to, unique_etype),

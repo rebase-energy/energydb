@@ -23,6 +23,7 @@ import polars as pl
 from timedb import RETENTION_TIERS
 
 from energydb.errors import AlreadyExistsError, EdgeNotFoundError, ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 
 OwnerCol = Literal["node_uuid", "edge_uuid"]
 
@@ -152,7 +153,7 @@ async def register_series(
     row = await (
         await conn.execute(
             f"""
-            INSERT INTO series
+            INSERT INTO {P}series
                 (node_uuid, edge_uuid, data_type, name, canonical_unit,
                  timeseries_type, retention, description)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -170,7 +171,7 @@ async def register_series(
     existing = await (
         await conn.execute(
             f"SELECT series_id, canonical_unit, retention "
-            f"FROM series "
+            f"FROM {P}series "
             f"WHERE {owner_col} = %s AND data_type = %s AND name = %s",
             (owner_uuid, data_type, name),
         )
@@ -223,10 +224,10 @@ async def resolve_subtree_series_for_read(
         root_cte = "SELECT %s::text AS rp"
         cte_params.append(root_path)
     elif start_uuid is not None and rel_path:
-        root_cte = "SELECT (path || '/' || %s) AS rp FROM node WHERE uuid = %s"
+        root_cte = f"SELECT (path || '/' || %s) AS rp FROM {P}node WHERE uuid = %s"
         cte_params.extend([rel_path, start_uuid])
     elif start_uuid is not None:
-        root_cte = "SELECT path AS rp FROM node WHERE uuid = %s"
+        root_cte = f"SELECT path AS rp FROM {P}node WHERE uuid = %s"
         cte_params.append(start_uuid)
     else:
         raise ValidationError("resolve_subtree_series_for_read needs root_path or start_uuid.")
@@ -250,12 +251,12 @@ async def resolve_subtree_series_for_read(
         SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
                s.node_uuid::text AS node_uuid, s.data_type, s.name, n.path AS path
         FROM root r
-        JOIN node n
+        JOIN {P}node n
           ON (n.path = r.rp
               OR n.path LIKE
                  replace(replace(replace(r.rp, E'\\', E'\\\\'), '%%', E'\\%%'), '_', E'\\_')
                  || '/%%' ESCAPE '\')
-        JOIN series s ON s.node_uuid = n.uuid
+        JOIN {P}series s ON s.node_uuid = n.uuid
         WHERE TRUE{where_clause}
     """
     rows = await (await conn.execute(sql, [*cte_params, *where_vals])).fetchall()
@@ -337,10 +338,10 @@ async def resolve_edge_series_for_read(
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
         "s.edge_uuid::text, s.data_type, s.name, "
         "e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path "
-        "FROM edge e "
-        "JOIN node fn ON fn.uuid = e.from_node_uuid "
-        "JOIN node tn ON tn.uuid = e.to_node_uuid "
-        "LEFT JOIN series s ON " + " AND ".join(join_conds) + " "
+        f"FROM {P}edge e "
+        f"JOIN {P}node fn ON fn.uuid = e.from_node_uuid "
+        f"JOIN {P}node tn ON tn.uuid = e.to_node_uuid "
+        f"LEFT JOIN {P}series s ON " + " AND ".join(join_conds) + " "
         "WHERE " + where_sql
     )
     rows = await (await conn.execute(sql, [*join_params, *where_params])).fetchall()
