@@ -135,7 +135,7 @@ schema is used as-is. Finally it *best-effort* provisions the ClickHouse
 there is logged, not raised (reads fall back to the sequential path). Safe to
 run repeatedly.
 
-Use :meth:`~energydb.Client.setup_ch_meta_engine` as the explicit, *raising*
+Use :meth:`~energydb.AsyncClient.setup_ch_meta_engine` as the explicit, *raising*
 alternative that (re)creates the ``series_meta`` view and the engine table and
 clears the session's engine-degraded flag — call it to re-enable ``concurrent``
 reads after fixing engine infrastructure.
@@ -169,7 +169,7 @@ Building with ``register_tree``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The single entry point for **creating** structure — every node, edge, and
-series declaration — is :meth:`~energydb.Client.register_tree`. It is
+series declaration — is :meth:`~energydb.AsyncClient.register_tree`. It is
 declarative and atomic: build the entire portfolio top-down as one nested
 expression in Python, then persist it in one call.
 
@@ -210,9 +210,9 @@ writes those UUIDs straight into the row primary keys in PostgreSQL.
 
    * Any UUID in the payload that already exists in the DB raises
      :class:`~energydb.errors.AlreadyExistsError` — modify existing rows
-     through scope mutators (:meth:`NodeScope.rename`, ``.update``,
+     through scope mutators (:meth:`NodeScope.rename <energydb.NodeScope.rename>`, ``.update``,
      ``.delete``, ``.move_to``, ``.add``) instead, optionally batched in a
-     :meth:`Client.transaction`.
+     :meth:`Client.transaction <energydb.AsyncClient.transaction>`.
    * Names must be non-empty and must not contain ``/`` (the path
      separator). Violations raise
      :class:`~energydb.errors.ValidationError` before any SQL runs and
@@ -220,7 +220,7 @@ writes those UUIDs straight into the row primary keys in PostgreSQL.
    * If any node/edge in the tree carries non-empty inline
      ``TimeSeries.df`` data, the call raises
      :class:`~energydb.errors.ValidationError` — write data separately via
-     :meth:`~energydb.Client.write` or the scope helpers (see below).
+     :meth:`~energydb.AsyncClient.write` or the scope helpers (see below).
 
 Grafting onto an existing tree
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -311,6 +311,42 @@ Flat queries by type / subtree / properties (return lists of EDM objects):
 
    turbines = client.query_nodes(type="WindTurbine", within="my-portfolio")
    lines = client.query_edges(type="Line", within="my-portfolio")
+
+Generic (non-EDM) nodes
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Not every node has to be an EnergyDataModel class. ``create_node`` takes a
+free-form ``node_type`` slug plus a JSONB ``data`` payload and stores both
+verbatim, and the ``*_raw`` accessors read such nodes back without EDM
+reconstruction:
+
+.. code-block:: python
+
+   uuid = client.create_node(
+       node_type="Substation", name="SS-1",
+       data={"voltage_kv": 130},
+       parent=("my-portfolio",),          # UUID or path; None creates a root
+   )
+
+   client.get_node_raw(uuid)              # {uuid, node_type, name, data, parent_uuid}
+   client.get_subtree_raw(uuid)           # root + every descendant, same dicts + path
+
+``get_node_raw`` returns ``None`` when the node does not exist;
+``get_subtree_raw`` returns an empty list. Both are safe for any
+``node_type`` string, unlike :meth:`~energydb.AsyncClient.get_node` /
+:meth:`~energydb.AsyncClient.get_tree`, which need a known EDM class.
+
+To enumerate the series catalog for one owner — the reverse lookup from
+``(owner, data_type, name)`` to the timedb-internal ``series_id`` — use
+``list_series``:
+
+.. code-block:: python
+
+   client.list_series(t01.id)                            # node-owned series
+   client.list_series(line.id, owner_col="edge_uuid")    # edge-owned series
+
+Each dict is ``{series_id, name, data_type, canonical_unit,
+timeseries_type, description}``.
 
 
 Editing single elements
@@ -424,7 +460,7 @@ support endpoint navigation.
    client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b, line]))
 
 For standalone edges between nodes that already exist in the database, use
-:meth:`~energydb.Client.create_edge` directly:
+:meth:`~energydb.AsyncClient.create_edge` directly:
 
 .. code-block:: python
 
@@ -623,8 +659,8 @@ Bulk Manifest I/O
 -----------------
 
 For production pipelines that touch many series across many nodes or edges
-in one call, use :meth:`Client.write <energydb.Client.write>` and
-:meth:`Client.read <energydb.Client.read>` with a *manifest DataFrame*. The
+in one call, use :meth:`Client.write <energydb.AsyncClient.write>` and
+:meth:`Client.read <energydb.AsyncClient.read>` with a *manifest DataFrame*. The
 same engine drives the scope helpers, so guarantees are identical.
 
 The manifest carries one routing column plus ``data_type``, ``name``, and
@@ -709,7 +745,7 @@ edge triple (e.g. ``from_path`` + ``to_path`` without ``edge_type``) raises
 the same.
 
 Series must already be registered (typically via
-:meth:`~energydb.Client.register_tree`) — unresolved
+:meth:`~energydb.AsyncClient.register_tree`) — unresolved
 ``(owner, data_type, name)`` triples raise
 :class:`~energydb.errors.SeriesNotFoundError` before any data reaches
 ClickHouse, and the exception names *every* unresolved triple, not just the
@@ -820,7 +856,7 @@ settings. Those are caller bugs, not catalog gaps.
 Output modes
 ~~~~~~~~~~~~
 
-Both :meth:`Client.read <energydb.Client.read>` and the scope reads accept
+Both :meth:`Client.read <energydb.AsyncClient.read>` and the scope reads accept
 an ``output=`` kwarg that controls return shape:
 
 - ``output="frame"`` (default) — one DataFrame with the identity columns
@@ -857,9 +893,9 @@ Atomic batches with ``transaction()``
 -------------------------------------
 
 For a sequence of mutations that must apply (or roll back) as a unit, open
-a :meth:`Client.transaction`. Mutations executed through the txn's scope
+a :meth:`Client.transaction <energydb.AsyncClient.transaction>`. Mutations executed through the txn's scope
 factories share one borrowed pool connection and stay uncommitted until
-:meth:`Transaction.commit` is called explicitly. Exiting the
+:meth:`Transaction.commit <energydb.Transaction.commit>` is called explicitly. Exiting the
 ``with``-block without committing raises and rolls back.
 
 .. code-block:: python
@@ -875,7 +911,7 @@ factories share one borrowed pool connection and stay uncommitted until
 
 The transaction supports every scope mutator (``rename``, ``update``,
 ``move_to``, ``delete``, ``add``, ``register_series``) plus
-:meth:`Transaction.register_tree` for create-only inserts. Mid-transaction
+:meth:`Transaction.register_tree <energydb.Transaction.register_tree>` for create-only inserts. Mid-transaction
 reads on the same connection see the transaction's own uncommitted writes.
 
 .. warning::
@@ -885,7 +921,7 @@ reads on the same connection see the transaction's own uncommitted writes.
    ``scope.read_relative(...)`` on a txn-bound scope raise
    ``RuntimeError`` — the ClickHouse writes and the ``energydb.runs``
    inserts go through their own connection and would not roll back with
-   the PG transaction. Call :meth:`Client.write` / :meth:`Client.read`
+   the PG transaction. Call :meth:`Client.write <energydb.AsyncClient.write>` / :meth:`Client.read <energydb.AsyncClient.read>`
    directly outside the ``with``-block when you need to mix structure
    mutations and time-series I/O.
 
@@ -910,7 +946,7 @@ Two environment variables gate this path:
 - ``ENERGYDB_ENGINE_STRICT=1`` — raise on an engine-read failure instead of
   degrading to sequential (useful in tests). Without it, the first failure
   degrades the session and later reads go sequential until
-  :meth:`~energydb.Client.setup_ch_meta_engine` is called again.
+  :meth:`~energydb.AsyncClient.setup_ch_meta_engine` is called again.
 
 Logging on degrade
 ~~~~~~~~~~~~~~~~~~
@@ -920,7 +956,7 @@ you which kind of problem it is:
 
 - **The engine table is not provisioned** → one ``info`` line, no traceback.
   For a deployment that never calls
-  :meth:`~energydb.Client.setup_ch_meta_engine`, this is a steady
+  :meth:`~energydb.AsyncClient.setup_ch_meta_engine`, this is a steady
   configuration state, not an incident: reads work, they just take the
   sequential path.
 - **Anything else** (network, auth, schema drift, ClickHouse→PostgreSQL
@@ -948,8 +984,13 @@ energydb at it:
    ENERGYDB_CH_PG_COLLECTION=my_pg_collection
 
 The password then stays out of both the DDL and ``SHOW CREATE TABLE``, and
-the warning goes away. One related knob:
+the warning goes away. Two related knobs:
 
+- ``ENERGYDB_CH_ENGINE_TABLE`` — base name for the ClickHouse engine table
+  (default ``energydb_series_meta_pg``). When ``ENERGYDB_SCHEMA`` names a
+  non-default schema, that schema is appended (``<base>__<schema>``), so
+  several energydb schemas can share one ClickHouse database without
+  colliding. Read once at import time.
 - ``ENERGYDB_CH_PG_HOST`` (``host:port``) — overrides the DSN's host for
   **ClickHouse's** network vantage. The DSN addresses PostgreSQL from your
   application, which is not necessarily how ClickHouse reaches it (e.g.
@@ -984,7 +1025,7 @@ Namespaces (multi-tenancy)
 
 *New in 0.10.0.* One energydb database can serve many tenants. Every row in
 ``node`` / ``edge`` / ``series`` carries a ``namespace`` label, and
-:meth:`~energydb.Client.namespace` returns a *view* of the client bound to one
+:meth:`~energydb.AsyncClient.namespace` returns a *view* of the client bound to one
 tenant:
 
 .. code-block:: python
@@ -1079,7 +1120,9 @@ Catch the branch you mean:
 
 .. note::
 
-   **Every class above also subclasses** ``ValueError``. Broad
+   **Every class energydb raises also subclasses** ``ValueError`` — every
+   subclass in the tree above does, though the ``EnergyDBError`` base
+   itself does not (nothing raises it directly). Broad
    ``except ValueError`` handlers therefore catch all of them, which keeps
    generic error-handling code working — but the typed classes are what you
    want in new code, because message text is not a contract and the
@@ -1145,7 +1188,7 @@ Schema misconfiguration
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 If the configured schema does not contain energydb's tables — the wrong
-``ENERGYDB_SCHEMA``, or :meth:`~energydb.Client.create` never having run —
+``ENERGYDB_SCHEMA``, or :meth:`~energydb.AsyncClient.create` never having run —
 queries fail with psycopg's own ``UndefinedTable``. energydb attaches a note
 to it naming the schema it searched, the environment variable that controls
 it, and the fix, so the traceback is actionable:
@@ -1182,10 +1225,10 @@ Best Practices
    no delete-then-insert dance, no full tree round-trip.
 
 4. **Batch related mutations in a transaction.** Use
-   :meth:`Client.transaction` so a sequence of ``rename`` / ``update`` /
+   :meth:`Client.transaction <energydb.AsyncClient.transaction>` so a sequence of ``rename`` / ``update`` /
    ``move_to`` / ``delete`` / ``add`` / ``register_tree`` calls either
    all apply together or all roll back. Time-series I/O does not
-   participate — call :meth:`Client.write` / :meth:`Client.read`
+   participate — call :meth:`Client.write <energydb.AsyncClient.write>` / :meth:`Client.read <energydb.AsyncClient.read>`
    outside the ``with``-block.
 
 5. **Pick a routing column per pipeline.** Mixing ``path`` and ``node_uuid``
@@ -1200,7 +1243,7 @@ Best Practices
 
 7. **Tag writes with ``workflow_id`` / ``model_name``.** Provenance lives in
    ``energydb.runs`` and is recoverable via
-   :meth:`~energydb.Client.read_runs_for_series`.
+   :meth:`~energydb.AsyncClient.read_runs_for_series`.
 
 8. **Use ``where(type=...)`` for type-filtered subtree reads.** A single
    fluent call replaces N targeted reads — the manifest pipeline batches
@@ -1226,7 +1269,7 @@ re-provisioning, and every API change is additive. Three things are worth
 knowing:
 
 - **Namespaces** (see `Namespaces (multi-tenancy)`_) are new and opt-in. A
-  client that never calls :meth:`~energydb.Client.namespace` behaves exactly
+  client that never calls :meth:`~energydb.AsyncClient.namespace` behaves exactly
   as on 0.9.0. ``create()`` on a **new** database now emits namespace-aware
   DDL (a ``namespace`` column on ``node``/``edge``/``series``, composite
   keys); an **existing** 0.9.0-shaped database keeps working unchanged — no
@@ -1241,8 +1284,8 @@ knowing:
   If you were pinned to an unpooled endpoint because of that, you no longer are.
   ``ENERGYDB_SCHEMA`` semantics are unchanged, and ``SHOW search_path`` now
   echoes whatever your server or role says — energydb stopped setting it.
-- **New methods**, all additive: :meth:`~energydb.Client.namespace`,
-  :meth:`~energydb.Client.list_nodes_raw` (keyset-paginated raw node listing),
+- **New methods**, all additive: :meth:`~energydb.AsyncClient.namespace`,
+  :meth:`~energydb.AsyncClient.list_nodes_raw` (keyset-paginated raw node listing),
   and the resolve-then-read split ``scope.resolve()`` /
   ``scope.read_from_meta()`` for authorize-before-read flows.
 
@@ -1270,8 +1313,9 @@ re-provisioning. Four things are worth knowing:
   all — and which you want instead if anything between you and PostgreSQL
   pools connections.
 
-Existing ``except ValueError`` handlers keep working: every class in
-:mod:`energydb.errors` also subclasses ``ValueError``.
+Existing ``except ValueError`` handlers keep working: every raisable class
+in :mod:`energydb.errors` also subclasses ``ValueError`` (the
+``EnergyDBError`` base, which is never raised on its own, does not).
 
 
 Complete Example

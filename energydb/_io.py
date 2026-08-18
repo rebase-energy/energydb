@@ -85,6 +85,7 @@ class WriteResult(int):
 
     @property
     def run_id(self) -> int:
+        """The run id for this write — the same value as ``int(result)``."""
         return int(self)
 
     def __repr__(self) -> str:

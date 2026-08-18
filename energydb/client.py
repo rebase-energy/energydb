@@ -359,6 +359,13 @@ class AsyncClient:
         self._engine_unavailable = False
 
     async def close(self) -> None:
+        """Close the PostgreSQL connection pool.
+
+        Root-client only — calling it on a
+        :meth:`namespace` view raises
+        :class:`~energydb.errors.ValidationError`, since the view shares the
+        root's pool.
+        """
         self._require_root("close")
         await self._pool.close()
 

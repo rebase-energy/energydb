@@ -30,6 +30,7 @@ Most time-series systems are agnostic about what their series represent — they
 - ⏱️ **Time-of-knowledge queries**: forecast revisions, corrections, and as-of backtests, powered by TimeDB.
 - 🧭 **Lazy fluent navigation**: ``client.get_node("Portfolio", "Site", "T01").read(...)`` resolves to one indexed SQL query, regardless of subtree size.
 - ⚖️ **Unit conversion at the boundary**: declare canonical units once; pint rescales every read and write automatically.
+- 🏢 **Opt-in multi-tenancy**: ``client.namespace("acme")`` binds a client view to one tenant — shared pool, namespace-stamped writes, and row filtering once the host application enables PostgreSQL RLS.
 
 
 Quick Start

@@ -37,8 +37,15 @@ if os.path.exists(_dev_md_src):
 project = "energydb"
 copyright = "Rebase Energy"
 author = "Rebase Energy"
-release = "0.3.2"
-version = "0.3.2"
+# Read the version from the installed package metadata so it never drifts
+# from pyproject.toml.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    release = _pkg_version("energydb")
+except Exception:  # pragma: no cover - docs build without the package installed
+    release = "0.0.0"
+version = release
 
 # -- General configuration ---------------------------------------------------
 
@@ -95,4 +102,8 @@ intersphinx_mapping = {
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "polars": ("https://docs.pola.rs/api/python/stable/", None),
     "pint": ("https://pint.readthedocs.io/en/stable/", None),
+    # Sibling projects whose types energydb re-exports or wraps.
+    "timedb": ("https://timedb.readthedocs.io/en/stable/", None),
+    "timedatamodel": ("https://timedatamodel.readthedocs.io/en/stable/", None),
+    "energydatamodel": ("https://energydatamodel.readthedocs.io/en/stable/", None),
 }

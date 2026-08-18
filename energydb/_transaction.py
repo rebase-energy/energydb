@@ -85,6 +85,14 @@ class Transaction:
     # ------------------------------------------------------------------
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
+        """Return a :class:`~energydb.NodeScope` bound to this transaction.
+
+        Same addressing as :meth:`Client.get_node <energydb.AsyncClient.get_node>`,
+        but every mutation runs on the transaction's connection and stays
+        uncommitted until :meth:`commit`. Time-series ``read`` / ``write`` /
+        ``read_relative`` on the returned scope raise ``RuntimeError`` — they
+        do not participate in the PostgreSQL transaction.
+        """
         scope = self._client.get_node(*names_or_path, uuid=uuid)
         return scope._with_txn(self)
 
@@ -96,6 +104,11 @@ class Transaction:
         type: str | None = None,
         uuid: UUID | None = None,
     ) -> EdgeScope:
+        """Return an :class:`~energydb.EdgeScope` bound to this transaction.
+
+        Same addressing as :meth:`Client.get_edge <energydb.AsyncClient.get_edge>`,
+        with the same transaction semantics as :meth:`get_node`.
+        """
         scope = self._client.get_edge(from_path, to_path, type=type, uuid=uuid)
         return scope._with_txn(self)
 

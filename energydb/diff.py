@@ -77,10 +77,14 @@ class _BaseChange[SnapshotT]:
 
     @property
     def uuid(self) -> UUID:
+        """The changed element's UUID, taken from whichever of ``new`` /
+        ``old`` is present (they always share it)."""
         return self._present().uuid  # type: ignore[attr-defined]
 
     @property
     def kind(self) -> str:
+        """``"insert"`` (no ``old``), ``"delete"`` (no ``new``), or
+        ``"update"`` (both present)."""
         if self.old is None:
             return "insert"
         if self.new is None:
@@ -89,6 +93,8 @@ class _BaseChange[SnapshotT]:
 
     @property
     def data_changed(self) -> bool:
+        """``True`` when this is an update whose ``data`` payload differs.
+        Always ``False`` for inserts and deletes."""
         return self.kind == "update" and self.old.data != self.new.data  # type: ignore[union-attr]
 
 
@@ -98,18 +104,23 @@ class NodeChange(_BaseChange[NodeSnapshot]):
 
     @property
     def display_name(self) -> str:
+        """The node's name, for rendering the diff."""
         return self._present().name
 
     @property
     def display_type(self) -> str:
+        """The node's ``node_type``, for rendering the diff."""
         return self._present().node_type
 
     @property
     def renamed(self) -> bool:
+        """``True`` when this update changed the node's ``name``."""
         return self.kind == "update" and self.old.name != self.new.name  # type: ignore[union-attr]
 
     @property
     def moved(self) -> bool:
+        """``True`` when this update re-parented the node
+        (``parent_uuid`` changed)."""
         return self.kind == "update" and self.old.parent_uuid != self.new.parent_uuid  # type: ignore[union-attr]
 
 
@@ -119,15 +130,18 @@ class EdgeChange(_BaseChange[EdgeSnapshot]):
 
     @property
     def display_name(self) -> str:
+        """The edge's name, falling back to its ``edge_type`` when unnamed."""
         snap = self._present()
         return snap.name or snap.edge_type
 
     @property
     def display_type(self) -> str:
+        """The edge's ``edge_type``, for rendering the diff."""
         return self._present().edge_type
 
     @property
     def endpoints_changed(self) -> bool:
+        """``True`` when this update moved either endpoint of the edge."""
         return self.kind == "update" and (
             self.old.from_node_uuid != self.new.from_node_uuid  # type: ignore[union-attr]
             or self.old.to_node_uuid != self.new.to_node_uuid  # type: ignore[union-attr]
@@ -163,6 +177,7 @@ class TreeDiff:
 
     @property
     def node_inserts(self) -> list[NodeChange]:
+        """Nodes created by this diff."""
         return [c for c in self.node_changes if c.kind == "insert"]
 
     @property
@@ -172,10 +187,12 @@ class TreeDiff:
 
     @property
     def node_renames(self) -> list[NodeChange]:
+        """Node updates that changed the name (may also have moved)."""
         return [c for c in self.node_changes if c.kind == "update" and c.renamed]
 
     @property
     def node_moves(self) -> list[NodeChange]:
+        """Node updates that changed the parent (may also have been renamed)."""
         return [c for c in self.node_changes if c.kind == "update" and c.moved]
 
     @property
@@ -185,18 +202,22 @@ class TreeDiff:
 
     @property
     def node_deletes(self) -> list[NodeChange]:
+        """Nodes removed by this diff."""
         return [c for c in self.node_changes if c.kind == "delete"]
 
     @property
     def edge_inserts(self) -> list[EdgeChange]:
+        """Edges created by this diff."""
         return [c for c in self.edge_changes if c.kind == "insert"]
 
     @property
     def edge_updates(self) -> list[EdgeChange]:
+        """Edges whose endpoints, name, or ``data`` changed."""
         return [c for c in self.edge_changes if c.kind == "update"]
 
     @property
     def edge_deletes(self) -> list[EdgeChange]:
+        """Edges removed by this diff."""
         return [c for c in self.edge_changes if c.kind == "delete"]
 
     # ------------------------------------------------------------------

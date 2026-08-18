@@ -905,6 +905,16 @@ class NodeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     async def get(self):
+        """Reconstruct this node as an EnergyDataModel object.
+
+        The returned ``Element`` keeps the stored UUID, so it round-trips.
+        Series are not attached — use
+        :meth:`Client.get_tree(include_series=True) <energydb.AsyncClient.get_tree>`
+        for that, or :meth:`get_raw` for the plain row.
+
+        Raises :class:`~energydb.errors.NodeNotFoundError` if the path or
+        uuid resolves to nothing.
+        """
         frm, frm_params, where, where_params = self._node_match()
         async with self._use_read_conn() as conn:
             row = await (
@@ -1028,6 +1038,13 @@ class NodeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        """Rename this node in place — same uuid, one ``UPDATE``.
+
+        The node's ``path`` and every descendant's ``path`` are rewritten in
+        the same statement. With ``dry_run=True`` nothing is written and a
+        :class:`~energydb.TreeDiff` of the pending change is returned.
+        """
+
         async def _do(conn, node_uuid: UUID) -> None:
             # One SELECT to grab the node's current path and its parent's path,
             # then a single UPDATE rewrites ``path`` for self + every descendant
@@ -1081,6 +1098,14 @@ class NodeScope(_BaseScope):
         return await self._apply_mutation(_do, dry_run=dry_run)
 
     async def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        """Delete this node.
+
+        Descendants, attached edges, and series declarations go with it via
+        ``ON DELETE CASCADE``; the time-series values already written to
+        ClickHouse are **not** removed. With ``dry_run=True`` nothing is
+        written and a :class:`~energydb.TreeDiff` is returned.
+        """
+
         async def _do(conn, node_uuid: UUID) -> None:
             await conn.execute(f"DELETE FROM {P}node WHERE uuid = %s", (node_uuid,))
 
@@ -1421,6 +1446,12 @@ class EdgeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     async def get(self):
+        """Reconstruct this edge as an EnergyDataModel object, endpoints
+        included.
+
+        Raises :class:`~energydb.errors.EdgeNotFoundError` when the uuid or
+        the ``(from_path, to_path, type)`` triple matches no edge.
+        """
         async with self._use_read_conn() as conn:
             row = await self._fetch_edge_row(conn)
             if row is None:
@@ -1462,11 +1493,13 @@ class EdgeScope(_BaseScope):
         }
 
     async def from_node(self) -> NodeScope:
+        """Return a :class:`NodeScope` on this edge's source endpoint."""
         async with self._use_read_conn() as conn:
             from_uuid, _ = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=from_uuid, txn=self._txn)
 
     async def to_node(self) -> NodeScope:
+        """Return a :class:`NodeScope` on this edge's target endpoint."""
         async with self._use_read_conn() as conn:
             _, to_uuid = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=to_uuid, txn=self._txn)
@@ -1476,6 +1509,12 @@ class EdgeScope(_BaseScope):
     # ------------------------------------------------------------------
 
     async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
+        """Rename this edge in place — same uuid, one ``UPDATE``.
+
+        With ``dry_run=True`` nothing is written and a
+        :class:`~energydb.TreeDiff` of the pending change is returned.
+        """
+
         async def _do(conn, edge_uuid: UUID) -> None:
             await conn.execute(
                 f"UPDATE {P}edge SET name = %s, updated_at = now() WHERE uuid = %s",
@@ -1528,6 +1567,13 @@ class EdgeScope(_BaseScope):
         return await self._apply_mutation(_do, dry_run=dry_run)
 
     async def delete(self, *, dry_run: bool = False) -> TreeDiff | None:
+        """Delete this edge and its series declarations.
+
+        The endpoint nodes are untouched, and values already in ClickHouse
+        are not removed. With ``dry_run=True`` nothing is written and a
+        :class:`~energydb.TreeDiff` is returned.
+        """
+
         async def _do(conn, edge_uuid: UUID) -> None:
             await conn.execute(f"DELETE FROM {P}edge WHERE uuid = %s", (edge_uuid,))
 
