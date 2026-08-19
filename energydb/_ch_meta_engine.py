@@ -45,7 +45,7 @@ _ENGINE_COLS = (
     "(series_id Int64, path Nullable(String), data_type String, name String, "
     "canonical_unit String, retention String, timeseries_type String, "
     "node_uuid Nullable(String), edge_uuid Nullable(String), edge_type Nullable(String), "
-    "from_path Nullable(String), to_path Nullable(String))"
+    "from_path Nullable(String), to_path Nullable(String), edge_name Nullable(String))"
 )
 
 
@@ -59,13 +59,19 @@ def series_meta_view_ddl(qualifier: str) -> tuple[str, str]:
     columns. Consumed by ``models.py`` for its metadata DDL events (the view is
     created by ``Client.create()``; Alembic autogenerate does not track views)
     and by ``Client.setup_ch_meta_engine()``.
+
+    ``edge_name`` is appended last (0.11.0) for exactly that append-only
+    reason — it is the edge's own name, which tells parallel edges of a
+    multigraph apart. Existing deployments pick it up by re-running
+    ``setup_ch_meta_engine()``.
     """
     view = f"{qualifier}series_meta"
     create = (
         f"CREATE OR REPLACE VIEW {view} AS "
         "SELECT s.series_id, n.path, s.data_type, s.name, s.canonical_unit, s.retention, s.timeseries_type, "
         "s.node_uuid::text AS node_uuid, s.edge_uuid::text AS edge_uuid, "
-        "e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path "
+        "e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path, "
+        "e.name AS edge_name "
         f"FROM {qualifier}series s "
         f"LEFT JOIN {qualifier}node n ON n.uuid = s.node_uuid "
         f"LEFT JOIN {qualifier}edge e ON e.uuid = s.edge_uuid "

@@ -55,6 +55,7 @@ _ROUTING_AND_META_COLS = (
     "from_path",
     "to_path",
     "edge_type",
+    "edge_name",
     "data_type",
     "name",
     "canonical_unit",
@@ -62,7 +63,9 @@ _ROUTING_AND_META_COLS = (
 )
 
 # Edge-triple routing columns; their joint presence marks an edge-routed manifest
-# even before ``edge_uuid`` is attached during resolution.
+# even before ``edge_uuid`` is attached during resolution. The optional
+# ``edge_name`` fourth column narrows the triple to one parallel edge; it never
+# routes on its own, so it plays no part in that detection.
 _EDGE_TRIPLE_COLS = ("from_path", "to_path", "edge_type")
 
 
@@ -531,11 +534,11 @@ def _project_meta(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
     * Node-routed: ``(series_id, data_type, name, canonical_unit,
       retention, node_uuid, path)``.
     * Edge-routed: ``(series_id, data_type, name, canonical_unit,
-      retention, edge_uuid, edge_type, from_path, to_path)``.
+      retention, edge_uuid, edge_type, edge_name, from_path, to_path)``.
     """
     cols = ["series_id", "data_type", "name", "canonical_unit", "retention"]
     if is_edge:
-        cols += ["edge_uuid", "edge_type", "from_path", "to_path"]
+        cols += ["edge_uuid", "edge_type", "edge_name", "from_path", "to_path"]
         if "edge_uuid" not in resolved.columns:
             # edge-triple-routed manifest: edge_uuid is attached during resolve_manifest.
             raise RuntimeError("resolve_manifest did not attach edge_uuid for an edge-routed manifest")

@@ -278,8 +278,13 @@ class AsyncClient:
         For production, set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named
         collection holding the PostgreSQL connection; otherwise the credentials
         are inlined into the engine table's DDL (and a warning says so).
+
+        Raises :class:`~energydb.errors.ConfigurationError` on PostgreSQL
+        older than 15 — the ``edge_uniq`` multigraph key needs
+        ``UNIQUE NULLS NOT DISTINCT``.
         """
         self._require_root("create")
+        await self._check_server_version()
         await asyncio.to_thread(self._create_blocking)
         try:
             await asyncio.to_thread(self._provision_engine_table_blocking)
@@ -287,6 +292,25 @@ class AsyncClient:
             logger.warning(
                 "could not provision the ClickHouse meta engine table; reads will use the sequential path",
                 exc_info=True,
+            )
+
+    # ``UNIQUE NULLS NOT DISTINCT`` on ``edge_uniq`` (the multigraph key) is
+    # PostgreSQL 15+ syntax. Checking it up front turns a cryptic mid-DDL
+    # syntax error into one sentence naming the version and the reason.
+    _MIN_SERVER_VERSION_NUM = 150000
+    _MIN_SERVER_VERSION = "15"
+
+    async def _check_server_version(self) -> None:
+        """Raise :class:`ConfigurationError` if the server predates PostgreSQL 15."""
+        async with self._pool.connection() as conn:
+            row = await (await conn.execute("SHOW server_version_num")).fetchone()
+        version_num = int(row[0]) if row is not None else 0
+        if version_num < self._MIN_SERVER_VERSION_NUM:
+            raise ConfigurationError(
+                f"energydb requires PostgreSQL {self._MIN_SERVER_VERSION}+ "
+                f"(server reports server_version_num={version_num}). The edge "
+                f"table's unique key uses UNIQUE NULLS NOT DISTINCT, which "
+                f"PostgreSQL 14 and older do not support."
             )
 
     def _provision_engine_table_blocking(self) -> None:
@@ -403,17 +427,25 @@ class AsyncClient:
         to_path: Path | list[str] | str | None = None,
         *,
         type: str | None = None,
+        name: str | None = None,
         uuid: UUID | None = None,
     ) -> EdgeScope:
-        """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type)``.
+        """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type[, name])``.
 
         ``from_path`` / ``to_path`` accept the canonical ``/``-joined string
         form (``"P/Site/T01"``) or a tuple/list of segments. Terminate with
         ``.get()`` to fetch the EDM edge eagerly.
+
+        ``name`` picks one of several *parallel* edges sharing the triple —
+        the six circuits of a double-circuit corridor, say. Without it a
+        triple that matches exactly one edge resolves as it always has, and
+        one that matches several raises
+        :class:`~energydb.errors.AmbiguousEdgeError` listing the candidates
+        rather than picking one.
         """
         if uuid is not None:
-            if from_path is not None or to_path is not None or type is not None:
-                raise ValidationError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
+            if from_path is not None or to_path is not None or type is not None or name is not None:
+                raise ValidationError("Pass uuid= alone, or (from_path, to_path, type=[, name=]) — not both.")
             return EdgeScope(self, edge_uuid=uuid)
         if from_path is None or to_path is None or type is None:
             raise ValidationError("Provide uuid= or (from_path, to_path, type=).")
@@ -422,6 +454,7 @@ class AsyncClient:
             from_path=_coerce_path((), kwarg=from_path),
             to_path=_coerce_path((), kwarg=to_path),
             edge_type=type,
+            edge_name=name,
         )
 
     # ------------------------------------------------------------------
@@ -1043,20 +1076,26 @@ class AsyncClient:
           server-side the same way node ``path`` is. Symmetric with the edge
           output columns below, so an edge read's own output can be fed back in
           as a manifest without a UUID-resolution round-trip.
+        * ``edge_name`` — optional fourth column on that route, picking one of
+          several *parallel* edges sharing a triple (null = the unnamed edge).
+          A triple matching more than one edge without it raises
+          :class:`~energydb.errors.AmbiguousEdgeError`.
 
         Accepts pandas or polars on input. Output shape:
 
         * ``output="frame"`` (default): a single DataFrame with columns
           ``(path, data_type, name, valid_time, value, …)`` for node-routed
-          reads, or ``(from_path, to_path, edge_type, data_type, name,
-          valid_time, value, …)`` for edge-routed reads. ``path`` /
-          ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``.
+          reads, or ``(from_path, to_path, edge_type, edge_name, data_type,
+          name, valid_time, value, …)`` for edge-routed reads. ``path`` /
+          ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``;
+          ``edge_name`` is the edge's own name, always present and null for
+          unnamed edges.
           Optional columns appear when ``include_knowledge_time`` /
           ``include_updates`` are set.
         * ``output="by_path"``: a ``dict`` keyed by
           :class:`SeriesKey` (node-routed: ``path``, ``data_type``, ``name``)
           or :class:`EdgeSeriesKey` (edge-routed: ``from_path``, ``to_path``,
-          ``edge_type``, ``data_type``, ``name``) with per-series DataFrames
+          ``edge_type``, ``edge_name``, ``data_type``, ``name``) with per-series DataFrames
           carrying only the data columns (``valid_time``, ``value``, plus
           opt-in time/audit columns). Keys are NamedTuples — positional
           access (``result[(path, dt, name)]``) and attribute access

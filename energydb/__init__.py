@@ -76,6 +76,7 @@ from energydb.client import AsyncClient  # noqa: E402
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff  # noqa: E402
 from energydb.errors import (  # noqa: E402
     AlreadyExistsError,
+    AmbiguousEdgeError,
     ConfigurationError,
     EdgeNotFoundError,
     EnergyDBError,
@@ -115,6 +116,7 @@ __all__ = [
     "EdgeNotFoundError",
     "SeriesNotFoundError",
     "AlreadyExistsError",
+    "AmbiguousEdgeError",
     "ValidationError",
     "ManifestError",
     "UnchangedScopeError",

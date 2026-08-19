@@ -182,6 +182,10 @@ root. See :ref:`the SDK error-handling guide <sdk-error-handling>` for usage.
    :members:
    :show-inheritance:
 
+.. autoexception:: energydb.errors.AmbiguousEdgeError
+   :members:
+   :show-inheritance:
+
 .. autoexception:: energydb.errors.ManifestError
    :members:
    :show-inheritance:

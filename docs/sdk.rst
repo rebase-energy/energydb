@@ -486,6 +486,109 @@ Series on an edge:
    scope.read(name="power_flow", data_type="actual")
 
 
+Parallel Edges (Multigraph)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Power networks are multigraphs: a corridor routinely carries several
+circuits between the same two substations. energydb's edge key is the
+**quadruple** ``(edge_type, from_node_uuid, to_node_uuid, name)``, so those
+circuits are ordinary sibling edges that differ only by ``name``:
+
+.. code-block:: python
+
+   no2 = edb.grid.JunctionPoint(name="NO2-420")
+   no1 = edb.grid.JunctionPoint(name="NO1-420")
+   client.register_tree(edb.Portfolio(name="Grid", members=[no2, no1]))
+
+   for i, capacity in enumerate([1200, 1200, 1400, 1400, 900, 900], start=1):
+       client.create_edge(
+           edb.grid.Line(
+               name=f"circuit-{i}", capacity=capacity,
+               from_element=no2, to_element=no1,
+           )
+       )
+
+The name is what addresses one of them — pass ``name=`` alongside the triple:
+
+.. code-block:: python
+
+   c3 = client.get_edge("Grid/NO2-420", "Grid/NO1-420", type="Line", name="circuit-3").get()
+
+Without a name, a triple that matches **more than one** edge raises
+:class:`~energydb.errors.AmbiguousEdgeError` rather than picking one. The
+exception carries every candidate on ``.matches`` (``{"uuid": …, "name": …}``),
+so an API server can render a "which circuit did you mean?" choice:
+
+.. code-block:: python
+
+   try:
+       client.get_edge("Grid/NO2-420", "Grid/NO1-420", type="Line").get()
+   except edb.AmbiguousEdgeError as err:
+       print([m["name"] for m in err.matches])
+       # ['circuit-1', 'circuit-2', 'circuit-3', 'circuit-4', 'circuit-5', 'circuit-6']
+
+A triple that matches exactly one edge resolves as it always has — every
+address that was unambiguous before stays unambiguous.
+
+``name`` is nullable, and ``NULLS NOT DISTINCT`` applies: there can be **one
+unnamed edge** per ``(type, from, to)``, alongside any number of named ones.
+Two unnamed edges between the same endpoints are still rejected. A conflicting
+insert, rename, or ``move_to`` raises
+:class:`~energydb.errors.AlreadyExistsError` naming the occupied key.
+
+On the manifest side, the edge triple takes an optional fourth column,
+``edge_name`` (``Utf8``, null = the unnamed edge). Edge read output carries the
+same column, so an edge read's own frame feeds straight back in:
+
+.. code-block:: python
+
+   manifest = pl.DataFrame({
+       "from_path": ["Grid/NO2-420"] * 2,
+       "to_path":   ["Grid/NO1-420"] * 2,
+       "edge_type": ["Line"] * 2,
+       "edge_name": ["circuit-1", "circuit-3"],
+       "data_type": ["actual"] * 2,
+       "name":      ["power_flow"] * 2,
+   })
+   client.read(manifest)
+
+Orientation is by convention
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Every edge has a **reference orientation**: ``from_element`` → ``to_element``.
+Flow in the opposite direction is a *negative value* on the series, the
+convention PyPSA and pandapower use and the one EnergyDataModel documents.
+energydb stores that orientation verbatim and does not interpret the EDM
+``directed`` flag — it is advisory metadata for the application, not a storage
+semantic.
+
+Two consequences worth stating plainly:
+
+- energydb never canonicalizes endpoints. ``A → B`` and ``B → A`` are two
+  distinct edges, by design: silently folding them together would flip the
+  sign of half your flow data.
+- A mirror-orientation pair in imported data is therefore legitimate — either
+  a genuine second circuit modelled the other way round, or a modelling choice
+  in the source. energydb keeps what you gave it.
+
+Enforcing one edge per pair
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some edge types are singletons by nature — one ``BorderFlow`` per zone pair,
+say. That is an application invariant, not a library one (same doctrine as
+namespaces and RLS: energydb provides the columns, the host application
+provides the policy). Enforce it with a partial unique index:
+
+.. code-block:: sql
+
+   CREATE UNIQUE INDEX border_flow_singleton ON energydb.edge
+     (edge_type, from_node_uuid, to_node_uuid)
+     WHERE edge_type = 'BorderFlow';
+
+Any insert of a second ``BorderFlow`` on that pair then fails at the database,
+whatever its name — while every other edge type stays a multigraph.
+
+
 Targeted Time-Series I/O
 ------------------------
 
@@ -511,7 +614,7 @@ via the scope's path or uuid before any data reaches the database.
    * - **Routing**
      - Implicit (the scope's resolved uuid)
      - Manifest column: ``node_uuid``, ``edge_uuid``, ``path``, or
-       ``from_path`` + ``to_path`` + ``edge_type``
+       ``from_path`` + ``to_path`` + ``edge_type`` (+ optional ``edge_name``)
 
 Writing
 ~~~~~~~
@@ -623,7 +726,9 @@ set. Internal identifiers (``series_id``, ``node_uuid``, ``edge_uuid``)
 are never exposed on the result.
 
 For edge reads, the hierarchy columns are ``from_path``, ``to_path`` (both
-``Utf8``, joined with ``/``) and ``edge_type``.
+``Utf8``, joined with ``/``), ``edge_type``, and ``edge_name`` — the edge's
+own name, always present and null for unnamed edges. It is what tells two
+parallel circuits' rows apart; see `Parallel Edges (Multigraph)`_.
 
 .. note::
 
@@ -685,6 +790,12 @@ the data columns. The routing column is autodetected from the column names
   resolved server-side via its endpoint nodes' paths and type. Symmetric
   with the edge read output columns, so an edge read's frame can be fed
   back in as a manifest without resolving ``edge_uuid`` first.
+- ``edge_name`` — optional fourth column on that route (``Utf8``, null = the
+  unnamed edge), picking one of several parallel edges sharing a triple. A
+  triple matching more than one edge without it raises
+  :class:`~energydb.errors.AmbiguousEdgeError` listing the candidates; see
+  `Parallel Edges (Multigraph)`_. On its own — without the triple — it routes
+  nothing and raises :class:`~energydb.errors.ManifestError`.
 
 write() — long-format multi-series ingestion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -733,6 +844,18 @@ The other two routing forms are equivalent:
        "from_path":  ["my-grid/BusA"] * 24,
        "to_path":    ["my-grid/BusB"] * 24,
        "edge_type":  ["Line"] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power_flow"] * 24,
+       "valid_time": hours,
+       "value":      [200.0 + h for h in range(24)],
+   })
+
+   # ...plus edge_name when parallel edges share that triple
+   pl.DataFrame({
+       "from_path":  ["my-grid/BusA"] * 24,
+       "to_path":    ["my-grid/BusB"] * 24,
+       "edge_type":  ["Line"] * 24,
+       "edge_name":  ["circuit-3"] * 24,
        "data_type":  ["actual"] * 24,
        "name":       ["power_flow"] * 24,
        "valid_time": hours,
@@ -801,8 +924,8 @@ Optional kwargs:
 
 The result columns mirror the scope read: ``path``, ``data_type``,
 ``name``, ``valid_time``, ``value`` for node manifests; ``from_path``,
-``to_path``, ``edge_type``, ``data_type``, ``name``, ``valid_time``,
-``value`` for edge manifests. ``path`` / ``from_path`` / ``to_path`` are
+``to_path``, ``edge_type``, ``edge_name``, ``data_type``, ``name``,
+``valid_time``, ``value`` for edge manifests. ``path`` / ``from_path`` / ``to_path`` are
 ``Utf8`` joined with ``/``. Internal identifiers (``series_id``,
 ``node_uuid``, ``edge_uuid``) are never on the result.
 
@@ -865,7 +988,8 @@ an ``output=`` kwarg that controls return shape:
 - ``output="by_path"`` — a ``dict`` keyed by a
   :class:`~energydb.SeriesKey` ``(path, data_type, name)`` for node reads,
   or an :class:`~energydb.EdgeSeriesKey`
-  ``(from_path, to_path, edge_type, data_type, name)`` for edge reads. Both
+  ``(from_path, to_path, edge_type, edge_name, data_type, name)`` for edge
+  reads (``edge_name`` is ``None`` for an unnamed edge). Both
   are ``NamedTuple``\ s, so keys support positional *and* attribute access
   (``key.path``, ``key.name``, …). Each value is one DataFrame per series,
   carrying only the data columns (``valid_time``, ``value``, plus opt-in
@@ -1082,6 +1206,7 @@ the package root, so ``from energydb import SeriesNotFoundError`` works.
    │   └── SeriesNotFoundError
    ├── AlreadyExistsError         — create-only violation
    ├── ValidationError            — invalid arguments or invalid operation
+   │   ├── AmbiguousEdgeError     — edge triple matches several parallel edges
    │   ├── ManifestError          — structurally invalid manifest
    │   └── UnchangedScopeError    — scope would drop OVERLAPPING revisions
    ├── ConfigurationError         — client / environment misconfiguration
@@ -1145,7 +1270,10 @@ keyword-only and default to ``None`` when the raise site does not know them;
    * - :class:`~energydb.errors.NodeNotFoundError`
      - ``path``, ``uuid``
    * - :class:`~energydb.errors.EdgeNotFoundError`
-     - ``uuid``, ``from_path``, ``to_path``, ``edge_type``
+     - ``uuid``, ``from_path``, ``to_path``, ``edge_type``, ``name``
+   * - :class:`~energydb.errors.AmbiguousEdgeError`
+     - ``from_path``, ``to_path``, ``edge_type``, ``matches`` (every candidate
+       edge as ``{"uuid": …, "name": …}``)
    * - :class:`~energydb.errors.SeriesNotFoundError`
      - ``route`` (``"path"`` / ``"node_uuid"`` / ``"edge_uuid"`` / the edge
        triple), ``missing`` (every unresolved ``(owner, data_type, name)``)
@@ -1161,11 +1289,18 @@ What raises what
 - :class:`~energydb.errors.AlreadyExistsError` — create-only violations:
   a UUID in a ``register_tree`` payload that already exists in the database,
   a duplicate UUID on two elements of one tree, re-registering a series with
-  different immutable attributes.
+  different immutable attributes, or an edge landing on an
+  ``(edge_type, from, to, name)`` quadruple another edge already occupies
+  (on insert, ``rename``, or ``move_to``).
+- :class:`~energydb.errors.AmbiguousEdgeError` — an edge triple matches more
+  than one parallel edge and no name narrowed it: ``get_edge(...)`` without
+  ``name=``, or a triple-routed manifest without an ``edge_name`` column.
+  ``.matches`` carries every candidate. See `Parallel Edges (Multigraph)`_.
 - :class:`~energydb.errors.ManifestError` — the manifest is structurally
   wrong: no routing column, more than one routing column, a partial edge
-  triple, missing ``data_type`` / ``name``, a ``List(Utf8)`` ``path`` column
-  (use ``Utf8`` joined with ``/``), or null routing values.
+  triple, an ``edge_name`` column without that triple, missing ``data_type``
+  / ``name``, a ``List(Utf8)`` ``path`` column (use ``Utf8`` joined with
+  ``/``), or null routing values.
 - :class:`~energydb.errors.UnchangedScopeError` —
   ``unchanged_scope="valid_time"`` on a manifest containing OVERLAPPING
   series, which would drop their republications. See
@@ -1177,7 +1312,8 @@ What raises what
   a transaction, an empty path.
 - :class:`~energydb.errors.ConfigurationError` — the client cannot be
   constructed: no PostgreSQL connection configured, or a DSN that is not a
-  URI.
+  URI. Also raised by ``create()`` against a PostgreSQL older than 15, which
+  cannot express the ``UNIQUE NULLS NOT DISTINCT`` edge key.
 - :class:`~energydb.IncompatibleUnitError` — a requested unit is not
   dimensionally compatible with the series' ``canonical_unit``.
 - ``RuntimeError`` — time-series ``read`` / ``write`` / ``read_relative`` on
@@ -1260,6 +1396,61 @@ Best Practices
 
 
 .. _sdk-upgrading:
+
+Upgrading to 0.11.0
+-------------------
+
+0.11.0 makes ``edge`` a **multigraph** (see `Parallel Edges (Multigraph)`_).
+That is a schema change, one breaking result-schema change, and a raised
+PostgreSQL floor. In order of what you have to do:
+
+- **PostgreSQL 15+ is now required** (up from 14). The edge key uses
+  ``UNIQUE NULLS NOT DISTINCT``, which PostgreSQL 14 cannot express.
+  ``create()`` checks ``server_version_num`` up front and raises
+  :class:`~energydb.errors.ConfigurationError` on an older server, rather
+  than failing mid-DDL with a syntax error.
+
+- **Migrate an existing database by hand.** energydb ships no migrations
+  (same stance as namespaces in 0.10.0) — ``create()`` will not alter a table
+  that already exists. Run:
+
+  .. code-block:: sql
+
+     ALTER TABLE energydb.edge DROP CONSTRAINT edge_uniq;
+     ALTER TABLE energydb.edge ADD CONSTRAINT edge_uniq
+       UNIQUE NULLS NOT DISTINCT (edge_type, from_node_uuid, to_node_uuid, name);
+
+  It is metadata-only in the sense that matters: no backfill, no data
+  rewrite, and every row that satisfied the old constraint satisfies the new
+  one. (Drop the ``energydb.`` qualifier if your tables live in ``public``.)
+
+- **``EdgeSeriesKey`` gained a field** — ``(from_path, to_path, edge_type,
+  edge_name, data_type, name)``, 5 → 6. This is the one breaking change.
+  Code that unpacks the key positionally breaks loudly at the unpack;
+  attribute access (``key.edge_type``) and dict lookups built with
+  ``EdgeSeriesKey(...)`` keywords are unaffected. Without the field, two
+  parallel circuits' series would silently collide on one key.
+
+- **Edge read output gained an ``edge_name`` column**, after ``edge_type``,
+  always present and null for unnamed edges. Code that asserts an exact
+  column set on edge reads needs updating; code that selects by name does
+  not. It feeds straight back in as the manifest's optional ``edge_name``
+  routing column.
+
+- **Re-run** :meth:`~energydb.AsyncClient.setup_ch_meta_engine` once, so the
+  ``series_meta`` view and the ClickHouse engine table over it expose
+  ``edge_name`` too. Reads are correct either way — the engine predicates
+  stay triple-based and the values are trimmed against the exact PostgreSQL
+  resolve — so this is housekeeping, not a fix, but it keeps the bridge in
+  step with the schema.
+
+- **Triple addressing may now raise.** ``get_edge(from, to, type=...)`` and
+  triple-routed manifests raise
+  :class:`~energydb.errors.AmbiguousEdgeError` when the triple matches
+  several parallel edges. Nothing that resolved uniquely before changes
+  behaviour: the error can only fire against data a pre-0.11.0 database
+  could not hold.
+
 
 Upgrading to 0.10.0
 -------------------

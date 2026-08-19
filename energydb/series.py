@@ -24,6 +24,7 @@ from timedb import RETENTION_TIERS
 
 from energydb.errors import AlreadyExistsError, EdgeNotFoundError, ValidationError
 from energydb.models import SQL_SCHEMA_PREFIX as P
+from energydb.paths import ambiguous_edge_error, edge_address_repr
 
 OwnerCol = Literal["node_uuid", "edge_uuid"]
 
@@ -295,22 +296,30 @@ async def resolve_edge_series_for_read(
     from_path: str | None = None,
     to_path: str | None = None,
     edge_type: str | None = None,
+    edge_name: str | None = None,
     data_type: str | None = None,
     name: str | None = None,
 ) -> pl.DataFrame:
     """Resolve an edge's series for a read in ONE round-trip.
 
     The edge is addressed by ``edge_uuid`` OR by its
-    ``(from_path, to_path, edge_type)`` triple; the triple form collapses the
-    former three-step chain (paths → uuids, edge lookup, series scan) into a
-    single query. The endpoint paths and ``edge_type`` ride along on the join,
-    so the post-read attach step needs no further PG calls.
+    ``(from_path, to_path, edge_type)`` triple, optionally narrowed by
+    ``edge_name``; the triple form collapses the former three-step chain
+    (paths → uuids, edge lookup, series scan) into a single query. The
+    endpoint paths, ``edge_type`` and ``edge_name`` ride along on the join, so
+    the post-read attach step needs no further PG calls.
+
+    ``name`` / ``data_type`` filter the *series*; ``edge_name`` identifies the
+    *edge* — the two names are deliberately separate.
 
     ``series`` is LEFT-JOINed so an existing edge with no (matching) series
     still returns a row — distinguishing "edge not found" from "no series":
 
-    * triple-addressed + edge missing → raises ``ValueError`` (same contract
-      as the former ``resolve_edge_uuid`` lookup);
+    * triple-addressed + edge missing → raises
+      :class:`~energydb.errors.EdgeNotFoundError` (same contract as the former
+      ``resolve_edge_uuid`` lookup);
+    * triple-addressed + several parallel edges matched → raises
+      :class:`~energydb.errors.AmbiguousEdgeError` (pass ``edge_name``);
     * uuid-addressed + edge missing → empty df (historical contract);
     * edge exists, nothing matches → empty df.
     """
@@ -329,15 +338,20 @@ async def resolve_edge_series_for_read(
     elif from_path is not None and to_path is not None and edge_type is not None:
         where_sql = "fn.path = %s AND tn.path = %s AND e.edge_type = %s"
         where_params = [from_path, to_path, edge_type]
+        if edge_name is not None:
+            where_sql += " AND e.name = %s"
+            where_params.append(edge_name)
     else:
         raise ValidationError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
 
     # ``::text`` cast on the uuid column: PG returns strings directly,
-    # skipping psycopg's per-row UUID-object parse.
+    # skipping psycopg's per-row UUID-object parse. The edge uuid comes from
+    # ``e`` rather than ``s`` so it is populated on the LEFT-JOIN row of a
+    # series-less edge too — that row is what the ambiguity check counts.
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
-        "s.edge_uuid::text, s.data_type, s.name, "
-        "e.edge_type AS edge_type, fn.path AS from_path, tn.path AS to_path "
+        "e.uuid::text, s.data_type, s.name, "
+        "e.edge_type AS edge_type, e.name AS edge_name, fn.path AS from_path, tn.path AS to_path "
         f"FROM {P}edge e "
         f"JOIN {P}node fn ON fn.uuid = e.from_node_uuid "
         f"JOIN {P}node tn ON tn.uuid = e.to_node_uuid "
@@ -346,13 +360,27 @@ async def resolve_edge_series_for_read(
     )
     rows = await (await conn.execute(sql, [*join_params, *where_params])).fetchall()
 
-    if not rows and edge_uuid is None:
-        raise EdgeNotFoundError(
-            f"Edge not found: type={edge_type!r} from={from_path!r} to={to_path!r}",
-            from_path=from_path,
-            to_path=to_path,
-            edge_type=edge_type,
-        )
+    if edge_uuid is None:
+        assert from_path is not None and to_path is not None and edge_type is not None
+        if not rows:
+            raise EdgeNotFoundError(
+                f"Edge not found: {edge_address_repr(from_path, to_path, edge_type, edge_name)}",
+                from_path=from_path,
+                to_path=to_path,
+                edge_type=edge_type,
+                name=edge_name,
+            )
+        # One row per (edge, matching series): several *edges* is the ambiguous
+        # case, several series on one edge is the ordinary one.
+        matched = {r[4]: r[8] for r in rows}
+        if len(matched) > 1:
+            raise ambiguous_edge_error(
+                from_path=from_path,
+                to_path=to_path,
+                edge_type=edge_type,
+                matches=list(matched.items()),
+                fix="pass name= to address one of them",
+            )
 
     return pl.DataFrame(
         [
@@ -365,8 +393,9 @@ async def resolve_edge_series_for_read(
                 "data_type": r[5],
                 "name": r[6],
                 "edge_type": r[7],
-                "from_path": r[8],
-                "to_path": r[9],
+                "edge_name": r[8],
+                "from_path": r[9],
+                "to_path": r[10],
             }
             for r in rows
             if r[0] is not None  # LEFT-JOIN row for a series-less edge
@@ -380,6 +409,7 @@ async def resolve_edge_series_for_read(
             "data_type": pl.Utf8,
             "name": pl.Utf8,
             "edge_type": pl.Utf8,
+            "edge_name": pl.Utf8,
             "from_path": pl.Utf8,
             "to_path": pl.Utf8,
         },

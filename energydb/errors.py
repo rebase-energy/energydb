@@ -23,7 +23,7 @@ module-level re-export would be a cycle.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -60,7 +60,12 @@ class NodeNotFoundError(NotFoundError):
 
 
 class EdgeNotFoundError(NotFoundError):
-    """An edge addressed by uuid or by its ``(from, to, type)`` triple does not exist."""
+    """An edge addressed by uuid or by its ``(from, to, type[, name])`` key does not exist.
+
+    ``name`` is the edge name that narrowed the lookup, or ``None`` when the
+    caller addressed by the bare triple (which, for a multigraph, may match
+    several edges — see :class:`AmbiguousEdgeError`).
+    """
 
     def __init__(
         self,
@@ -70,12 +75,14 @@ class EdgeNotFoundError(NotFoundError):
         from_path: str | None = None,
         to_path: str | None = None,
         edge_type: str | None = None,
+        name: str | None = None,
     ):
         super().__init__(message)
         self.uuid = uuid
         self.from_path = from_path
         self.to_path = to_path
         self.edge_type = edge_type
+        self.name = name
 
 
 class SeriesNotFoundError(NotFoundError):
@@ -137,6 +144,41 @@ class ManifestError(ValidationError):
     """
 
 
+class AmbiguousEdgeError(ValidationError):
+    """An edge triple matches more than one edge and no ``name`` narrowed it.
+
+    ``edge`` is a multigraph: ``(edge_type, from_node_uuid, to_node_uuid,
+    name)`` is the unique key, so several *parallel* edges — the six circuits
+    of a double-circuit corridor, say — can share one endpoint pair and type
+    and are told apart by their ``name``. Any triple-addressed lookup that
+    lands on more than one of them is a genuinely ambiguous address, and
+    energydb refuses to guess.
+
+    ``matches`` carries every candidate as ``{"uuid": UUID, "name": str |
+    None}`` in a stable order, so an API server can render a "which circuit
+    did you mean?" choice instead of parsing the message. The fix is in the
+    message too: pass ``name=`` (fluent addressing) or add an ``edge_name``
+    column (manifest routing).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        from_path: str | None = None,
+        to_path: str | None = None,
+        edge_type: str | None = None,
+        matches: Sequence[Mapping[str, Any]] | None = None,
+    ):
+        super().__init__(message)
+        self.from_path = from_path
+        self.to_path = to_path
+        self.edge_type = edge_type
+        # Normalized to a list of plain dicts on the way out, mirroring
+        # ``SeriesNotFoundError.missing``: one predictable type for consumers.
+        self.matches: list[dict[str, Any]] | None = None if matches is None else [dict(m) for m in matches]
+
+
 class UnchangedScopeError(ValidationError):
     """``skip_unchanged`` was asked for with a comparison key that would lose data.
 
@@ -179,6 +221,7 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "AlreadyExistsError",
+    "AmbiguousEdgeError",
     "ConfigurationError",
     "EdgeNotFoundError",
     "EnergyDBError",

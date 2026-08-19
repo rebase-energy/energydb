@@ -80,6 +80,7 @@ def test_edge_manifest_resolve_does_not_leak_internal_join_columns():
             "FLAT",
             "forever",
             "Cable",  # edge_type
+            "circuit-1",  # edge_name
             "Europe/Sweden/A",  # from_path
             "Europe/Sweden/B",  # to_path
         ),
@@ -101,8 +102,9 @@ def test_edge_manifest_resolve_does_not_leak_internal_join_columns():
     assert "series_id" in resolved.columns
     assert "canonical_unit" in resolved.columns
     assert "retention" in resolved.columns
-    # Endpoint paths + edge_type ride along on the resolve.
+    # Endpoint paths + edge_type + the edge's own name ride along on the resolve.
     assert "edge_type" in resolved.columns
+    assert resolved["edge_name"].to_list() == ["circuit-1"]
     assert "from_path" in resolved.columns
     assert "to_path" in resolved.columns
     assert "timeseries_type" not in resolved.columns
@@ -243,9 +245,10 @@ def test_edge_triple_manifest_resolves_in_one_round_trip():
     """(from_path, to_path, edge_type) routing is a single PG statement and
     attaches edge_uuid so the read pipeline detects/projects it as an edge."""
     edge_uuid = str(uuid4())
-    # Edge-triple row layout: from_path, to_path, edge_type, data_type, name,
-    # series_id, canonical_unit, timeseries_type, retention, edge_uuid::text.
-    rows = [("Grid/A", "Grid/B", "Line", "actual", "flow", 11, "MW", "FLAT", "forever", edge_uuid)]
+    # Edge-triple row layout: from_path, to_path, edge_type, edge name, data_type,
+    # series name, series_id, canonical_unit, timeseries_type, retention,
+    # edge_uuid::text.
+    rows = [("Grid/A", "Grid/B", "Line", None, "actual", "flow", 11, "MW", "FLAT", "forever", edge_uuid)]
     conn = _mock_conn_with_series(rows)
 
     manifest = pl.DataFrame(
@@ -267,6 +270,8 @@ def test_edge_triple_manifest_resolves_in_one_round_trip():
     assert resolved["from_path"].to_list() == ["Grid/A"]
     assert resolved["to_path"].to_list() == ["Grid/B"]
     assert resolved["edge_type"].to_list() == ["Line"]
+    # The edge's own name rides along too — null here, for an unnamed edge.
+    assert resolved["edge_name"].to_list() == [None]
     assert summary.has_overlapping is False
 
 

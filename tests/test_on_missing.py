@@ -188,7 +188,7 @@ def test_skip_on_the_uuid_route_stringifies_the_owner():
 
 def test_skip_on_the_edge_uuid_route():
     present, absent = uuid4(), uuid4()
-    rows = [(str(present), "actual", "flow", 5, "MW", "FLAT", "forever", "Line", "G/A", "G/B")]
+    rows = [(str(present), "actual", "flow", 5, "MW", "FLAT", "forever", "Line", None, "G/A", "G/B")]
     manifest = pl.DataFrame(
         {
             "edge_uuid": [str(present), str(absent)],
@@ -205,7 +205,7 @@ def test_skip_on_the_edge_uuid_route():
 def test_skip_on_the_edge_triple_route_reports_all_five_key_columns():
     """The edge triple's identity *is* the quintuple, so a three-column report
     would not say which edge was missing."""
-    rows = [("G/A", "G/B", "Line", "actual", "flow", 11, "MW", "FLAT", "forever", str(uuid4()))]
+    rows = [("G/A", "G/B", "Line", None, "actual", "flow", 11, "MW", "FLAT", "forever", str(uuid4()))]
     manifest = pl.DataFrame(
         {
             "from_path": ["G/A", "G/A"],

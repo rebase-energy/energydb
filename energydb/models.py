@@ -150,8 +150,28 @@ class Edge(Base):
             ondelete="CASCADE",
             name="edge_to_node_namespace_fkey",
         ),
-        sa.UniqueConstraint("edge_type", "from_node_uuid", "to_node_uuid", name="edge_uniq"),
-        # NULL names are allowed; CHECK runs only when name IS NOT NULL.
+        # Multigraph key: parallel edges (the circuits of a double-circuit
+        # corridor, say) share an endpoint pair and type and are told apart by
+        # ``name``. ``NULLS NOT DISTINCT`` keeps the pre-multigraph guarantee
+        # for unnamed edges — at most one unnamed edge per (type, from, to),
+        # unlimited named ones. Standard NULL semantics would instead accept
+        # unlimited unnamed duplicates — strictly worse than the simple-graph
+        # constraint this replaces. Requires PostgreSQL 15+ (checked by
+        # ``Client.create()``).
+        #
+        # ``namespace`` needs no seat in the key: node uuids are globally
+        # unique and the composite endpoint FKs already pin the edge's
+        # namespace.
+        sa.UniqueConstraint(
+            "edge_type",
+            "from_node_uuid",
+            "to_node_uuid",
+            "name",
+            name="edge_uniq",
+            postgresql_nulls_not_distinct=True,
+        ),
+        # NULL names are allowed; CHECK runs only when name IS NOT NULL. The
+        # column is now part of ``edge_uniq``, so this guards a key column.
         sa.CheckConstraint(
             "name IS NULL OR (name !~ '/' AND length(name) > 0)",
             name="edge_name_valid",

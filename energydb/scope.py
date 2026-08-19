@@ -34,15 +34,17 @@ from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import WriteResult, annotate_undefined_table, autocommit_read_conn, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
-from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, register_tree_under
+from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, map_edge_conflict, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
 from energydb.errors import EdgeNotFoundError, NodeNotFoundError, NotFoundError, ValidationError
 from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import (
     Path,
     _like_escape,
+    ambiguous_edge_error,
     build_filter_conditions,
     derived_prefix_like,
+    edge_address_repr,
     resolve_edge_uuid,
     resolve_node_uuid,
     resolve_subtree_uuids,
@@ -1315,7 +1317,9 @@ class EdgeScope(_BaseScope):
     """Scope for operating on a single edge.
 
     Identified by ``uuid`` or by the ``(from_path, to_path, edge_type)``
-    triple.
+    triple — optionally narrowed by ``edge_name``, which is what tells
+    parallel edges of a multigraph apart. A triple matching several edges
+    raises :class:`~energydb.errors.AmbiguousEdgeError` on resolution.
     """
 
     _owner_col = "edge_uuid"
@@ -1328,6 +1332,7 @@ class EdgeScope(_BaseScope):
         from_path: Path | None = None,
         to_path: Path | None = None,
         edge_type: str | None = None,
+        edge_name: str | None = None,
         txn: Transaction | None = None,
     ):
         self._client = client
@@ -1336,6 +1341,7 @@ class EdgeScope(_BaseScope):
         self._from_path = tuple(from_path) if from_path is not None else None
         self._to_path = tuple(to_path) if to_path is not None else None
         self._edge_type = edge_type
+        self._edge_name = edge_name
 
     def _with_txn(self, txn: Transaction) -> EdgeScope:
         return EdgeScope(
@@ -1344,6 +1350,7 @@ class EdgeScope(_BaseScope):
             from_path=self._from_path,
             to_path=self._to_path,
             edge_type=self._edge_type,
+            edge_name=self._edge_name,
             txn=txn,
         )
 
@@ -1357,6 +1364,8 @@ class EdgeScope(_BaseScope):
                 f"to={'/'.join(self._to_path or ())!r}, "
                 f"type={self._edge_type!r}"
             )
+            if self._edge_name is not None:
+                base += f", name={self._edge_name!r}"
         if self._txn is not None:
             base += ", txn=True"
         return base + ")"
@@ -1389,7 +1398,7 @@ class EdgeScope(_BaseScope):
         if self._edge_uuid is not None:
             return self._edge_uuid
         if self._from_path is not None and self._to_path is not None and self._edge_type is not None:
-            return await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
+            return await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type, name=self._edge_name)
         raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
 
     async def _fetch_edge_row(self, conn):
@@ -1398,6 +1407,9 @@ class EdgeScope(_BaseScope):
         The triple addressing joins the endpoint nodes by path inline —
         no separate ``resolve_edge_uuid`` round-trip. Columns:
         ``(uuid, edge_type, name, data, from_node_uuid, to_node_uuid)``.
+
+        A triple that matches several parallel edges raises
+        :class:`~energydb.errors.AmbiguousEdgeError` — never picks one.
         """
         if self._edge_uuid is not None:
             sql = f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid FROM {P}edge WHERE uuid = %s"
@@ -1411,9 +1423,23 @@ class EdgeScope(_BaseScope):
                 "WHERE fn.path = %s AND tn.path = %s AND e.edge_type = %s"
             )
             params = ["/".join(self._from_path), "/".join(self._to_path), self._edge_type]
+            if self._edge_name is not None:
+                sql += " AND e.name = %s"
+                params.append(self._edge_name)
         else:
             raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
-        return await (await conn.execute(sql, params)).fetchone()
+        rows = await (await conn.execute(sql, params)).fetchall()
+        if len(rows) > 1:
+            # uuid- and name-narrowed addressing are unique by construction, so
+            # this is always a bare triple over parallel edges.
+            assert self._from_path is not None and self._to_path is not None and self._edge_type is not None
+            raise ambiguous_edge_error(
+                from_path="/".join(self._from_path),
+                to_path="/".join(self._to_path),
+                edge_type=self._edge_type,
+                matches=[(r[0], r[2]) for r in rows],
+            )
+        return rows[0] if rows else None
 
     async def _edge_not_found(self, conn):
         """Raise the pre-collapse not-found error for this addressing.
@@ -1425,13 +1451,14 @@ class EdgeScope(_BaseScope):
         if self._edge_uuid is not None:
             raise EdgeNotFoundError(f"Edge not found: uuid={self._edge_uuid}", uuid=self._edge_uuid)
         assert self._from_path is not None and self._to_path is not None and self._edge_type is not None
-        await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type)
+        joined_from, joined_to = "/".join(self._from_path), "/".join(self._to_path)
+        await resolve_edge_uuid(conn, self._from_path, self._to_path, self._edge_type, name=self._edge_name)
         raise EdgeNotFoundError(
-            f"Edge not found: type={self._edge_type!r} "
-            f"from={'/'.join(self._from_path)!r} to={'/'.join(self._to_path)!r}",
-            from_path="/".join(self._from_path),
-            to_path="/".join(self._to_path),
+            f"Edge not found: {edge_address_repr(joined_from, joined_to, self._edge_type, self._edge_name)}",
+            from_path=joined_from,
+            to_path=joined_to,
             edge_type=self._edge_type,
+            name=self._edge_name,
         )
 
     async def _endpoints(self, conn) -> tuple[UUID, UUID]:
@@ -1511,15 +1538,20 @@ class EdgeScope(_BaseScope):
     async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
         """Rename this edge in place — same uuid, one ``UPDATE``.
 
+        The name is part of the edge's unique key, so renaming onto a
+        ``(edge_type, from, to, name)`` quadruple that a parallel edge already
+        occupies raises :class:`~energydb.errors.AlreadyExistsError`.
+
         With ``dry_run=True`` nothing is written and a
         :class:`~energydb.TreeDiff` of the pending change is returned.
         """
 
         async def _do(conn, edge_uuid: UUID) -> None:
-            await conn.execute(
-                f"UPDATE {P}edge SET name = %s, updated_at = now() WHERE uuid = %s",
-                (new_name, edge_uuid),
-            )
+            async with map_edge_conflict():
+                await conn.execute(
+                    f"UPDATE {P}edge SET name = %s, updated_at = now() WHERE uuid = %s",
+                    (new_name, edge_uuid),
+                )
 
         return await self._apply_mutation(_do, dry_run=dry_run)
 
@@ -1549,9 +1581,11 @@ class EdgeScope(_BaseScope):
     ) -> TreeDiff | None:
         """Re-point this edge to a new ``(from_node, to_node)`` pair.
 
-        The edge's ``uuid`` (and its series) stays attached. The
-        ``(edge_type, from_node_uuid, to_node_uuid)`` unique constraint
-        surfaces collisions with an existing edge as a Postgres error.
+        The edge's ``uuid`` (and its series) stays attached. Landing on a
+        ``(edge_type, from_node_uuid, to_node_uuid, name)`` quadruple that is
+        already taken raises :class:`~energydb.errors.AlreadyExistsError` —
+        give the edge a distinct ``name`` (see :meth:`rename`) to park two
+        parallel edges on the same endpoint pair.
         """
 
         async def _do(conn, edge_uuid: UUID) -> None:
@@ -1559,10 +1593,11 @@ class EdgeScope(_BaseScope):
             new_to_uuid = await _resolve_endpoint(conn, to_node)
             if new_from_uuid == new_to_uuid:
                 raise ValidationError("Edge endpoints must be distinct nodes.")
-            await conn.execute(
-                f"UPDATE {P}edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
-                (new_from_uuid, new_to_uuid, edge_uuid),
-            )
+            async with map_edge_conflict():
+                await conn.execute(
+                    f"UPDATE {P}edge SET from_node_uuid = %s, to_node_uuid = %s, updated_at = now() WHERE uuid = %s",
+                    (new_from_uuid, new_to_uuid, edge_uuid),
+                )
 
         return await self._apply_mutation(_do, dry_run=dry_run)
 
@@ -1589,6 +1624,12 @@ class EdgeScope(_BaseScope):
         Both edge addressings are expressible server-side (the view carries
         ``edge_uuid`` / ``edge_type`` / ``from_path`` / ``to_path``), so edge
         reads run the resolve and the value read in parallel too.
+
+        The triple predicate stays triple-only for a name-narrowed scope: it
+        resolves the superset of parallel edges, which the caller trims against
+        the exactly-resolved meta — same contract as the set-valued manifest
+        predicates. An ambiguous (nameless) triple never gets that far; the
+        parallel PG resolve raises before the values are used.
         """
         dt = str(data_type).lower() if data_type else None
         if self._edge_uuid is not None:
@@ -1631,6 +1672,7 @@ class EdgeScope(_BaseScope):
                         from_path="/".join(self._from_path),
                         to_path="/".join(self._to_path),
                         edge_type=self._edge_type,
+                        edge_name=self._edge_name,
                         data_type=data_type_str,
                         name=name,
                     )

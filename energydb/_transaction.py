@@ -102,14 +102,16 @@ class Transaction:
         to_path: Path | list[str] | str | None = None,
         *,
         type: str | None = None,
+        name: str | None = None,
         uuid: UUID | None = None,
     ) -> EdgeScope:
         """Return an :class:`~energydb.EdgeScope` bound to this transaction.
 
-        Same addressing as :meth:`Client.get_edge <energydb.AsyncClient.get_edge>`,
-        with the same transaction semantics as :meth:`get_node`.
+        Same addressing as :meth:`Client.get_edge <energydb.AsyncClient.get_edge>`
+        (``name=`` included, for parallel edges), with the same transaction
+        semantics as :meth:`get_node`.
         """
-        scope = self._client.get_edge(from_path, to_path, type=type, uuid=uuid)
+        scope = self._client.get_edge(from_path, to_path, type=type, name=name, uuid=uuid)
         return scope._with_txn(self)
 
     async def register_tree(

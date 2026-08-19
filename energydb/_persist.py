@@ -20,11 +20,13 @@ written straight into the FK columns ``from_node_uuid`` / ``to_node_uuid``
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Literal
 from uuid import UUID
 
 import energydatamodel as edm
 import polars as pl
+import psycopg
 from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
@@ -37,6 +39,41 @@ from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.serialization import serialize_edge, serialize_node
 from energydb.series import SERIES_INSERT_COLUMNS, prepare_series_row, validate_name
 from energydb.units import compute_unit_factor
+
+# ---------------------------------------------------------------------------
+# Edge uniqueness conflicts
+# ---------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def map_edge_conflict():
+    """Map an ``edge_uniq`` violation to :class:`AlreadyExistsError`.
+
+    ``edge_uniq`` is ``(edge_type, from_node_uuid, to_node_uuid, name)`` with
+    ``NULLS NOT DISTINCT``, so it fires when a *new* edge (or a rename / move
+    of an existing one) lands on a quadruple another edge already occupies —
+    including two unnamed edges on the same endpoint pair and type. Wrap the
+    statement rather than the whole transaction: the caller owns the
+    transaction boundary, and every other integrity error stays untouched.
+
+    PostgreSQL's DETAIL line already names the colliding key, so it is quoted
+    verbatim rather than re-derived — the raise site does not need to know
+    which of the four columns the caller was changing.
+    """
+    try:
+        yield
+    except psycopg.errors.UniqueViolation as exc:
+        diag = getattr(exc, "diag", None)
+        if getattr(diag, "constraint_name", None) != "edge_uniq":
+            raise
+        detail = (getattr(diag, "message_detail", None) or "").strip()
+        collision = f" — {detail}" if detail else "."
+        raise AlreadyExistsError(
+            f"An edge with this (edge_type, from_node_uuid, to_node_uuid, name) already exists{collision} "
+            f"Parallel edges between the same endpoints are supported, but each needs a distinct "
+            f"name (an unnamed edge counts as a name of its own, so there can be only one)."
+        ) from exc
+
 
 # ---------------------------------------------------------------------------
 # Node / edge persistence
@@ -100,7 +137,10 @@ async def create_edge(
     Identity is ``edm_obj.id``. ``ON CONFLICT (uuid)`` updates the row's
     payload, name, endpoints, and edge_type (the latter only on insert —
     PG wouldn't actually let you change it via the unique key, but we let
-    the same-uuid update through cleanly).
+    the same-uuid update through cleanly). Identity staying UUID-based is
+    what keeps this upsert unaffected by the multigraph key: a *new* uuid
+    colliding on ``(edge_type, from, to, name)`` raises
+    :class:`~energydb.errors.AlreadyExistsError` asking for a distinct name.
     """
     row_data = serialize_edge(edm_obj)
     uuid_val: UUID = row_data["uuid"]
@@ -110,23 +150,24 @@ async def create_edge(
     from_uuid = _endpoint_uuid(edm_obj, "from_element", tree_root)
     to_uuid = _endpoint_uuid(edm_obj, "to_element", tree_root)
 
-    row = await (
-        await conn.execute(
-            f"""
-        INSERT INTO {P}edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (uuid) DO UPDATE
-          SET name           = EXCLUDED.name,
-              from_node_uuid = EXCLUDED.from_node_uuid,
-              to_node_uuid   = EXCLUDED.to_node_uuid,
-              data           = EXCLUDED.data,
-              updated_at     = now()
-          WHERE edge.edge_type = EXCLUDED.edge_type
-        RETURNING uuid
-        """,
-            (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
-        )
-    ).fetchone()
+    async with map_edge_conflict():
+        row = await (
+            await conn.execute(
+                f"""
+            INSERT INTO {P}edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (uuid) DO UPDATE
+              SET name           = EXCLUDED.name,
+                  from_node_uuid = EXCLUDED.from_node_uuid,
+                  to_node_uuid   = EXCLUDED.to_node_uuid,
+                  data           = EXCLUDED.data,
+                  updated_at     = now()
+              WHERE edge.edge_type = EXCLUDED.edge_type
+            RETURNING uuid
+            """,
+                (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
+            )
+        ).fetchone()
 
     if row is None:
         existing = await (
@@ -276,8 +317,11 @@ async def register_tree_under(
 
     # One explicit pipeline around all three batches: every INSERT is queued
     # and the whole structure needs a single network sync, rather than
-    # relying on executemany's per-call internal pipelining.
-    async with conn.pipeline(), conn.cursor() as cur:
+    # relying on executemany's per-call internal pipelining. The conflict
+    # mapping wraps the *pipeline*, not the edge statement: a pipelined error
+    # surfaces when the pipeline syncs on exit, not at the execute that caused
+    # it. Non-``edge_uniq`` violations propagate untouched.
+    async with map_edge_conflict(), conn.pipeline(), conn.cursor() as cur:
         await cur.executemany(
             f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
             node_rows,
