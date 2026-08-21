@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energydb"
-version = "0.10.0"
+version = "0.11.0"
 description = "Energy database: hierarchy + series metadata on Postgres, 3-dimensional time-series I/O via timedb"
 readme = "README.md"
 license = "Apache-2.0"
@@ -16,9 +16,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "timedatamodel==0.10.0",
-    "timedb==0.10.0",
-    "energydatamodel==0.10.0",
+    "timedatamodel==0.11.0",
+    "timedb==0.11.0",
+    "energydatamodel==0.11.0",
     "psycopg[binary]>=3.1",
     "psycopg_pool>=3.1",
     "sqlalchemy>=2.0",
