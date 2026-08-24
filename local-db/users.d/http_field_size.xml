@@ -1,0 +1,7 @@
+<clickhouse>
+  <profiles>
+    <default>
+      <http_max_field_value_size>1073741824</http_max_field_value_size>
+    </default>
+  </profiles>
+</clickhouse>
