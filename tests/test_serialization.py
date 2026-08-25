@@ -5,7 +5,7 @@ After the UUID identity rewrite, every node row carries
 ``{"uuid", "edge_type", "name", "data", "from_node_uuid", "to_node_uuid"}``.
 Reconstruction populates ``Element.id`` from the row's uuid, and edge
 endpoints come back as :class:`Reference` objects holding the endpoint
-uuids directly — no path round-trip.
+uuids directly, with no path round-trip.
 """
 
 from datetime import date
@@ -102,7 +102,7 @@ class TestSerializeNode:
         # Coords are lists, not tuples, so the in-memory serialize output
         # compares equal to the JSONB read-back.
         assert data["geometry"]["coordinates"] == [3.0, 55.0]
-        # Structural columns and ``id`` live as columns; not duplicated in data.
+        # Structural columns and id live as columns; not duplicated in data.
         assert "name" not in data
         assert "id" not in data
         assert "type" not in data
@@ -238,7 +238,7 @@ class TestSerializeEdge:
         data = row["data"].obj
         assert data["capacity"] == 500
         assert data["directed"] is True
-        # FK columns hold the endpoints; not in `data`.
+        # FK columns hold the endpoints; not in data.
         assert "from_element" not in data
         assert "to_element" not in data
         assert "id" not in data
@@ -361,7 +361,7 @@ class TestEdgeRoundTrip:
 
 
 def _collect_nodes(obj, parent, out):
-    """Depth-first walk — skip Edges; yield (obj, parent_obj)."""
+    """Depth-first walk: skip Edges; yield (obj, parent_obj)."""
     out.append((obj, parent))
     for child in obj.children():
         if isinstance(child, edm.Edge):
@@ -800,12 +800,12 @@ class TestComplexTreeRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# Previously-broken fields now round-trip
+# Fields that were once dropped on round-trip
 # ---------------------------------------------------------------------------
 
 
 class TestPreviouslyDroppedFields:
-    """Fields that silently dropped pre-refactor now round-trip correctly."""
+    """Fields that were once silently dropped and must now round-trip."""
 
     def test_polygon_geometry(self):
         poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])

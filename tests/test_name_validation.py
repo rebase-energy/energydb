@@ -24,7 +24,7 @@ from energydb.series import validate_name
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping name-validation tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping name-validation tests",
         allow_module_level=True,
     )
 
@@ -40,7 +40,7 @@ def client():
 
 
 # ---------------------------------------------------------------------------
-# Python guard — register_tree (node)
+# Python guard: register_tree (node)
 # ---------------------------------------------------------------------------
 
 
@@ -78,13 +78,13 @@ def test_register_tree_rejects_deeply_nested_slash(client):
     tree = edb.Portfolio(name="P", members=[edb.Site(name="S", members=[bad])])
     with pytest.raises(ValueError, match="/"):
         client.register_tree(tree)
-    # Confirm nothing was committed by attempting to fetch — should raise.
+    # Confirm nothing was committed by attempting to fetch; should raise.
     with pytest.raises(ValueError, match="not found"):
         client.get_tree("P")
 
 
 # ---------------------------------------------------------------------------
-# Python guard — register_series
+# Python guard: register_series
 # ---------------------------------------------------------------------------
 
 
@@ -113,7 +113,7 @@ def test_register_series_rejects_empty_name(client):
 
 
 # ---------------------------------------------------------------------------
-# Python guard — create_edge (name is nullable, but if present must be valid)
+# Python guard: create_edge (name is nullable, but if present must be valid)
 # ---------------------------------------------------------------------------
 
 
@@ -140,12 +140,12 @@ def test_create_edge_allows_null_name(client):
         from_element=Reference(a),
         to_element=Reference(b),
     )
-    # No exception — edges can have NULL name.
+    # No exception: edges can have NULL name.
     client.create_edge(edge)
 
 
 # ---------------------------------------------------------------------------
-# PG-level CheckConstraint — bypasses the Python guard
+# PG-level CheckConstraint: bypasses the Python guard
 # ---------------------------------------------------------------------------
 
 
@@ -154,9 +154,9 @@ def _raw_dsn() -> str:
 
 
 def test_pg_check_rejects_slash_in_node_name(client):
-    # ``path`` is NOT NULL with its own non-empty CHECK and a UNIQUE
+    # path is NOT NULL with its own non-empty CHECK and a UNIQUE
     # constraint; pass a unique sentinel so the row only fails the
-    # ``node_name_valid`` CHECK we're actually testing.
+    # node_name_valid CHECK we're actually testing.
     with psycopg.connect(_raw_dsn()) as conn, pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(
             "INSERT INTO energydb.node (uuid, node_type, name, path, data) VALUES (%s, %s, %s, %s, %s)",

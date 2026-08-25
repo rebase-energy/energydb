@@ -1,4 +1,4 @@
-"""Unit tests for ``energydb.diff`` — TreeDiff structure, change kinds,
+"""Unit tests for ``energydb.diff``: TreeDiff structure, change kinds,
 and tree-shaped print formatting.
 """
 
@@ -47,7 +47,7 @@ def _edge(
 
 
 # ---------------------------------------------------------------------------
-# NodeChange — kind classification
+# NodeChange: kind classification
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +125,7 @@ class TestNodeChangeKind:
 
 
 # ---------------------------------------------------------------------------
-# EdgeChange — kind classification
+# EdgeChange: kind classification
 # ---------------------------------------------------------------------------
 
 
@@ -162,7 +162,7 @@ class TestEdgeChangeKind:
 
 
 # ---------------------------------------------------------------------------
-# TreeDiff — bin classifiers
+# TreeDiff: bin classifiers
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +209,7 @@ class TestTreeDiffBins:
 
 
 # ---------------------------------------------------------------------------
-# TreeDiff.render() — tree-shaped output
+# TreeDiff.render(): tree-shaped output
 # ---------------------------------------------------------------------------
 
 
@@ -293,7 +293,7 @@ class TestTreeDiffRender:
 
     def test_change_under_unchanged_ancestor_renders(self):
         """A change whose parent is unchanged (and thus absent from the diff)
-        must still render — it becomes a render trunk in its own right.
+        must still render; it becomes a render trunk in its own right.
         Regression for `diff.render()` silently producing no output when
         ``replace_subtree`` only edits a deep node."""
         unchanged_portfolio = uuid4()
@@ -312,7 +312,7 @@ class TestTreeDiffRender:
 
     def test_mixed_subtree_edit_under_unchanged_root(self):
         """Mirrors the notebook flow: rename a Site, edit a child's data,
-        delete a sibling — all under an unchanged Portfolio. The Site is
+        delete a sibling, all under an unchanged Portfolio. The Site is
         the render trunk; the two children nest under it."""
         portfolio = uuid4()
         site = uuid4()

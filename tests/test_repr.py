@@ -1,6 +1,6 @@
 """Repr / _repr_html_ tests.
 
-Most cases are pure formatting — no DB needed. Construct scopes with a
+Most cases are pure formatting: no DB needed. Construct scopes with a
 dummy client (None cast); the repr methods deliberately don't touch the
 client, so this is safe. Client repr requires a real DSN and is gated on
 the live-DB env vars.
@@ -16,8 +16,8 @@ import pytest
 from energydb._transaction import Transaction
 from energydb.scope import EdgeScope, NodeScope
 
-# ``Any`` so the type checker accepts ``None`` for a parameter typed
-# ``Client``. The repr methods never touch the client, so this is safe.
+# Any so the type checker accepts None for a parameter typed
+# Client. The repr methods never touch the client, so this is safe.
 _DUMMY_CLIENT: Any = None
 
 
@@ -156,7 +156,7 @@ def test_transaction_repr_pending_counts():
 
 
 # ---------------------------------------------------------------------------
-# Client.__repr__ — needs a real DSN; gated on live-DB env vars.
+# Client.__repr__: needs a real DSN; gated on live-DB env vars.
 # ---------------------------------------------------------------------------
 
 
@@ -170,8 +170,8 @@ def test_client_repr_strips_credentials():
     c = Client()
     try:
         r = repr(c)
-        # Should never contain a raw password — we can't know the password,
-        # but we can assert the *userinfo* sentinel is present when the DSN
+        # Should never contain a raw password. The password itself is unknown,
+        # but we can assert the userinfo sentinel is present when the DSN
         # has any '@'.
         if "@" in c._dsn:
             assert "***@" in r

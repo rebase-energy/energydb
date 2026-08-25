@@ -91,6 +91,27 @@ For programmatic use, instantiate the client with explicit settings:
        ch_url="http://default:devpassword@localhost:8123/default",
    )
 
+Schema resolution
+~~~~~~~~~~~~~~~~~
+
+energydb never sets, reads, or depends on the connection's ``search_path``.
+Every statement it issues names its relations in the SQL text itself:
+``energydb.node`` under ``ENERGYDB_SCHEMA=energydb``, and plain ``node`` under
+the default ``public`` — where it resolves alongside the host application's own
+unqualified tables through the server's own default search path.
+
+Resolution is therefore a property of the query, not of per-connection session
+state, which is what makes energydb correct behind a **transaction-mode
+connection pooler** (PgBouncer, Neon's pooled ``-pooler`` endpoints). Such a
+pooler may serve each transaction from a different server connection, and
+rejects the libpq ``options`` startup parameter outright — so any scheme that
+carries the schema in session state either fails to connect or resolves against
+state some other client set. Point energydb at a pooled endpoint or a direct
+one; both behave identically.
+
+``SHOW search_path`` reports whatever your server, role, or proxy configures.
+energydb does not change it and does not depend on what it says.
+
 
 Schema Management
 -----------------
@@ -114,7 +135,7 @@ schema is used as-is. Finally it *best-effort* provisions the ClickHouse
 there is logged, not raised (reads fall back to the sequential path). Safe to
 run repeatedly.
 
-Use :meth:`~energydb.Client.setup_ch_meta_engine` as the explicit, *raising*
+Use :meth:`~energydb.AsyncClient.setup_ch_meta_engine` as the explicit, *raising*
 alternative that (re)creates the ``series_meta`` view and the engine table and
 clears the session's engine-degraded flag — call it to re-enable ``concurrent``
 reads after fixing engine infrastructure.
@@ -148,7 +169,7 @@ Building with ``register_tree``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The single entry point for **creating** structure — every node, edge, and
-series declaration — is :meth:`~energydb.Client.register_tree`. It is
+series declaration — is :meth:`~energydb.AsyncClient.register_tree`. It is
 declarative and atomic: build the entire portfolio top-down as one nested
 expression in Python, then persist it in one call.
 
@@ -189,9 +210,9 @@ writes those UUIDs straight into the row primary keys in PostgreSQL.
 
    * Any UUID in the payload that already exists in the DB raises
      :class:`~energydb.errors.AlreadyExistsError` — modify existing rows
-     through scope mutators (:meth:`NodeScope.rename`, ``.update``,
+     through scope mutators (:meth:`NodeScope.rename <energydb.NodeScope.rename>`, ``.update``,
      ``.delete``, ``.move_to``, ``.add``) instead, optionally batched in a
-     :meth:`Client.transaction`.
+     :meth:`Client.transaction <energydb.AsyncClient.transaction>`.
    * Names must be non-empty and must not contain ``/`` (the path
      separator). Violations raise
      :class:`~energydb.errors.ValidationError` before any SQL runs and
@@ -199,7 +220,7 @@ writes those UUIDs straight into the row primary keys in PostgreSQL.
    * If any node/edge in the tree carries non-empty inline
      ``TimeSeries.df`` data, the call raises
      :class:`~energydb.errors.ValidationError` — write data separately via
-     :meth:`~energydb.Client.write` or the scope helpers (see below).
+     :meth:`~energydb.AsyncClient.write` or the scope helpers (see below).
 
 Grafting onto an existing tree
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -290,6 +311,42 @@ Flat queries by type / subtree / properties (return lists of EDM objects):
 
    turbines = client.query_nodes(type="WindTurbine", within="my-portfolio")
    lines = client.query_edges(type="Line", within="my-portfolio")
+
+Generic (non-EDM) nodes
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Not every node has to be an EnergyDataModel class. ``create_node`` takes a
+free-form ``node_type`` slug plus a JSONB ``data`` payload and stores both
+verbatim, and the ``*_raw`` accessors read such nodes back without EDM
+reconstruction:
+
+.. code-block:: python
+
+   uuid = client.create_node(
+       node_type="Substation", name="SS-1",
+       data={"voltage_kv": 130},
+       parent=("my-portfolio",),          # UUID or path; None creates a root
+   )
+
+   client.get_node_raw(uuid)              # {uuid, node_type, name, data, parent_uuid}
+   client.get_subtree_raw(uuid)           # root + every descendant, same dicts + path
+
+``get_node_raw`` returns ``None`` when the node does not exist;
+``get_subtree_raw`` returns an empty list. Both are safe for any
+``node_type`` string, unlike :meth:`~energydb.AsyncClient.get_node` /
+:meth:`~energydb.AsyncClient.get_tree`, which need a known EDM class.
+
+To enumerate the series catalog for one owner — the reverse lookup from
+``(owner, data_type, name)`` to the timedb-internal ``series_id`` — use
+``list_series``:
+
+.. code-block:: python
+
+   client.list_series(t01.id)                            # node-owned series
+   client.list_series(line.id, owner_col="edge_uuid")    # edge-owned series
+
+Each dict is ``{series_id, name, data_type, canonical_unit,
+timeseries_type, description}``.
 
 
 Editing single elements
@@ -403,7 +460,7 @@ support endpoint navigation.
    client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b, line]))
 
 For standalone edges between nodes that already exist in the database, use
-:meth:`~energydb.Client.create_edge` directly:
+:meth:`~energydb.AsyncClient.create_edge` directly:
 
 .. code-block:: python
 
@@ -427,6 +484,109 @@ Series on an edge:
    )
    scope.write(df, name="power_flow", data_type="actual")
    scope.read(name="power_flow", data_type="actual")
+
+
+Parallel Edges (Multigraph)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Power networks are multigraphs: a corridor routinely carries several
+circuits between the same two substations. energydb's edge key is the
+**quadruple** ``(edge_type, from_node_uuid, to_node_uuid, name)``, so those
+circuits are ordinary sibling edges that differ only by ``name``:
+
+.. code-block:: python
+
+   no2 = edb.grid.JunctionPoint(name="NO2-420")
+   no1 = edb.grid.JunctionPoint(name="NO1-420")
+   client.register_tree(edb.Portfolio(name="Grid", members=[no2, no1]))
+
+   for i, capacity in enumerate([1200, 1200, 1400, 1400, 900, 900], start=1):
+       client.create_edge(
+           edb.grid.Line(
+               name=f"circuit-{i}", capacity=capacity,
+               from_element=no2, to_element=no1,
+           )
+       )
+
+The name is what addresses one of them — pass ``name=`` alongside the triple:
+
+.. code-block:: python
+
+   c3 = client.get_edge("Grid/NO2-420", "Grid/NO1-420", type="Line", name="circuit-3").get()
+
+Without a name, a triple that matches **more than one** edge raises
+:class:`~energydb.errors.AmbiguousEdgeError` rather than picking one. The
+exception carries every candidate on ``.matches`` (``{"uuid": …, "name": …}``),
+so an API server can render a "which circuit did you mean?" choice:
+
+.. code-block:: python
+
+   try:
+       client.get_edge("Grid/NO2-420", "Grid/NO1-420", type="Line").get()
+   except edb.AmbiguousEdgeError as err:
+       print([m["name"] for m in err.matches])
+       # ['circuit-1', 'circuit-2', 'circuit-3', 'circuit-4', 'circuit-5', 'circuit-6']
+
+A triple that matches exactly one edge resolves as it always has — every
+address that was unambiguous before stays unambiguous.
+
+``name`` is nullable, and ``NULLS NOT DISTINCT`` applies: there can be **one
+unnamed edge** per ``(type, from, to)``, alongside any number of named ones.
+Two unnamed edges between the same endpoints are still rejected. A conflicting
+insert, rename, or ``move_to`` raises
+:class:`~energydb.errors.AlreadyExistsError` naming the occupied key.
+
+On the manifest side, the edge triple takes an optional fourth column,
+``edge_name`` (``Utf8``, null = the unnamed edge). Edge read output carries the
+same column, so an edge read's own frame feeds straight back in:
+
+.. code-block:: python
+
+   manifest = pl.DataFrame({
+       "from_path": ["Grid/NO2-420"] * 2,
+       "to_path":   ["Grid/NO1-420"] * 2,
+       "edge_type": ["Line"] * 2,
+       "edge_name": ["circuit-1", "circuit-3"],
+       "data_type": ["actual"] * 2,
+       "name":      ["power_flow"] * 2,
+   })
+   client.read(manifest)
+
+Orientation is by convention
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Every edge has a **reference orientation**: ``from_element`` → ``to_element``.
+Flow in the opposite direction is a *negative value* on the series, the
+convention PyPSA and pandapower use and the one EnergyDataModel documents.
+energydb stores that orientation verbatim and does not interpret the EDM
+``directed`` flag — it is advisory metadata for the application, not a storage
+semantic.
+
+Two consequences worth stating plainly:
+
+- energydb never canonicalizes endpoints. ``A → B`` and ``B → A`` are two
+  distinct edges, by design: silently folding them together would flip the
+  sign of half your flow data.
+- A mirror-orientation pair in imported data is therefore legitimate — either
+  a genuine second circuit modelled the other way round, or a modelling choice
+  in the source. energydb keeps what you gave it.
+
+Enforcing one edge per pair
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some edge types are singletons by nature — one ``BorderFlow`` per zone pair,
+say. That is an application invariant, not a library one (same doctrine as
+namespaces and RLS: energydb provides the columns, the host application
+provides the policy). Enforce it with a partial unique index:
+
+.. code-block:: sql
+
+   CREATE UNIQUE INDEX border_flow_singleton ON energydb.edge
+     (edge_type, from_node_uuid, to_node_uuid)
+     WHERE edge_type = 'BorderFlow';
+
+Any insert of a second ``BorderFlow`` on that pair then fails at the database,
+whatever its name — while every other edge type stays a multigraph.
 
 
 Targeted Time-Series I/O
@@ -454,7 +614,7 @@ via the scope's path or uuid before any data reaches the database.
    * - **Routing**
      - Implicit (the scope's resolved uuid)
      - Manifest column: ``node_uuid``, ``edge_uuid``, ``path``, or
-       ``from_path`` + ``to_path`` + ``edge_type``
+       ``from_path`` + ``to_path`` + ``edge_type`` (+ optional ``edge_name``)
 
 Writing
 ~~~~~~~
@@ -566,7 +726,9 @@ set. Internal identifiers (``series_id``, ``node_uuid``, ``edge_uuid``)
 are never exposed on the result.
 
 For edge reads, the hierarchy columns are ``from_path``, ``to_path`` (both
-``Utf8``, joined with ``/``) and ``edge_type``.
+``Utf8``, joined with ``/``), ``edge_type``, and ``edge_name`` — the edge's
+own name, always present and null for unnamed edges. It is what tells two
+parallel circuits' rows apart; see `Parallel Edges (Multigraph)`_.
 
 .. note::
 
@@ -602,8 +764,8 @@ Bulk Manifest I/O
 -----------------
 
 For production pipelines that touch many series across many nodes or edges
-in one call, use :meth:`Client.write <energydb.Client.write>` and
-:meth:`Client.read <energydb.Client.read>` with a *manifest DataFrame*. The
+in one call, use :meth:`Client.write <energydb.AsyncClient.write>` and
+:meth:`Client.read <energydb.AsyncClient.read>` with a *manifest DataFrame*. The
 same engine drives the scope helpers, so guarantees are identical.
 
 The manifest carries one routing column plus ``data_type``, ``name``, and
@@ -628,6 +790,12 @@ the data columns. The routing column is autodetected from the column names
   resolved server-side via its endpoint nodes' paths and type. Symmetric
   with the edge read output columns, so an edge read's frame can be fed
   back in as a manifest without resolving ``edge_uuid`` first.
+- ``edge_name`` — optional fourth column on that route (``Utf8``, null = the
+  unnamed edge), picking one of several parallel edges sharing a triple. A
+  triple matching more than one edge without it raises
+  :class:`~energydb.errors.AmbiguousEdgeError` listing the candidates; see
+  `Parallel Edges (Multigraph)`_. On its own — without the triple — it routes
+  nothing and raises :class:`~energydb.errors.ManifestError`.
 
 write() — long-format multi-series ingestion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -682,13 +850,25 @@ The other two routing forms are equivalent:
        "value":      [200.0 + h for h in range(24)],
    })
 
+   # ...plus edge_name when parallel edges share that triple
+   pl.DataFrame({
+       "from_path":  ["my-grid/BusA"] * 24,
+       "to_path":    ["my-grid/BusB"] * 24,
+       "edge_type":  ["Line"] * 24,
+       "edge_name":  ["circuit-3"] * 24,
+       "data_type":  ["actual"] * 24,
+       "name":       ["power_flow"] * 24,
+       "valid_time": hours,
+       "value":      [200.0 + h for h in range(24)],
+   })
+
 Routing modes are mutually exclusive — passing more than one routing column
 raises :class:`~energydb.errors.ManifestError`. Supplying only part of the
 edge triple (e.g. ``from_path`` + ``to_path`` without ``edge_type``) raises
 the same.
 
 Series must already be registered (typically via
-:meth:`~energydb.Client.register_tree`) — unresolved
+:meth:`~energydb.AsyncClient.register_tree`) — unresolved
 ``(owner, data_type, name)`` triples raise
 :class:`~energydb.errors.SeriesNotFoundError` before any data reaches
 ClickHouse, and the exception names *every* unresolved triple, not just the
@@ -744,8 +924,8 @@ Optional kwargs:
 
 The result columns mirror the scope read: ``path``, ``data_type``,
 ``name``, ``valid_time``, ``value`` for node manifests; ``from_path``,
-``to_path``, ``edge_type``, ``data_type``, ``name``, ``valid_time``,
-``value`` for edge manifests. ``path`` / ``from_path`` / ``to_path`` are
+``to_path``, ``edge_type``, ``edge_name``, ``data_type``, ``name``,
+``valid_time``, ``value`` for edge manifests. ``path`` / ``from_path`` / ``to_path`` are
 ``Utf8`` joined with ``/``. Internal identifiers (``series_id``,
 ``node_uuid``, ``edge_uuid``) are never on the result.
 
@@ -799,7 +979,7 @@ settings. Those are caller bugs, not catalog gaps.
 Output modes
 ~~~~~~~~~~~~
 
-Both :meth:`Client.read <energydb.Client.read>` and the scope reads accept
+Both :meth:`Client.read <energydb.AsyncClient.read>` and the scope reads accept
 an ``output=`` kwarg that controls return shape:
 
 - ``output="frame"`` (default) — one DataFrame with the identity columns
@@ -808,7 +988,8 @@ an ``output=`` kwarg that controls return shape:
 - ``output="by_path"`` — a ``dict`` keyed by a
   :class:`~energydb.SeriesKey` ``(path, data_type, name)`` for node reads,
   or an :class:`~energydb.EdgeSeriesKey`
-  ``(from_path, to_path, edge_type, data_type, name)`` for edge reads. Both
+  ``(from_path, to_path, edge_type, edge_name, data_type, name)`` for edge
+  reads (``edge_name`` is ``None`` for an unnamed edge). Both
   are ``NamedTuple``\ s, so keys support positional *and* attribute access
   (``key.path``, ``key.name``, …). Each value is one DataFrame per series,
   carrying only the data columns (``valid_time``, ``value``, plus opt-in
@@ -836,9 +1017,9 @@ Atomic batches with ``transaction()``
 -------------------------------------
 
 For a sequence of mutations that must apply (or roll back) as a unit, open
-a :meth:`Client.transaction`. Mutations executed through the txn's scope
+a :meth:`Client.transaction <energydb.AsyncClient.transaction>`. Mutations executed through the txn's scope
 factories share one borrowed pool connection and stay uncommitted until
-:meth:`Transaction.commit` is called explicitly. Exiting the
+:meth:`Transaction.commit <energydb.Transaction.commit>` is called explicitly. Exiting the
 ``with``-block without committing raises and rolls back.
 
 .. code-block:: python
@@ -854,7 +1035,7 @@ factories share one borrowed pool connection and stay uncommitted until
 
 The transaction supports every scope mutator (``rename``, ``update``,
 ``move_to``, ``delete``, ``add``, ``register_series``) plus
-:meth:`Transaction.register_tree` for create-only inserts. Mid-transaction
+:meth:`Transaction.register_tree <energydb.Transaction.register_tree>` for create-only inserts. Mid-transaction
 reads on the same connection see the transaction's own uncommitted writes.
 
 .. warning::
@@ -864,7 +1045,7 @@ reads on the same connection see the transaction's own uncommitted writes.
    ``scope.read_relative(...)`` on a txn-bound scope raise
    ``RuntimeError`` — the ClickHouse writes and the ``energydb.runs``
    inserts go through their own connection and would not roll back with
-   the PG transaction. Call :meth:`Client.write` / :meth:`Client.read`
+   the PG transaction. Call :meth:`Client.write <energydb.AsyncClient.write>` / :meth:`Client.read <energydb.AsyncClient.read>`
    directly outside the ``with``-block when you need to mix structure
    mutations and time-series I/O.
 
@@ -889,7 +1070,7 @@ Two environment variables gate this path:
 - ``ENERGYDB_ENGINE_STRICT=1`` — raise on an engine-read failure instead of
   degrading to sequential (useful in tests). Without it, the first failure
   degrades the session and later reads go sequential until
-  :meth:`~energydb.Client.setup_ch_meta_engine` is called again.
+  :meth:`~energydb.AsyncClient.setup_ch_meta_engine` is called again.
 
 Logging on degrade
 ~~~~~~~~~~~~~~~~~~
@@ -899,7 +1080,7 @@ you which kind of problem it is:
 
 - **The engine table is not provisioned** → one ``info`` line, no traceback.
   For a deployment that never calls
-  :meth:`~energydb.Client.setup_ch_meta_engine`, this is a steady
+  :meth:`~energydb.AsyncClient.setup_ch_meta_engine`, this is a steady
   configuration state, not an incident: reads work, they just take the
   sequential path.
 - **Anything else** (network, auth, schema drift, ClickHouse→PostgreSQL
@@ -927,8 +1108,13 @@ energydb at it:
    ENERGYDB_CH_PG_COLLECTION=my_pg_collection
 
 The password then stays out of both the DDL and ``SHOW CREATE TABLE``, and
-the warning goes away. One related knob:
+the warning goes away. Two related knobs:
 
+- ``ENERGYDB_CH_ENGINE_TABLE`` — base name for the ClickHouse engine table
+  (default ``energydb_series_meta_pg``). When ``ENERGYDB_SCHEMA`` names a
+  non-default schema, that schema is appended (``<base>__<schema>``), so
+  several energydb schemas can share one ClickHouse database without
+  colliding. Read once at import time.
 - ``ENERGYDB_CH_PG_HOST`` (``host:port``) — overrides the DSN's host for
   **ClickHouse's** network vantage. The DSN addresses PostgreSQL from your
   application, which is not necessarily how ClickHouse reaches it (e.g.
@@ -958,6 +1144,49 @@ Run ids are client-side BIGINTs (top 63 bits of a UUID7), time-sortable, and
 fit cleanly in ``Int64``.
 
 
+Namespaces (multi-tenancy)
+--------------------------
+
+*New in 0.10.0.* One energydb database can serve many tenants. Every row in
+``node`` / ``edge`` / ``series`` carries a ``namespace`` label, and
+:meth:`~energydb.AsyncClient.namespace` returns a *view* of the client bound to one
+tenant:
+
+.. code-block:: python
+
+   root = Client()                     # root client: sees everything
+   acme = root.namespace("acme")       # view: sees and stamps only "acme"
+
+Namespacing is **opt-in and invisible to single-tenant users**: a root client
+never sets the label, rows it creates land in ``'default'``, and nothing else
+about its behavior changes.
+
+How a view works:
+
+- It **shares the root client's connection pool and ClickHouse client** — no
+  extra connections. Rebinding is cheap; call ``namespace()`` per request if
+  you like.
+- On checkout it binds the ``energydb.namespace`` GUC (transaction-local for
+  transactional work), which a server-side column default reads back to stamp
+  new rows. Write paths never mention the column.
+- **Row filtering is enforced by PostgreSQL Row-Level Security when the host
+  application enables it** — the library ships no policies of its own. Until
+  RLS is enabled, a view stamps rows but does not hide other tenants' rows.
+- Lifecycle operations (``open`` / ``create`` / ``delete`` / ``close`` /
+  ``setup_ch_meta_engine``) are **root-only** and raise
+  :class:`~energydb.errors.ValidationError` on a view.
+- Engine-parallel reads are disabled on views (the ClickHouse meta engine
+  reads PostgreSQL with credentials that bypass RLS); reads fall back to the
+  sequential path.
+
+One deployment caveat: the autocommit read path binds the GUC at *session*
+level and clears it before the connection returns to the pool. Behind a
+transaction-mode connection pooler (PgBouncer), session state is not
+guaranteed to follow your queries — run **namespaced** deployments against a
+direct PostgreSQL connection. Root clients have no such constraint; since
+0.10.0 they are fully pooler-safe.
+
+
 .. _sdk-error-handling:
 
 Error Handling
@@ -977,6 +1206,7 @@ the package root, so ``from energydb import SeriesNotFoundError`` works.
    │   └── SeriesNotFoundError
    ├── AlreadyExistsError         — create-only violation
    ├── ValidationError            — invalid arguments or invalid operation
+   │   ├── AmbiguousEdgeError     — edge triple matches several parallel edges
    │   ├── ManifestError          — structurally invalid manifest
    │   └── UnchangedScopeError    — scope would drop OVERLAPPING revisions
    ├── ConfigurationError         — client / environment misconfiguration
@@ -1015,7 +1245,9 @@ Catch the branch you mean:
 
 .. note::
 
-   **Every class above also subclasses** ``ValueError``. Broad
+   **Every class energydb raises also subclasses** ``ValueError`` — every
+   subclass in the tree above does, though the ``EnergyDBError`` base
+   itself does not (nothing raises it directly). Broad
    ``except ValueError`` handlers therefore catch all of them, which keeps
    generic error-handling code working — but the typed classes are what you
    want in new code, because message text is not a contract and the
@@ -1038,7 +1270,10 @@ keyword-only and default to ``None`` when the raise site does not know them;
    * - :class:`~energydb.errors.NodeNotFoundError`
      - ``path``, ``uuid``
    * - :class:`~energydb.errors.EdgeNotFoundError`
-     - ``uuid``, ``from_path``, ``to_path``, ``edge_type``
+     - ``uuid``, ``from_path``, ``to_path``, ``edge_type``, ``name``
+   * - :class:`~energydb.errors.AmbiguousEdgeError`
+     - ``from_path``, ``to_path``, ``edge_type``, ``matches`` (every candidate
+       edge as ``{"uuid": …, "name": …}``)
    * - :class:`~energydb.errors.SeriesNotFoundError`
      - ``route`` (``"path"`` / ``"node_uuid"`` / ``"edge_uuid"`` / the edge
        triple), ``missing`` (every unresolved ``(owner, data_type, name)``)
@@ -1054,11 +1289,18 @@ What raises what
 - :class:`~energydb.errors.AlreadyExistsError` — create-only violations:
   a UUID in a ``register_tree`` payload that already exists in the database,
   a duplicate UUID on two elements of one tree, re-registering a series with
-  different immutable attributes.
+  different immutable attributes, or an edge landing on an
+  ``(edge_type, from, to, name)`` quadruple another edge already occupies
+  (on insert, ``rename``, or ``move_to``).
+- :class:`~energydb.errors.AmbiguousEdgeError` — an edge triple matches more
+  than one parallel edge and no name narrowed it: ``get_edge(...)`` without
+  ``name=``, or a triple-routed manifest without an ``edge_name`` column.
+  ``.matches`` carries every candidate. See `Parallel Edges (Multigraph)`_.
 - :class:`~energydb.errors.ManifestError` — the manifest is structurally
   wrong: no routing column, more than one routing column, a partial edge
-  triple, missing ``data_type`` / ``name``, a ``List(Utf8)`` ``path`` column
-  (use ``Utf8`` joined with ``/``), or null routing values.
+  triple, an ``edge_name`` column without that triple, missing ``data_type``
+  / ``name``, a ``List(Utf8)`` ``path`` column (use ``Utf8`` joined with
+  ``/``), or null routing values.
 - :class:`~energydb.errors.UnchangedScopeError` —
   ``unchanged_scope="valid_time"`` on a manifest containing OVERLAPPING
   series, which would drop their republications. See
@@ -1070,7 +1312,8 @@ What raises what
   a transaction, an empty path.
 - :class:`~energydb.errors.ConfigurationError` — the client cannot be
   constructed: no PostgreSQL connection configured, or a DSN that is not a
-  URI.
+  URI. Also raised by ``create()`` against a PostgreSQL older than 15, which
+  cannot express the ``UNIQUE NULLS NOT DISTINCT`` edge key.
 - :class:`~energydb.IncompatibleUnitError` — a requested unit is not
   dimensionally compatible with the series' ``canonical_unit``.
 - ``RuntimeError`` — time-series ``read`` / ``write`` / ``read_relative`` on
@@ -1081,7 +1324,7 @@ Schema misconfiguration
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 If the configured schema does not contain energydb's tables — the wrong
-``ENERGYDB_SCHEMA``, or :meth:`~energydb.Client.create` never having run —
+``ENERGYDB_SCHEMA``, or :meth:`~energydb.AsyncClient.create` never having run —
 queries fail with psycopg's own ``UndefinedTable``. energydb attaches a note
 to it naming the schema it searched, the environment variable that controls
 it, and the fix, so the traceback is actionable:
@@ -1118,10 +1361,10 @@ Best Practices
    no delete-then-insert dance, no full tree round-trip.
 
 4. **Batch related mutations in a transaction.** Use
-   :meth:`Client.transaction` so a sequence of ``rename`` / ``update`` /
+   :meth:`Client.transaction <energydb.AsyncClient.transaction>` so a sequence of ``rename`` / ``update`` /
    ``move_to`` / ``delete`` / ``add`` / ``register_tree`` calls either
    all apply together or all roll back. Time-series I/O does not
-   participate — call :meth:`Client.write` / :meth:`Client.read`
+   participate — call :meth:`Client.write <energydb.AsyncClient.write>` / :meth:`Client.read <energydb.AsyncClient.read>`
    outside the ``with``-block.
 
 5. **Pick a routing column per pipeline.** Mixing ``path`` and ``node_uuid``
@@ -1136,7 +1379,7 @@ Best Practices
 
 7. **Tag writes with ``workflow_id`` / ``model_name``.** Provenance lives in
    ``energydb.runs`` and is recoverable via
-   :meth:`~energydb.Client.read_runs_for_series`.
+   :meth:`~energydb.AsyncClient.read_runs_for_series`.
 
 8. **Use ``where(type=...)`` for type-filtered subtree reads.** A single
    fluent call replaces N targeted reads — the manifest pipeline batches
@@ -1153,6 +1396,90 @@ Best Practices
 
 
 .. _sdk-upgrading:
+
+Upgrading to 0.11.0
+-------------------
+
+0.11.0 makes ``edge`` a **multigraph** (see `Parallel Edges (Multigraph)`_).
+That is a schema change, one breaking result-schema change, and a raised
+PostgreSQL floor. In order of what you have to do:
+
+- **PostgreSQL 15+ is now required** (up from 14). The edge key uses
+  ``UNIQUE NULLS NOT DISTINCT``, which PostgreSQL 14 cannot express.
+  ``create()`` checks ``server_version_num`` up front and raises
+  :class:`~energydb.errors.ConfigurationError` on an older server, rather
+  than failing mid-DDL with a syntax error.
+
+- **Migrate an existing database by hand.** energydb ships no migrations
+  (same stance as namespaces in 0.10.0) — ``create()`` will not alter a table
+  that already exists. Run:
+
+  .. code-block:: sql
+
+     ALTER TABLE energydb.edge DROP CONSTRAINT edge_uniq;
+     ALTER TABLE energydb.edge ADD CONSTRAINT edge_uniq
+       UNIQUE NULLS NOT DISTINCT (edge_type, from_node_uuid, to_node_uuid, name);
+
+  It is metadata-only in the sense that matters: no backfill, no data
+  rewrite, and every row that satisfied the old constraint satisfies the new
+  one. (Drop the ``energydb.`` qualifier if your tables live in ``public``.)
+
+- **``EdgeSeriesKey`` gained a field** — ``(from_path, to_path, edge_type,
+  edge_name, data_type, name)``, 5 → 6. This is the one breaking change.
+  Code that unpacks the key positionally breaks loudly at the unpack;
+  attribute access (``key.edge_type``) and dict lookups built with
+  ``EdgeSeriesKey(...)`` keywords are unaffected. Without the field, two
+  parallel circuits' series would silently collide on one key.
+
+- **Edge read output gained an ``edge_name`` column**, after ``edge_type``,
+  always present and null for unnamed edges. Code that asserts an exact
+  column set on edge reads needs updating; code that selects by name does
+  not. It feeds straight back in as the manifest's optional ``edge_name``
+  routing column.
+
+- **Re-run** :meth:`~energydb.AsyncClient.setup_ch_meta_engine` once, so the
+  ``series_meta`` view and the ClickHouse engine table over it expose
+  ``edge_name`` too. Reads are correct either way — the engine predicates
+  stay triple-based and the values are trimmed against the exact PostgreSQL
+  resolve — so this is housekeeping, not a fix, but it keeps the bridge in
+  step with the schema.
+
+- **Triple addressing may now raise.** ``get_edge(from, to, type=...)`` and
+  triple-routed manifests raise
+  :class:`~energydb.errors.AmbiguousEdgeError` when the triple matches
+  several parallel edges. Nothing that resolved uniquely before changes
+  behaviour: the error can only fire against data a pre-0.11.0 database
+  could not hold.
+
+
+Upgrading to 0.10.0
+-------------------
+
+No migration required for an existing database: no ClickHouse engine-table
+re-provisioning, and every API change is additive. Three things are worth
+knowing:
+
+- **Namespaces** (see `Namespaces (multi-tenancy)`_) are new and opt-in. A
+  client that never calls :meth:`~energydb.AsyncClient.namespace` behaves exactly
+  as on 0.9.0. ``create()`` on a **new** database now emits namespace-aware
+  DDL (a ``namespace`` column on ``node``/``edge``/``series``, composite
+  keys); an **existing** 0.9.0-shaped database keeps working unchanged — no
+  root-client query references the column — but the library ships no
+  migration to add namespacing to existing data; adopting multi-tenancy on an
+  existing database is the host application's project.
+- **energydb no longer touches the connection's** ``search_path``. Every
+  relation reference is written out in the SQL instead — see `Schema
+  resolution`_ above. This supersedes the 0.9.0 startup-option transport, which
+  a PgBouncer-based pooler rejects (Neon's pooled endpoints fail *every*
+  connection with ``unsupported startup parameter in options: search_path``).
+  If you were pinned to an unpooled endpoint because of that, you no longer are.
+  ``ENERGYDB_SCHEMA`` semantics are unchanged, and ``SHOW search_path`` now
+  echoes whatever your server or role says — energydb stopped setting it.
+- **New methods**, all additive: :meth:`~energydb.AsyncClient.namespace`,
+  :meth:`~energydb.AsyncClient.list_nodes_raw` (keyset-paginated raw node listing),
+  and the resolve-then-read split ``scope.resolve()`` /
+  ``scope.read_from_meta()`` for authorize-before-read flows.
+
 
 Upgrading to 0.9.0
 ------------------
@@ -1172,12 +1499,14 @@ re-provisioning. Four things are worth knowing:
   a traceback. Alerting that matched on that warning will stop firing for
   this cause — deliberately.
 - **``SHOW search_path`` echoes ``myschema,public``** (no space), because the
-  search path now travels in the libpq startup packet rather than a ``SET``
-  statement. Resolution is identical; only the spelling differs, which
-  matters solely to a deployment smoke-test that string-matches it.
+  search path travels in the libpq startup packet rather than a ``SET``
+  statement. *Superseded by 0.10.0*, which stops setting the search path at
+  all — and which you want instead if anything between you and PostgreSQL
+  pools connections.
 
-Existing ``except ValueError`` handlers keep working: every class in
-:mod:`energydb.errors` also subclasses ``ValueError``.
+Existing ``except ValueError`` handlers keep working: every raisable class
+in :mod:`energydb.errors` also subclasses ``ValueError`` (the
+``EnergyDBError`` base, which is never raised on its own, does not).
 
 
 Complete Example

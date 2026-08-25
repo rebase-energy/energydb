@@ -3,7 +3,9 @@
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-# -- Path setup --------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Path setup
+# ---------------------------------------------------------------------------
 
 import glob
 import os
@@ -32,15 +34,26 @@ if os.path.exists(_dev_md_src):
     if not os.path.exists(_dev_md_dest) or os.path.getmtime(_dev_md_src) > os.path.getmtime(_dev_md_dest):
         shutil.copy2(_dev_md_src, _dev_md_dest)
 
-# -- Project information -----------------------------------------------------
+# ---------------------------------------------------------------------------
+# Project information
+# ---------------------------------------------------------------------------
 
 project = "energydb"
 copyright = "Rebase Energy"
 author = "Rebase Energy"
-release = "0.3.2"
-version = "0.3.2"
+# Read the version from the installed package metadata so it never drifts
+# from pyproject.toml.
+try:
+    from importlib.metadata import version as _pkg_version
 
-# -- General configuration ---------------------------------------------------
+    release = _pkg_version("energydb")
+except Exception:  # pragma: no cover  (docs build without the package installed)
+    release = "0.0.0"
+version = release
+
+# ---------------------------------------------------------------------------
+# General configuration
+# ---------------------------------------------------------------------------
 
 extensions = [
     "sphinx.ext.autodoc",
@@ -65,7 +78,9 @@ nbsphinx_allow_errors = True
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
 
-# -- Options for HTML output -------------------------------------------------
+# ---------------------------------------------------------------------------
+# Options for HTML output
+# ---------------------------------------------------------------------------
 
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
@@ -74,7 +89,9 @@ html_theme_options = {
     "navigation_depth": 2,
 }
 
-# -- Extension configuration -------------------------------------------------
+# ---------------------------------------------------------------------------
+# Extension configuration
+# ---------------------------------------------------------------------------
 
 # Napoleon settings for NumPy/Google style docstrings
 napoleon_google_docstring = True
@@ -95,4 +112,8 @@ intersphinx_mapping = {
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "polars": ("https://docs.pola.rs/api/python/stable/", None),
     "pint": ("https://pint.readthedocs.io/en/stable/", None),
+    # Sibling projects whose types energydb re-exports or wraps.
+    "timedb": ("https://timedb.readthedocs.io/en/stable/", None),
+    "timedatamodel": ("https://timedatamodel.readthedocs.io/en/stable/", None),
+    "energydatamodel": ("https://energydatamodel.readthedocs.io/en/stable/", None),
 }

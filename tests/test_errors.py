@@ -2,13 +2,13 @@
 
 Three groups:
 
-* **Hierarchy invariants** — every public error subclasses both
+* **Hierarchy invariants**: every public error subclasses both
   :class:`~energydb.errors.EnergyDBError` and :class:`ValueError`, so the
   pre-taxonomy ``except ValueError`` contract still holds. Pinned as a test
   because it *is* the backwards-compatibility guarantee.
-* **Source scan** — zero ``raise ValueError(`` left in ``energydb/``. The
+* **Source scan**: zero ``raise ValueError(`` left in ``energydb/``. The
   cheapest possible regression guard for the ~92-site sweep.
-* **Per-family behavior** — the class and its structured identifier fields at
+* **Per-family behavior**: the class and its structured identifier fields at
   the raise sites that matter. Mock-connection tests run everywhere; the ones
   that genuinely need PG + ClickHouse are marked and skip without a DB.
 """
@@ -45,7 +45,7 @@ from energydb.paths import resolve_edge_uuid, resolve_manifest, resolve_node_uui
 
 needs_db = pytest.mark.skipif(
     not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")),
-    reason="TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping DB-backed error tests",
+    reason="TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping DB-backed error tests",
 )
 
 PUBLIC_ERRORS = [
@@ -79,7 +79,7 @@ def test_except_value_error_still_catches_every_public_error(cls):
         raise cls("boom")
     except ValueError as exc:
         assert isinstance(exc, cls)
-    else:  # pragma: no cover - the raise above always fires
+    else:  # pragma: no cover  (the raise above always fires)
         pytest.fail(f"{cls.__name__} was not caught by 'except ValueError'")
 
 
@@ -94,7 +94,7 @@ def test_taxonomy_is_re_exported_from_the_package_root():
 
 
 # ---------------------------------------------------------------------------
-# Source scan — no bare raises left
+# Source scan: no bare raises left
 # ---------------------------------------------------------------------------
 
 
@@ -137,7 +137,7 @@ def test_identifier_fields_are_keyword_only():
 
 
 # ---------------------------------------------------------------------------
-# Per-family behavior — mock connection / pure paths
+# Per-family behavior: mock connection / pure paths
 # ---------------------------------------------------------------------------
 
 
@@ -294,7 +294,7 @@ def test_incompatible_units_raise_incompatible_unit_error():
 
 
 # ---------------------------------------------------------------------------
-# Sync facade — typed errors survive the portal round-trip
+# Sync facade: typed errors survive the portal round-trip
 # ---------------------------------------------------------------------------
 
 

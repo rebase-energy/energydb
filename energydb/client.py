@@ -1,4 +1,4 @@
-"""Client — owns the psycopg pool and constructs TimeDBClient.
+"""Client: owns the psycopg pool and constructs TimeDBClient.
 
 UUID identity model:
 
@@ -8,15 +8,15 @@ UUID identity model:
 * Path-based addressing (``client.get_node("Europe", "Sweden")``) is
   preserved as a user-friendly fluent CLI; resolution walks
   ``(parent_uuid, name)`` via one indexed recursive CTE.
-* Edge endpoints in storage are ``from_node_uuid`` / ``to_node_uuid`` —
+* Edge endpoints in storage are ``from_node_uuid`` / ``to_node_uuid``:
   no path resolution at write or read time.
 
 API split:
 
-* ``register_tree`` — structure (nodes, edges, series declarations). Create-only;
+* ``register_tree``: structure (nodes, edges, series declarations). Create-only;
   raises if any UUID in the payload already exists, or on inline timeseries data.
-* ``write`` / ``read`` — bulk timeseries data via manifest DataFrames.
-* ``get_node`` / ``get_edge`` — fluent scope entry points. Reads like
+* ``write`` / ``read``: bulk timeseries data via manifest DataFrames.
+* ``get_node`` / ``get_edge``: fluent scope entry points. Reads like
   English: ``client.get_node("p").where(type="WindTurbine").read()``.
   Terminate with ``.get()`` to fetch the EDM object eagerly.
 """
@@ -39,7 +39,6 @@ if TYPE_CHECKING:
 
 import pandas as pd
 import polars as pl
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy import create_engine
 from timedatamodel import DataType, TimeSeries, TimeSeriesType
@@ -68,6 +67,7 @@ from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
 from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
 from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import (
     OnMissing,
     Path,
@@ -82,35 +82,6 @@ from energydb.serialization import reconstruct_edge, reconstruct_node
 logger = logging.getLogger(__name__)
 
 
-def _pool_conninfo(conninfo: str) -> str:
-    """``conninfo`` plus a startup ``options`` carrying energydb's search path.
-
-    The search path used to be a ``SET`` + ``commit()`` in the pool's ``configure``
-    callback — one extra round-trip on every checkout (the commit was needed
-    because an uncommitted ``SET`` leaves the connection in a transaction, which
-    ``psycopg_pool`` rejects). As a libpq startup option it travels in the startup
-    packet instead: set once per connection, zero per-checkout cost.
-
-    Only the pool sees this. ``self._dsn`` keeps the caller's URI, because
-    :meth:`AsyncClient._sqlalchemy_url`, :func:`engine_table_ddl` and
-    :meth:`AsyncClient._safe_dsn` all parse it as one and ``make_conninfo``
-    emits key=value.
-
-    A caller's own ``options`` are preserved and appended to, never clobbered.
-    The search path itself mirrors the previous ``SET`` exactly: ``"{schema},
-    public"`` for a named schema, plain ``"public"`` by default (rather than
-    ``public,public``, which would make ``SHOW search_path`` confusing).
-
-    Caveat: startup options travel in the libpq startup packet, so a connection
-    pooler in transaction-pooling mode may not honour them per-client. energydb's
-    supported deployments (direct PostgreSQL / Neon) do.
-    """
-    search_path = f"{SCHEMA},public" if SCHEMA else "public"
-    existing = conninfo_to_dict(conninfo).get("options") or ""
-    options = f"{existing} -c search_path={search_path}".strip() if existing else f"-c search_path={search_path}"
-    return make_conninfo(conninfo, options=options)
-
-
 class AsyncClient:
     """Async-native client for energy assets, hierarchy, and time series.
 
@@ -122,9 +93,9 @@ class AsyncClient:
     """
 
     # Namespace binding, as *class-level defaults* so that instances built
-    # without __init__ (test fixtures, :meth:`namespace` clones) behave like
-    # root clients unless overridden. ``None`` → no GUC set on checkouts.
-    # Views created via :meth:`namespace` shadow both per-instance and never
+    # without __init__ (test fixtures, namespace clones) behave like
+    # root clients unless overridden. None → no GUC set on checkouts.
+    # Views created via namespace shadow both per-instance and never
     # own the (shared) pool's lifecycle.
     _namespace: str | None = None
     _owns_pool: bool = True
@@ -140,7 +111,7 @@ class AsyncClient:
         Reads run the PG meta-resolve and the CH value read **in parallel**
         whenever the read is expressible over the ClickHouse engine table
         (provisioned by :meth:`create` for fresh DBs, or explicitly by
-        :meth:`setup_ch_meta_engine`); anything else — and any engine failure —
+        :meth:`setup_ch_meta_engine`); anything else, and any engine failure,
         uses the sequential path, with identical results. Set
         ``ENERGYDB_DISABLE_ENGINE=1`` to force sequential reads for the whole
         session (ops kill-switch; also what benchmarks use for before/after).
@@ -157,26 +128,27 @@ class AsyncClient:
         self._dsn = conninfo
 
         async def _configure(conn):
-            # ``prepare_threshold=1`` makes psycopg cache a server-side
+            # prepare_threshold=1 makes psycopg cache a server-side
             # prepared statement after the first execution of each SQL text.
             # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
             # (PG parse+plan stage skipped on subsequent calls).
             # Client-side attribute only: no round-trip, no transaction opened,
-            # hence no commit (the search path now rides the startup packet —
-            # see :func:`_pool_conninfo`).
+            # hence no commit. Nothing else belongs here: energydb's SQL is
+            # schema-qualified, so a connection needs no session state to
+            # resolve relation names (see models.SQL_SCHEMA_PREFIX).
             conn.prepare_threshold = 1
 
         self._pool = AsyncConnectionPool(
-            conninfo=_pool_conninfo(conninfo),
+            conninfo=conninfo,
             min_size=1,
             max_size=10,
             open=False,
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
-        # Set on the first engine-read failure (or by the env kill-switch): the rest of the
-        # session uses the sequential resolve without re-trying the engine.
-        # setup_ch_meta_engine() resets it.
+        # Set on the first engine-read failure, or by the env kill-switch: the
+        # rest of the session uses the sequential resolve without re-trying the
+        # engine. setup_ch_meta_engine() resets it.
         self._engine_unavailable = os.environ.get("ENERGYDB_DISABLE_ENGINE") == "1"
 
     async def open(self) -> None:
@@ -187,7 +159,7 @@ class AsyncClient:
     def _safe_dsn(self) -> str:
         """The DSN with the userinfo segment (user:pass) replaced by ``***``.
 
-        Shows scheme + host(:port) + db. Pure formatting — no I/O. Shared by
+        Shows scheme + host(:port) + db. Pure formatting, no I/O. Shared by
         :meth:`__repr__` and the sync :class:`energydb.Client` facade.
         """
         dsn = self._dsn
@@ -202,18 +174,18 @@ class AsyncClient:
         ns = f", namespace={self._namespace!r}" if self._namespace is not None else ""
         return f"AsyncClient(pg={self._safe_dsn()!r}{ns})"
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Namespacing
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def namespace(self, ns: str) -> AsyncClient:
         """Return a view of this client bound to one namespace.
 
         The view shares the parent's connection pool and ClickHouse client;
-        it is a cheap, disposable dict-copy — create one per request. Every
+        it is a cheap, disposable dict-copy: create one per request. Every
         PG round-trip made through the view binds the ``energydb.namespace``
         GUC (see :meth:`_conn` / :meth:`_read_conn`), which row-level
-        security policies — when installed — use to filter every table to
+        security policies, when installed, use to filter every table to
         that namespace, and which the columns' server defaults use to stamp
         writes. Lifecycle and schema operations (:meth:`open`, :meth:`close`,
         :meth:`create`, :meth:`delete`, :meth:`setup_ch_meta_engine`) stay
@@ -222,7 +194,7 @@ class AsyncClient:
         Engine-parallel reads are disabled on views: the ClickHouse meta
         engine table reads PG with its own (RLS-bypassing) credentials, so
         until its predicate carries the namespace, views always take the
-        sequential resolve — identical results, namespace-enforced.
+        sequential resolve (identical results, namespace-enforced).
         """
         if not ns:
             raise ValidationError("namespace must be a non-empty string")
@@ -239,18 +211,18 @@ class AsyncClient:
         """Raise unless called on a root client (namespaced views share the
         pool and must never manage its lifecycle or touch schema DDL)."""
         if not self._owns_pool:
-            raise ValidationError(f"{op}() is not available on a namespaced view — call it on the root client")
+            raise ValidationError(f"{op}() is not available on a namespaced view; call it on the root client")
 
     @asynccontextmanager
     async def _conn(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
-        """Borrow a pooled connection for transactional work — the single
+        """Borrow a pooled connection for transactional work: the single
         checkout point for every mutating PG round-trip (here and in
         ``scope`` / ``_transaction``).
 
         On a namespaced view, the transaction-local ``energydb.namespace``
         GUC is bound first. ``set_config(..., is_local := true)`` is
-        ``SET LOCAL`` in function form — parameterizable and server-side
-        preparable — so the value dies with the transaction and nothing
+        ``SET LOCAL`` in function form, parameterizable and server-side
+        preparable, so the value dies with the transaction and nothing
         leaks when the connection returns to the shared pool.
         """
         async with annotate_undefined_table(), self._pool.connection() as conn:
@@ -285,9 +257,9 @@ class AsyncClient:
             finally:
                 await conn.execute("SELECT set_config('energydb.namespace', '', false)")
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Schema management
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     async def create(self) -> None:
         """Create PG schema + CH tables, and provision the CH meta engine table.
@@ -299,22 +271,46 @@ class AsyncClient:
 
         The engine table is best-effort: a CH role that cannot create
         ``PostgreSQL()`` engine tables must not break ``create()`` for
-        deployments that never enable ``concurrent`` — those get a logged
+        deployments that never enable ``concurrent``; those get a logged
         warning and reads fall back to the sequential path.
         :meth:`setup_ch_meta_engine` is the explicit, raising alternative.
 
         For production, set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named
         collection holding the PostgreSQL connection; otherwise the credentials
         are inlined into the engine table's DDL (and a warning says so).
+
+        Raises :class:`~energydb.errors.ConfigurationError` on PostgreSQL
+        older than 15: the ``edge_uniq`` multigraph key needs
+        ``UNIQUE NULLS NOT DISTINCT``.
         """
         self._require_root("create")
+        await self._check_server_version()
         await asyncio.to_thread(self._create_blocking)
         try:
             await asyncio.to_thread(self._provision_engine_table_blocking)
-        except Exception:  # noqa: BLE001  -- best-effort; engine reads degrade to sequential
+        except Exception:  # noqa: BLE001  (best-effort; engine reads degrade to sequential)
             logger.warning(
                 "could not provision the ClickHouse meta engine table; reads will use the sequential path",
                 exc_info=True,
+            )
+
+    # UNIQUE NULLS NOT DISTINCT on edge_uniq (the multigraph key) is
+    # PostgreSQL 15+ syntax. Checking it up front turns a cryptic mid-DDL
+    # syntax error into one sentence naming the version and the reason.
+    _MIN_SERVER_VERSION_NUM = 150000
+    _MIN_SERVER_VERSION = "15"
+
+    async def _check_server_version(self) -> None:
+        """Raise :class:`ConfigurationError` if the server predates PostgreSQL 15."""
+        async with self._pool.connection() as conn:
+            row = await (await conn.execute("SHOW server_version_num")).fetchone()
+        version_num = int(row[0]) if row is not None else 0
+        if version_num < self._MIN_SERVER_VERSION_NUM:
+            raise ConfigurationError(
+                f"energydb requires PostgreSQL {self._MIN_SERVER_VERSION}+ "
+                f"(server reports server_version_num={version_num}). The edge "
+                f"table's unique key uses UNIQUE NULLS NOT DISTINCT, which "
+                f"PostgreSQL 14 and older do not support."
             )
 
     def _provision_engine_table_blocking(self) -> None:
@@ -324,17 +320,19 @@ class AsyncClient:
         if inlines_pg_password(self._dsn):
             logger.warning(
                 "energydb: provisioning the ClickHouse meta-engine table %r with inline "
-                "PostgreSQL credentials -- the password will be visible via SHOW CREATE TABLE "
+                "PostgreSQL credentials: the password will be visible via SHOW CREATE TABLE "
                 "to any ClickHouse user with read access. For production, create a ClickHouse "
                 "named collection holding the PostgreSQL connection and set "
                 "ENERGYDB_CH_PG_COLLECTION to its name.",
                 CH_ENGINE_TABLE,
             )
-        # DROP + CREATE (not IF NOT EXISTS alone): the engine table is stateless, and
-        # recreating it picks up view/column upgrades on existing deployments.
+        # DROP + CREATE rather than IF NOT EXISTS alone: the engine table is
+        # stateless, and recreating it picks up view/column upgrades on
+        # existing deployments.
         self.td._ch.command(DROP_ENGINE_TABLE)
         if DROP_LEGACY_ENGINE_TABLE:
-            # Remove a stale bare-named table left by a pre-fix named-schema deployment.
+            # Remove a stale bare-named table left by an older named-schema
+            # deployment.
             self.td._ch.command(DROP_LEGACY_ENGINE_TABLE)
         self.td._ch.command(engine_table_ddl(self._dsn, SCHEMA or "public"))
 
@@ -351,7 +349,7 @@ class AsyncClient:
 
         With a named schema, drops the whole schema (CASCADE). With the
         default ``public`` schema (``SCHEMA is None``), drops only EnergyDB's
-        own four tables — never the shared ``public`` schema, which would take
+        own four tables, never the shared ``public`` schema, which would take
         the host application's tables with it.
         """
         self._require_root("delete")
@@ -371,11 +369,11 @@ class AsyncClient:
         ``PostgreSQL()`` engine table over it (see :mod:`energydb._ch_meta_engine`
         for the credential/vantage resolution). Unlike :meth:`create`'s best-effort
         provisioning this raises on failure, and it clears the session's
-        engine-unavailable degrade flag — call it to re-enable ``concurrent``
+        engine-unavailable degrade flag; call it to re-enable ``concurrent``
         after fixing engine infrastructure.
 
         Set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named collection for
-        production deployments — without it the PostgreSQL password is inlined
+        production deployments; without it the PostgreSQL password is inlined
         into the DDL and readable via ``SHOW CREATE TABLE`` (warned about at
         provisioning time).
         """
@@ -387,20 +385,27 @@ class AsyncClient:
         self._engine_unavailable = False
 
     async def close(self) -> None:
+        """Close the PostgreSQL connection pool.
+
+        Root-client only: calling it on a
+        :meth:`namespace` view raises
+        :class:`~energydb.errors.ValidationError`, since the view shares the
+        root's pool.
+        """
         self._require_root("close")
         await self._pool.close()
 
-    # ------------------------------------------------------------------
-    # Fluent entry — scopes for navigation & single-element ops
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Fluent entry: scopes for navigation & single-element ops
+    # -----------------------------------------------------------------------
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`NodeScope` for a node or subtree.
 
-        ``client.get_node("P/Site/T01")``            — canonical ``/``-joined string
-        ``client.get_node("P", "Site", "T01")``      — variadic — equivalent
-        ``client.get_node(("P", "Site", "T01"))``    — tuple/list path
-        ``client.get_node(uuid=...)``                — absolute by uuid
+        ``client.get_node("P/Site/T01")``: canonical ``/``-joined string
+        ``client.get_node("P", "Site", "T01")``: variadic, equivalent
+        ``client.get_node(("P", "Site", "T01"))``: tuple/list path
+        ``client.get_node(uuid=...)``: absolute by uuid
 
         ``/`` is reserved as the path separator; names containing ``/``
         are rejected at registration time. Empty segments (leading,
@@ -424,17 +429,25 @@ class AsyncClient:
         to_path: Path | list[str] | str | None = None,
         *,
         type: str | None = None,
+        name: str | None = None,
         uuid: UUID | None = None,
     ) -> EdgeScope:
-        """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type)``.
+        """Return an :class:`EdgeScope` by uuid or by ``(from_path, to_path, type[, name])``.
 
         ``from_path`` / ``to_path`` accept the canonical ``/``-joined string
         form (``"P/Site/T01"``) or a tuple/list of segments. Terminate with
         ``.get()`` to fetch the EDM edge eagerly.
+
+        ``name`` picks one of several *parallel* edges sharing the triple
+        (the six circuits of a double-circuit corridor, say). Without it a
+        triple that matches exactly one edge resolves, and one that matches
+        several raises
+        :class:`~energydb.errors.AmbiguousEdgeError` listing the candidates
+        rather than picking one.
         """
         if uuid is not None:
-            if from_path is not None or to_path is not None or type is not None:
-                raise ValidationError("Pass uuid= alone, or (from_path, to_path, type=) — not both.")
+            if from_path is not None or to_path is not None or type is not None or name is not None:
+                raise ValidationError("Pass uuid= alone, or (from_path, to_path, type=[, name=]), not both.")
             return EdgeScope(self, edge_uuid=uuid)
         if from_path is None or to_path is None or type is None:
             raise ValidationError("Provide uuid= or (from_path, to_path, type=).")
@@ -443,11 +456,12 @@ class AsyncClient:
             from_path=_coerce_path((), kwarg=from_path),
             to_path=_coerce_path((), kwarg=to_path),
             edge_type=type,
+            edge_name=name,
         )
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Transactions
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def transaction(self) -> Transaction:
         """Open an atomic batch of scope mutations.
@@ -460,16 +474,16 @@ class AsyncClient:
         commit raises and rolls back.
 
         Time-series I/O (``scope.write(df, ...)`` / ``scope.read(...)``)
-        inside a transaction does **not** participate in atomicity — it
+        inside a transaction does **not** participate in atomicity; it
         executes immediately against the pool / ClickHouse.
         """
         from energydb._transaction import Transaction
 
         return Transaction(self)
 
-    # ------------------------------------------------------------------
-    # Structure — register_tree, edges, queries
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Structure: register_tree, edges, queries
+    # -----------------------------------------------------------------------
 
     async def register_tree(
         self,
@@ -486,7 +500,7 @@ class AsyncClient:
         or batch them with :meth:`transaction`.
 
         ``dry_run=True`` returns the computed :class:`TreeDiff` without
-        committing — the transaction is rolled back so no DB state changes.
+        committing; the transaction is rolled back so no DB state changes.
 
         Inline ``TimeSeries.df`` data is rejected: write data separately
         via :meth:`write` against a manifest. ``under`` selects the parent
@@ -524,9 +538,9 @@ class AsyncClient:
     def _within_match(within) -> tuple[str, Any, str | None]:
         """``(addr_sql, param, joined_path|None)`` for a ``within=`` root row ``r``.
 
-        ``joined_path`` is ``None`` for the UUID form — a missing UUID root
-        yields an empty result (historical contract), while a missing path
-        raises, so callers need to know which form they got.
+        ``joined_path`` is ``None`` for the UUID form. A missing UUID root
+        yields an empty result while a missing path raises, so callers need to
+        know which form they got.
         """
         if isinstance(within, UUID):
             return "r.uuid = %s", within, None
@@ -540,7 +554,7 @@ class AsyncClient:
         With ``joined`` (path-addressed root) the escaped prefix is a bind
         param, so PG extracts the literal prefix at plan time and Index Scans
         ``ix_node_path_prefix``. The uuid form derives the prefix from the
-        root row inside the statement — a catalog-wide scan, kept only where
+        root row inside the statement (a catalog-wide scan), kept only where
         the root path is unknown client-side.
         """
         if joined is not None:
@@ -571,7 +585,7 @@ class AsyncClient:
                 where = " AND ".join(filter_conds) if filter_conds else "TRUE"
                 rows = await (
                     await conn.execute(
-                        f"SELECT uuid, node_type, name, data FROM node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
+                        f"SELECT uuid, node_type, name, data FROM {P}node WHERE {where} ORDER BY name",  # ty: ignore[invalid-argument-type]
                         list(filter_params),
                     )
                 ).fetchall()
@@ -584,7 +598,7 @@ class AsyncClient:
                 subtree_on, prefix_params = self._subtree_on("n", joined)
                 sql = f"""
                     SELECT n.uuid, n.node_type, n.name, n.data
-                    FROM node r LEFT JOIN node n
+                    FROM {P}node r LEFT JOIN {P}node n
                       ON {subtree_on}{extra}
                     WHERE {addr}
                     ORDER BY n.name
@@ -602,22 +616,22 @@ class AsyncClient:
         """Upsert an edge between two existing nodes. Idempotent.
 
         The edge's :class:`Reference` endpoints (``from_element`` /
-        ``to_element``) carry the endpoint UUIDs directly — no path
+        ``to_element``) carry the endpoint UUIDs directly, with no path
         resolution. The endpoints must already exist as nodes; the FK
         constraint will fail otherwise.
 
-        For edges that are part of a tree, prefer :meth:`register_tree` —
-        it walks the structure and validates endpoints against the tree's
-        index in one pass.
+        For edges that are part of a tree, prefer :meth:`register_tree`: it
+        walks the structure and validates endpoints against the tree's index
+        in one pass.
         """
         async with self._conn() as conn:
             edge_uuid = await create_edge(conn, edm_obj, tree_root=None)
             await conn.commit()
         return edge_uuid
 
-    # ------------------------------------------------------------------
-    # Generic raw node API — store/read by (node_type, data), no EDM class
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Generic raw node API: store/read by (node_type, data), no EDM class
+    # -----------------------------------------------------------------------
 
     async def create_node(
         self,
@@ -628,14 +642,14 @@ class AsyncClient:
         parent: UUID | Path | list[str] | str | None = None,
         uuid: UUID | None = None,
     ) -> UUID:
-        """Create a single node from a type slug + JSONB ``data`` — no EDM class.
+        """Create a single node from a type slug + JSONB ``data``, with no EDM class.
 
         Generic counterpart to :meth:`register_tree`: ``node_type`` is stored
         as a free-form string and ``data`` verbatim, bypassing EnergyDataModel
         (de)serialization. ``parent`` selects the parent node (UUID or path);
         ``None`` creates a root. ``uuid`` is minted (uuid7) when omitted. Read
         these nodes back with :meth:`get_node_raw` / :meth:`get_subtree_raw` or
-        ``NodeScope.children()`` — not the EDM readers, which require a
+        ``NodeScope.children()``, not the EDM readers, which require a
         registered type.
         """
         async with self._conn() as conn:
@@ -666,8 +680,8 @@ class AsyncClient:
         async with self._read_conn() as conn:
             row = await (
                 await conn.execute(
-                    "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
-                    "FROM node WHERE uuid = %s",
+                    "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "  # ty: ignore[invalid-argument-type]
+                    f"FROM {P}node WHERE uuid = %s",
                     (node_uuid,),
                 )
             ).fetchone()
@@ -695,7 +709,7 @@ class AsyncClient:
         async with self._read_conn() as conn:
             sql = rf"""
                 SELECT c.uuid, c.node_type, c.name, c.data, c.parent_uuid, c.path, c.created_at, c.updated_at
-                FROM node r JOIN node c
+                FROM {P}node r JOIN {P}node c
                   ON (c.path = r.path OR c.path LIKE {derived_prefix_like("r.path")} ESCAPE '\')
                 WHERE r.uuid = %s
                 ORDER BY c.path
@@ -730,7 +744,7 @@ class AsyncClient:
         Filters compose with AND: ``node_type`` (one string or a list),
         ``parents`` (direct children of any of the given nodes). On a
         namespaced view the rows are additionally constrained to the view's
-        namespace — explicitly, independent of whether RLS policies are
+        namespace explicitly, independent of whether RLS policies are
         installed. ``after`` is a ``(name, uuid)`` keyset cursor matching
         the ``ORDER BY name, uuid::text`` ordering; ``limit`` caps the page.
         Row shape matches :meth:`get_node_raw` / :meth:`get_subtree_raw`.
@@ -752,14 +766,14 @@ class AsyncClient:
         where = " AND ".join(conditions) if conditions else "TRUE"
         sql = (
             "SELECT uuid, node_type, name, data, parent_uuid, path, created_at, updated_at "
-            f"FROM node WHERE {where} ORDER BY name, uuid::text"
+            f"FROM {P}node WHERE {where} ORDER BY name, uuid::text"
         )
         if limit is not None:
             sql += " LIMIT %s"
             params.append(limit)
         async with self._read_conn() as conn:
-            # Dynamic WHERE from the allowlisted fragments above — same
-            # ty-ignored f-string story as query_nodes.
+            # Dynamic WHERE from the allowlisted fragments above; same
+            # ty-ignored f-string as query_nodes.
             rows = await (await conn.execute(sql, params)).fetchall()  # ty: ignore[invalid-argument-type]
         return [
             {
@@ -793,13 +807,13 @@ class AsyncClient:
             rows = await (
                 await conn.execute(
                     f"SELECT series_id, name, data_type, canonical_unit, timeseries_type, description "  # ty: ignore[invalid-argument-type]
-                    f"FROM series WHERE {owner_col} = %s ORDER BY data_type, name",
+                    f"FROM {P}series WHERE {owner_col} = %s ORDER BY data_type, name",
                     (owner_uuid,),
                 )
             ).fetchall()
         return [
             {
-                # First: it reads as the row identity.
+                # series_id first: it reads as the row identity.
                 "series_id": r[0],
                 "name": r[1],
                 "data_type": r[2],
@@ -836,7 +850,7 @@ class AsyncClient:
                 rows = await (
                     await conn.execute(
                         f"SELECT uuid, edge_type, name, data, from_node_uuid, to_node_uuid "  # ty: ignore[invalid-argument-type]
-                        f"FROM edge WHERE {where} ORDER BY name NULLS LAST",
+                        f"FROM {P}edge WHERE {where} ORDER BY name NULLS LAST",
                         list(filter_params),
                     )
                 ).fetchall()
@@ -849,10 +863,10 @@ class AsyncClient:
                 subtree_on, prefix_params = self._subtree_on("m", joined)
                 sql = f"""
                     SELECT DISTINCT e.uuid, e.edge_type, e.name, e.data, e.from_node_uuid, e.to_node_uuid
-                    FROM node r
-                    LEFT JOIN node m
+                    FROM {P}node r
+                    LEFT JOIN {P}node m
                       ON {subtree_on}
-                    LEFT JOIN edge e
+                    LEFT JOIN {P}edge e
                       ON (e.from_node_uuid = m.uuid OR e.to_node_uuid = m.uuid){extra}
                     WHERE {addr}
                     ORDER BY e.name NULLS LAST
@@ -880,9 +894,9 @@ class AsyncClient:
             for r in rows
         ]
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Tree reconstruction
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     async def get_tree(
         self,
@@ -899,7 +913,7 @@ class AsyncClient:
         **Edges are intentionally not attached to the returned tree.**
         The result is a node-only subtree walked via ``parent_uuid``.
         Edges (and their series) live alongside nodes in the schema but
-        outside the tree shape — query them separately with
+        outside the tree shape; query them separately with
         :meth:`get_edge` or :meth:`query_edges`.
         """
         if uuid is not None:
@@ -913,15 +927,15 @@ class AsyncClient:
             raise ValidationError("Provide a path or uuid=.")
 
         # One statement for the subtree (the root resolve and the prefix
-        # scan are inlined); with ``include_series`` a second, independent
-        # statement joins the series — both ride ONE pipeline flush.
+        # scan are inlined); with include_series a second, independent
+        # statement joins the series: both ride ONE pipeline flush.
         subtree_on, prefix_params = self._subtree_on("n", joined)
-        subtree_from = f"FROM node r JOIN node n ON {subtree_on}"
+        subtree_from = f"FROM {P}node r JOIN {P}node n ON {subtree_on}"
         params = [*prefix_params, addr_param]
         nodes_sql = f"SELECT n.uuid, n.node_type, n.name, n.data, n.parent_uuid, r.uuid {subtree_from} WHERE {addr}"
         series_sql = (
             f"SELECT s.node_uuid, s.data_type, s.name, s.canonical_unit, s.timeseries_type, s.description "
-            f"{subtree_from} JOIN series s ON s.node_uuid = n.uuid WHERE {addr}"
+            f"{subtree_from} JOIN {P}series s ON s.node_uuid = n.uuid WHERE {addr}"
         )
         async with self._read_conn() as conn:
             if include_series:
@@ -962,16 +976,16 @@ class AsyncClient:
                     node_obj.timeseries = []
                 node_obj.timeseries.append(series)
 
-        # Attach children to their parents (flat pass — uuid-based, order-agnostic).
+        # Attach children to their parents (flat pass, uuid-based, order-agnostic).
         for node_uuid, parent_uuid in parent_map.items():
             if parent_uuid is not None and parent_uuid in nodes:
                 nodes[parent_uuid].add_child(nodes[node_uuid])
 
         return nodes[root_uuid]
 
-    # ------------------------------------------------------------------
-    # Bulk timeseries I/O — manifest DataFrames only
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Bulk timeseries I/O: manifest DataFrames only
+    # -----------------------------------------------------------------------
 
     async def write(
         self,
@@ -999,18 +1013,18 @@ class AsyncClient:
         ``skip_unchanged`` drops rows whose latest stored value is unchanged
         before the insert. ``unchanged_scope`` picks the comparison key:
 
-        * ``"auto"`` (default) — per series, using each series' registered
+        * ``"auto"`` (default): per series, using each series' registered
           type: FLAT compares per ``valid_time``, OVERLAPPING per
           ``(valid_time, knowledge_time)``. One call handles a mixed manifest;
           for a FLAT-only manifest it is identical to ``"valid_time"``.
-        * ``"knowledge_time"`` — that key uniformly.
-        * ``"valid_time"`` — that key uniformly. Raises
+        * ``"knowledge_time"``: that key uniformly.
+        * ``"valid_time"``: that key uniformly. Raises
           :class:`~energydb.errors.UnchangedScopeError` if the manifest
           contains OVERLAPPING series, since it would drop their
           republications.
 
         Series must already be registered (typically via
-        :meth:`register_tree`). Returns a :class:`WriteResult` — an ``int``
+        :meth:`register_tree`). Returns a :class:`WriteResult`, an ``int``
         run_id carrying ``written`` / ``skipped`` counts.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
@@ -1057,29 +1071,35 @@ class AsyncClient:
 
         Routing is chosen from the columns present (exactly one route):
 
-        * ``path`` — node series by materialized path (``Utf8`` joined with ``/``).
-        * ``node_uuid`` / ``edge_uuid`` — series by owner uuid.
-        * ``from_path`` + ``to_path`` + ``edge_type`` — edge series by their
+        * ``path``: node series by materialized path (``Utf8`` joined with ``/``).
+        * ``node_uuid`` / ``edge_uuid``: series by owner uuid.
+        * ``from_path`` + ``to_path`` + ``edge_type``: edge series by their
           endpoint paths and type (all three required together), resolved
           server-side the same way node ``path`` is. Symmetric with the edge
           output columns below, so an edge read's own output can be fed back in
           as a manifest without a UUID-resolution round-trip.
+        * ``edge_name``: optional fourth column on that route, picking one of
+          several *parallel* edges sharing a triple (null = the unnamed edge).
+          A triple matching more than one edge without it raises
+          :class:`~energydb.errors.AmbiguousEdgeError`.
 
         Accepts pandas or polars on input. Output shape:
 
         * ``output="frame"`` (default): a single DataFrame with columns
           ``(path, data_type, name, valid_time, value, …)`` for node-routed
-          reads, or ``(from_path, to_path, edge_type, data_type, name,
-          valid_time, value, …)`` for edge-routed reads. ``path`` /
-          ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``.
+          reads, or ``(from_path, to_path, edge_type, edge_name, data_type,
+          name, valid_time, value, …)`` for edge-routed reads. ``path`` /
+          ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``;
+          ``edge_name`` is the edge's own name, always present and null for
+          unnamed edges.
           Optional columns appear when ``include_knowledge_time`` /
           ``include_updates`` are set.
         * ``output="by_path"``: a ``dict`` keyed by
           :class:`SeriesKey` (node-routed: ``path``, ``data_type``, ``name``)
           or :class:`EdgeSeriesKey` (edge-routed: ``from_path``, ``to_path``,
-          ``edge_type``, ``data_type``, ``name``) with per-series DataFrames
+          ``edge_type``, ``edge_name``, ``data_type``, ``name``) with per-series DataFrames
           carrying only the data columns (``valid_time``, ``value``, plus
-          opt-in time/audit columns). Keys are NamedTuples — positional
+          opt-in time/audit columns). Keys are NamedTuples, so positional
           access (``result[(path, dt, name)]``) and attribute access
           (``key.path``) both work. Each sub-frame is sorted by
           ``valid_time`` ascending; secondary sort keys are
@@ -1096,9 +1116,9 @@ class AsyncClient:
         :class:`~energydb.errors.SeriesNotFoundError` (naming every unresolved
         triple) and the return value is as described above. With ``"skip"``,
         those triples are dropped from the read and the call returns a
-        :class:`ReadResult` — ``(data, missing)`` — so one unregistered series
-        can't cost you a 1,500-series batch, and you still learn which ones were
-        skipped. Only unregistered series are affected: a structurally invalid
+        :class:`ReadResult` of ``(data, missing)``, so one unregistered series
+        can't cost a 1,500-series batch and the skipped triples are still
+        reported. Only unregistered series are affected: a structurally invalid
         manifest (missing/ambiguous routing column, wrong dtype, null routing
         value) raises either way.
         """
@@ -1144,7 +1164,7 @@ class AsyncClient:
         """Bulk relative read via manifest.
 
         See :meth:`read` for the ``output`` / ``backend`` contract, and for
-        ``on_missing`` — which switches the return type to
+        ``on_missing``, which switches the return type to
         :class:`ReadResult` when set to ``"skip"``, exactly as it does there.
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
@@ -1189,15 +1209,15 @@ class AsyncClient:
         """
         data = to_backend(result, backend)
         if on_missing == "skip":
-            # ``missing`` is always a plain frame, never the by_path dict shape,
-            # but ``to_backend`` is typed for the whole read-result union — narrow
-            # it back before it lands on ``ReadResult.missing``.
+            # missing is always a plain frame, never the by_path dict shape,
+            # but to_backend is typed for the whole read-result union, narrow
+            # it back before it lands on ReadResult.missing.
             return ReadResult(data, cast("pl.DataFrame | pd.DataFrame", to_backend(missing, backend)))
         return data
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Runs
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     async def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
         """Return runs that wrote data for a given series_id, latest first."""
@@ -1207,9 +1227,9 @@ class AsyncClient:
         async with self._read_conn() as conn:
             return await runs_mod.get_runs(conn, run_ids)
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Internals
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def _sqlalchemy_url(self) -> str:
         return f"postgresql+psycopg://{self._dsn.split('://', 1)[-1]}"

@@ -12,7 +12,7 @@ These tests pin the behavioral contracts that must survive that collapse:
 * txn-bound scopes read through the transaction's connection and see its
   uncommitted mutations.
 
-Live integration tests — skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
+Live integration tests: skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
 aren't set.
 """
 
@@ -28,7 +28,7 @@ from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping hierarchy-read tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping hierarchy-read tests",
         allow_module_level=True,
     )
 
@@ -183,7 +183,7 @@ def test_query_nodes_within_contracts(populated):
     assert {n.name for n in client.query_nodes(within="P")} == {"P", "S", "T1", "T2"}
     # subtree exists but the filter matches nothing → empty, no error
     assert client.query_nodes(type="Battery", within="P") == []
-    # missing path raises; missing uuid is empty (historical contract)
+    # missing path raises; missing uuid is empty, by contract
     with pytest.raises(ValueError, match="Node not found: nope"):
         client.query_nodes(within="nope")
     assert client.query_nodes(within=uuid4()) == []

@@ -26,8 +26,9 @@ Requirements
 energydb requires:
 
 - Python 3.12 or higher
-- A reachable PostgreSQL database (version 14+) — stores the asset hierarchy,
-  edges, and series catalog
+- A reachable PostgreSQL database (version 15+) — stores the asset hierarchy,
+  edges, and series catalog. 15 is the floor because the edge table's unique
+  key uses ``UNIQUE NULLS NOT DISTINCT``
 - A reachable ClickHouse database — stores all time-series values (via TimeDB)
 
 See :doc:`development` for a one-command Docker stack that boots both.

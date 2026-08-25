@@ -37,7 +37,9 @@ Most time-series systems are agnostic about what their series represent — they
 - ⚖️ **Unit conversion at the boundary:** Declare canonical units once; pint rescales every read and write automatically.
 - 🧹 **Idempotent writes:** `write(..., skip_unchanged=True)` drops rows that only duplicate the latest stored value before insert, so writing the same window repeatedly doesn't bloat storage. The comparison key is chosen *per series* — actuals dedupe per `valid_time`, versioned forecasts per `(valid_time, knowledge_time)` — so a republished forecast is never mistaken for a duplicate. Opt-in; the write still returns its `run_id` (a `WriteResult` carrying `.written` / `.skipped` counts).
 - 🎯 **Partial reads that don't fail:** `read(manifest, on_missing="skip")` returns every series that resolved plus the triples that didn't, so one unregistered series in a 1,500-series manifest costs you that series — not the whole batch.
-- 🧯 **Typed errors:** `NodeNotFoundError`, `SeriesNotFoundError` (carrying every unresolved triple), `ManifestError`, … all under one `EnergyDBError` base — so you branch on types and structured fields instead of matching message text. Every class also subclasses `ValueError`, so broad handlers keep working.
+- 🧯 **Typed errors:** `NodeNotFoundError`, `SeriesNotFoundError` (carrying every unresolved triple), `ManifestError`, … all under one `EnergyDBError` base — so you branch on types and structured fields instead of matching message text. Every raisable class also subclasses `ValueError`, so broad handlers keep working.
+
+- 🏢 **Opt-in multi-tenancy:** `client.namespace("acme")` returns a view of the client bound to one tenant — it shares the pool, stamps every row it writes with that namespace, and (once the host app enables PostgreSQL RLS) sees only that tenant's rows. A client that never calls it behaves exactly as a single-tenant client always has.
 
 ---
 
@@ -55,7 +57,7 @@ Most time-series systems are agnostic about what their series represent — they
 pip install energydb
 ```
 
-Requires Python 3.12+, PostgreSQL (asset hierarchy + series catalog), and ClickHouse (time-series values).
+Requires Python 3.12+, PostgreSQL 15+ (asset hierarchy + series catalog), and ClickHouse (time-series values).
 
 > **Need a local Postgres + ClickHouse?** One command brings both up: `cd local-db && docker compose up -d` (see [`local-db/`](local-db/), or [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup).
 

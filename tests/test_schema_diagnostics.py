@@ -5,7 +5,7 @@ models, so making it a per-``Client`` parameter is a real refactor and out of
 scope. What *is* in scope: when a client connects to a schema that doesn't
 contain the energydb tables (wrong schema, or ``create()`` never ran), the
 failure used to surface as a bare ``relation "node" does not exist`` from inside
-whatever query ran first — naming neither the schema searched, nor the env var
+whatever query ran first, naming neither the schema searched nor the env var
 that controls it, nor the fix.
 
 The exception is now *annotated* (:pep:`678`) rather than wrapped: it stays an
@@ -31,7 +31,7 @@ class _Diag:
 
 
 class _FakeUndefinedTable(psycopg.errors.UndefinedTable):
-    """``UndefinedTable`` with a synthetic ``diag`` — psycopg builds the real one
+    """``UndefinedTable`` with a synthetic ``diag``: psycopg builds the real one
     from a server error field we can't fabricate directly."""
 
     def __init__(self, message_primary: str | None) -> None:
@@ -59,7 +59,7 @@ def test_a_schema_qualified_name_is_reduced_to_the_relation():
 
 
 def test_every_energydb_relation_is_covered():
-    """The four tables plus the ``series_meta`` view — the set the annotation is
+    """The four tables plus the ``series_meta`` view: the set the annotation is
     scoped to, so a host application's own missing tables stay unannotated."""
     assert set(_ENERGYDB_RELATIONS) == {"node", "edge", "series", "runs", "series_meta"}
 
@@ -85,13 +85,13 @@ _MANIFEST = pl.DataFrame({"path": ["P/T1"], "data_type": ["actual"], "name": ["p
 
 @pytest.fixture
 def unprovisioned():
-    """A client whose configured schema exists but holds no energydb tables —
+    """A client whose configured schema exists but holds no energydb tables,
     exactly the state a wrong ``ENERGYDB_SCHEMA`` or a missing ``create()`` puts
     you in."""
     c = Client()
     c.delete()  # drops the schema (named) or energydb's own tables (public)
     if edb.client.SCHEMA is not None:
-        # ``delete()`` dropped the whole schema; recreate it empty so the failure
+        # delete() dropped the whole schema; recreate it empty so the failure
         # is "no tables here", not "no schema here".
         c._portal.run(_create_empty_schema(c))
     yield c
@@ -168,5 +168,5 @@ def test_the_bootstrap_flow_still_works(unprovisioned):
         name="power", canonical_unit="MW", data_type="actual", timeseries_type="FLAT", retention="forever"
     )
 
-    assert unprovisioned.read(_MANIFEST).is_empty()  # registered, no data — no raise
+    assert unprovisioned.read(_MANIFEST).is_empty()  # registered, no data, no raise
     unprovisioned.delete()

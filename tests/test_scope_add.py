@@ -1,6 +1,6 @@
 """Integration tests for ``NodeScope.add(...)``.
 
-Sugar over ``register_tree(under=<scope>)`` — same create-only semantics,
+Sugar over ``register_tree(under=<scope>)``: same create-only semantics,
 returns a :class:`NodeScope` on success or :class:`TreeDiff` for ``dry_run``,
 participates in ``client.transaction()``.
 
@@ -17,7 +17,7 @@ from energydb import Client, NodeScope, TreeDiff
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping NodeScope.add tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping NodeScope.add tests",
         allow_module_level=True,
     )
 
@@ -52,7 +52,7 @@ def test_add_single_child_returns_scope_and_persists(populated):
 
 
 def test_add_returns_scope_pointing_at_new_node(populated):
-    """The returned scope should resolve to the added node — chain-friendly."""
+    """The returned scope should resolve to the added node, and be chain-friendly."""
     turbine = edb.wind.WindTurbine(name="T2", capacity=3.5)
     new = populated.get_node("P", "S").add(turbine)
     fetched = new.get()

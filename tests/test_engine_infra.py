@@ -41,7 +41,7 @@ DSN = "postgresql://app_user:s3cret@db.example.com:6543/proddb"
 
 def test_engine_meta_edge_triple_manifest():
     """A (from_path, to_path, edge_type) manifest yields a set-valued edge_triples
-    predicate with lowercased data_type — the fast-path parity with path routing."""
+    predicate with lowercased data_type, the fast-path parity with path routing."""
     manifest = pl.DataFrame(
         {
             "from_path": ["Grid/A", "Grid/A"],
@@ -81,10 +81,10 @@ def test_engine_meta_edge_triple_falls_back_when_incomplete_or_null():
 def test_engine_meta_node_uuid_object_column_stays_engine_eligible():
     """A ``node_uuid`` column of ``uuid.UUID`` objects is polars dtype ``Object``.
 
-    Regression for two bugs at once: it used to raise (``unique()`` is not
-    supported on ``Object``), and the tempting fix — widening the Utf8 guard to
-    every route — would return ``None`` and silently push every uuid-routed read
-    onto the slow sequential path. Assert we get a real predicate.
+    Regression for two bugs at once: raising (``unique()`` is not supported on
+    ``Object``), and the tempting fix of widening the Utf8 guard to every route,
+    which would return ``None`` and silently push every uuid-routed read onto
+    the slow sequential path. Assert we get a real predicate.
     """
     u1, u2 = uuid.uuid4(), uuid.uuid4()
     manifest = pl.DataFrame({"node_uuid": [u1, u2], "data_type": ["Actual", "actual"], "name": ["power", "power"]})
@@ -94,7 +94,7 @@ def test_engine_meta_node_uuid_object_column_stays_engine_eligible():
     assert meta is not None
     assert meta.node_uuids == (str(u1), str(u2))
     # data_type dedups before lowercasing, so mixed case can repeat a value in the
-    # IN list — harmless for a superset filter, and unchanged by this fix.
+    # IN list: harmless for a superset filter, and unchanged by this fix.
     assert set(meta.data_type) == {"actual"}
     assert meta.name == ("power",)
 
@@ -129,7 +129,7 @@ def test_engine_meta_uuid_route_dedupes_mixed_representations():
 
 def test_engine_meta_uuid_route_with_a_null_returns_none():
     """``null_count()`` is unreliable on ``Object``, so the None scan runs on the
-    materialized list — a null owner is inexpressible either way."""
+    materialized list, a null owner is inexpressible either way."""
     manifest = pl.DataFrame({"node_uuid": [uuid.uuid4(), None], "data_type": ["actual"] * 2, "name": ["power"] * 2})
     assert engine_meta_for_manifest(manifest) is None
 
@@ -142,7 +142,7 @@ def test_engine_meta_path_route_non_utf8_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# The predicate is built lazily — only when the engine is usable (no DB needed)
+# The predicate is built lazily: only when the engine is usable (no DB needed)
 # ---------------------------------------------------------------------------
 
 
@@ -154,14 +154,14 @@ class _FakeClient:
 
 
 async def _resolves_to_nothing() -> None:
-    """An exact resolve that matched no series — short-circuits before any CH call."""
+    """An exact resolve that matched no series, short-circuits before any CH call."""
     return None
 
 
 def test_engine_predicate_is_not_built_when_the_engine_is_unavailable():
     """``ENERGYDB_DISABLE_ENGINE=1`` (and a degraded session) must skip predicate
-    construction entirely — it used to be evaluated eagerly at the call site, so
-    a predicate that raised broke reads the kill-switch was supposed to protect."""
+    construction entirely. Evaluated eagerly at the call site, a predicate that
+    raised would break the very reads the kill-switch is meant to protect."""
     calls = []
 
     def factory():
@@ -179,7 +179,7 @@ def test_engine_predicate_is_not_built_when_the_engine_is_unavailable():
     )
     assert calls == []
     assert n_series == 0
-    # Scope-style ``resolve=`` reads have no manifest, so nothing to report.
+    # Scope-style resolve= reads have no manifest, so nothing to report.
     assert missing.is_empty()
 
 
@@ -223,7 +223,7 @@ def test_engine_ddl_inlines_dsn_creds(monkeypatch):
 
 
 def test_engine_ddl_ch_vantage_host_override(monkeypatch):
-    """ENERGYDB_CH_PG_HOST replaces only the network path — ClickHouse dials PG
+    """ENERGYDB_CH_PG_HOST replaces only the network path, ClickHouse dials PG
     from its own vantage (e.g. the compose network), not the app's."""
     monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
     monkeypatch.setenv("ENERGYDB_CH_PG_HOST", "postgres:5432")
@@ -384,7 +384,7 @@ def _uuid_manifest(node_uuid, *, stringify: bool) -> pl.DataFrame:
 def test_uuid_object_routed_read_takes_the_engine_path(client, monkeypatch):
     """End-to-end: a manifest holding a ``uuid.UUID`` reads correctly *and* over the
     engine. ``get_raw()["uuid"]`` returns a UUID object, so feeding energydb's own
-    output straight back in is the natural thing to do — and is what used to crash."""
+    output straight back in is the natural thing to do."""
     import energydb._io as _io
 
     node_uuid = client.get_node("P", "T1").get_raw()["uuid"]
@@ -402,7 +402,7 @@ def test_uuid_object_routed_read_takes_the_engine_path(client, monkeypatch):
 
     try:
         out_obj = client.read(_uuid_manifest(node_uuid, stringify=False))
-    except Exception as exc:  # noqa: BLE001 -- re-raised below with a diagnosis
+    except Exception as exc:  # noqa: BLE001  (re-raised below with a diagnosis)
         if "POSTGRESQL_CONNECTION_FAILURE" in str(exc):
             pytest.fail(
                 "ClickHouse could not reach PostgreSQL through the meta-engine table, so this "
@@ -468,7 +468,7 @@ def test_unknown_table_is_recognised_from_the_server_text():
 
 def test_the_error_code_alone_is_enough():
     """A server locale or driver version that drops the symbolic name still has
-    the code — the classifier must not hinge on one spelling."""
+    the code, so the classifier must not hinge on one spelling."""
     assert _is_unknown_table(_FakeDatabaseError("Code: 60. DB::Exception: Table x doesn't exist.")) is True
 
 
@@ -509,7 +509,7 @@ def _fail_engine_with(monkeypatch, exc: BaseException):
     """Make only the engine-backed CH read fail, with ``exc`` as the cause.
 
     The sequential path is left intact, so the read under test still returns the
-    correct result — which is what lets these tests assert the log *and* the
+    correct result, which is what lets these tests assert the log *and* the
     fallback in one go.
     """
     import energydb._io as _io
@@ -533,7 +533,7 @@ def _fail_engine_with(monkeypatch, exc: BaseException):
 def test_not_provisioned_logs_one_info_line_without_a_traceback(client, monkeypatch, caplog):
     """**The regression this item exists for.** A deployment that never provisions
     the engine table used to get a scary traceback on its first read of every
-    process, and learned to silence it with ENERGYDB_DISABLE_ENGINE=1 — which then
+    process, and learned to silence it with ENERGYDB_DISABLE_ENGINE=1, which then
     hid real engine failures too."""
     _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
     expected = client.get_node("P").read(data_type="actual", name="power")
@@ -634,7 +634,7 @@ def test_a_named_collection_keeps_the_password_out_of_the_ddl(monkeypatch):
     """The secure path: nothing is inlined, so there is nothing to warn about."""
     monkeypatch.setenv("ENERGYDB_CH_PG_COLLECTION", "pg_energydb")
     assert inlines_pg_password(DSN) is False
-    # And the DDL really does omit it — the property the warning is a proxy for.
+    # And the DDL really does omit it, the property the warning is a proxy for.
     assert "s3cret" not in engine_table_ddl(DSN, "public")
 
 
@@ -646,7 +646,7 @@ def test_a_passwordless_dsn_is_not_worth_warning_about():
 
 
 def test_a_percent_encoded_password_still_counts():
-    """The DSN parser must decode before deciding — an encoded password is still a
+    """The DSN parser must decode before deciding, an encoded password is still a
     password, and it is what lands in the DDL."""
     assert inlines_pg_password("postgresql://u:p%40ss@db.example.com/proddb") is True
 
@@ -662,7 +662,7 @@ def test_provisioning_warns_that_the_password_lands_in_the_ddl(client, caplog):
     message = records[0].getMessage()
     assert "SHOW CREATE TABLE" in message  # names the exposure
     assert "ENERGYDB_CH_PG_COLLECTION" in message  # names the fix
-    # Provisioning still succeeded — this is a warning, not a new requirement.
+    # Provisioning still succeeded: this is a warning, not a new requirement.
     assert _engine_table_exists(client)
     assert client.get_node("P").read(data_type="actual", name="power").height == 2
 
@@ -682,10 +682,10 @@ def test_create_emits_it_too(client, caplog):
 def test_no_warning_when_a_named_collection_is_configured(client, monkeypatch, caplog):
     """The whole point of recommending the collection is that it silences this."""
     monkeypatch.setenv("ENERGYDB_CH_PG_COLLECTION", "pg_energydb_absent")
-    # The collection does not exist on this server, so the DDL fails — but the
+    # The collection does not exist on this server, so the DDL fails, but the
     # warning decision happens first, which is exactly what is under test.
     with caplog.at_level(logging.WARNING, logger="energydb.client"), contextlib.suppress(Exception):
         client.setup_ch_meta_engine()
 
     assert not [r for r in caplog.records if "SHOW CREATE TABLE" in r.getMessage()]
-    # No restore needed: the ``client`` fixture is per-test and re-provisions on setup.
+    # No restore needed: the client fixture is per-test and re-provisions on setup.

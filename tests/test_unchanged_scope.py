@@ -1,4 +1,4 @@
-"""``skip_unchanged`` scope selection — per-series comparison keys.
+"""``skip_unchanged`` scope selection: per-series comparison keys.
 
 ``unchanged_scope`` used to be a per-call flag while OVERLAPPING is a
 per-series property, so a manifest mixing the two could not be written
@@ -22,9 +22,10 @@ import pytest
 from energydb import Client
 from energydb._io import _check_unchanged_scope
 from energydb.errors import UnchangedScopeError, ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import ResolveSummary
 
-# ``missing`` is the on_missing="skip" report; irrelevant to scope selection, so
+# missing is the on_missing="skip" report; irrelevant to scope selection, so
 # these summaries carry the empty frame a fully-resolved manifest produces.
 NOTHING_MISSING = pl.DataFrame(schema={"path": pl.Utf8, "data_type": pl.Utf8, "name": pl.Utf8})
 FLAT_ONLY = ResolveSummary(overlapping_series_ids=frozenset(), missing=NOTHING_MISSING)
@@ -42,7 +43,7 @@ def test_explicit_valid_time_over_overlapping_series_raises():
 
     err = excinfo.value
     assert err.overlapping_series_ids == [7, 9]  # sorted, from the raise site's frozenset
-    # The message must name the count and both ways out — the caller has to be
+    # The message must name the count and both ways out; the caller has to be
     # able to act on it without reading the source.
     assert "2 OVERLAPPING series" in str(err)
     assert '"auto"' in str(err) and '"knowledge_time"' in str(err)
@@ -68,7 +69,7 @@ def test_valid_time_is_fine_for_a_flat_only_manifest():
 
 
 def test_scope_is_not_policed_when_skip_unchanged_is_off():
-    """No comparison happens, so no key can drop anything — don't invent an error."""
+    """No comparison happens, so no key can drop anything, don't invent an error."""
     _check_unchanged_scope(MIXED, skip_unchanged=False, unchanged_scope="valid_time")
 
 
@@ -127,7 +128,9 @@ def _run_ids(client: Client) -> set[int]:
 def _pg_run_count(client: Client) -> int:
     async def _count():
         async with client._async._pool.connection() as conn:
-            row = await (await conn.execute("SELECT count(*) FROM runs")).fetchone()
+            # Schema-qualified like every energydb query: the pool sets no
+            # search_path, so an unqualified name would not resolve here.
+            row = await (await conn.execute(f"SELECT count(*) FROM {P}runs")).fetchone()
             return int(row[0])
 
     return client._portal.run(_count())
@@ -139,7 +142,7 @@ def test_overlapping_republication_survives_the_default_scope(mixed_client):
 
     Both series are re-sent with identical values at a new knowledge_time. Under
     the old uniform ``valid_time`` key every row looked like a duplicate and the
-    forecast republication was dropped — unrecoverable information loss. With
+    forecast republication was dropped: unrecoverable information loss. With
     ``"auto"`` the FLAT rows are still skipped while the OVERLAPPING rows are
     written, and the new vintage is readable at its own knowledge time.
     """
@@ -153,7 +156,7 @@ def test_overlapping_republication_survives_the_default_scope(mixed_client):
     history = mixed_client.read(forecast, include_updates=True, include_knowledge_time=True)
     assert set(history["knowledge_time"].to_list()) == {KT_1, KT_2}
 
-    # The FLAT series really was deduped — one vintage only.
+    # The FLAT series really was deduped: one vintage only.
     actual = pl.DataFrame({"path": ["P/T1"], "data_type": ["actual"], "name": ["power"]})
     flat_history = mixed_client.read(actual, include_updates=True, include_knowledge_time=True)
     assert set(flat_history["knowledge_time"].to_list()) == {KT_1}
@@ -162,7 +165,7 @@ def test_overlapping_republication_survives_the_default_scope(mixed_client):
 @pytestmark_live
 def test_explicit_valid_time_raises_and_writes_nothing(mixed_client):
     """The kt-known path: the folded runs upsert has already committed by the time
-    the scope error is knowable, so it must be compensated — no orphan run row,
+    the scope error is knowable, so it must be compensated, no orphan run row,
     and nothing reaches ClickHouse."""
     manifest = _mixed_manifest()
     mixed_client.write(manifest, knowledge_time=KT_1)
@@ -179,7 +182,7 @@ def test_explicit_valid_time_raises_and_writes_nothing(mixed_client):
 def test_no_orphan_run_row_on_the_knowledge_time_unknown_path(mixed_client):
     """Same no-orphan property on the transactional path. Here the raise is the
     knowledge_time-required error (OVERLAPPING series with no kt), which precedes
-    the commit — so the run row rolls back rather than needing compensation."""
+    the commit, so the run row rolls back rather than needing compensation."""
     manifest = _mixed_manifest()
     runs_before = _pg_run_count(mixed_client)
 
@@ -207,7 +210,7 @@ def test_explicit_knowledge_time_scope_is_accepted(mixed_client):
 @pytestmark_live
 def test_flat_only_manifest_is_unaffected_by_the_new_default(mixed_client):
     """Backwards compatibility: for a FLAT-only manifest ``"auto"`` and
-    ``"valid_time"`` agree exactly — which is every correct caller today."""
+    ``"valid_time"`` agree exactly, which is every correct caller today."""
     flat = _mixed_manifest().filter(pl.col("data_type") == "actual")
     mixed_client.write(flat, knowledge_time=KT_1)
 

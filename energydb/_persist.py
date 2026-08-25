@@ -1,4 +1,4 @@
-"""Write helpers — node/edge inserts, series registration, tree walks.
+"""Write helpers: node/edge inserts, series registration, tree walks.
 
 These helpers all take an open ``conn`` and do **not** commit. The caller
 controls the transaction boundary, which is how ``client.register_tree``
@@ -8,23 +8,25 @@ is structure-only (no timeseries data); manifest data writes go through
 
 Identity is the EDM ``Element.id`` (UUID7). ``register_tree_under`` is
 create-only (it pre-validates that no payload uuid exists) and persists the
-whole structure in three pipelined batches — nodes, edges, series — with
+whole structure in three pipelined batches, nodes, edges, series, with
 materialized paths computed client-side from the DFS walk, so a tree costs
 a handful of round-trips instead of a few per row. Renames, moves, and
 property edits go through the scope mutators on :class:`NodeScope`.
 ``create_edge`` keeps an ``ON CONFLICT`` upsert because it's exposed as
 :meth:`Client.create_edge` and documented as idempotent. Edge endpoints are
-written straight into the FK columns ``from_node_uuid`` / ``to_node_uuid``
-— no path resolution at write time.
+written straight into the FK columns ``from_node_uuid`` / ``to_node_uuid``,
+with no path resolution at write time.
 """
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Literal
 from uuid import UUID
 
 import energydatamodel as edm
 import polars as pl
+import psycopg
 from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
@@ -33,9 +35,45 @@ from uuid6 import uuid7
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.errors import AlreadyExistsError, NodeNotFoundError, ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.serialization import serialize_edge, serialize_node
 from energydb.series import SERIES_INSERT_COLUMNS, prepare_series_row, validate_name
 from energydb.units import compute_unit_factor
+
+# ---------------------------------------------------------------------------
+# Edge uniqueness conflicts
+# ---------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def map_edge_conflict():
+    """Map an ``edge_uniq`` violation to :class:`AlreadyExistsError`.
+
+    ``edge_uniq`` is ``(edge_type, from_node_uuid, to_node_uuid, name)`` with
+    ``NULLS NOT DISTINCT``, so it fires when a *new* edge (or a rename / move
+    of an existing one) lands on a quadruple another edge already occupies,
+    including two unnamed edges on the same endpoint pair and type. Wrap the
+    statement rather than the whole transaction: the caller owns the
+    transaction boundary, and every other integrity error stays untouched.
+
+    PostgreSQL's DETAIL line already names the colliding key, so it is quoted
+    verbatim rather than re-derived; the raise site does not need to know which
+    of the four columns the caller was changing.
+    """
+    try:
+        yield
+    except psycopg.errors.UniqueViolation as exc:
+        diag = getattr(exc, "diag", None)
+        if getattr(diag, "constraint_name", None) != "edge_uniq":
+            raise
+        detail = (getattr(diag, "message_detail", None) or "").strip()
+        collision = f": {detail}" if detail else "."
+        raise AlreadyExistsError(
+            f"An edge with this (edge_type, from_node_uuid, to_node_uuid, name) already exists{collision} "
+            f"Parallel edges between the same endpoints are supported, but each needs a distinct "
+            f"name (an unnamed edge counts as a name of its own, so there can be only one)."
+        ) from exc
+
 
 # ---------------------------------------------------------------------------
 # Node / edge persistence
@@ -51,7 +89,7 @@ async def create_node_raw(
     parent_uuid: UUID | None,
     uuid: UUID | None = None,
 ) -> UUID:
-    """Insert one node from a type slug + ``data`` dict — no EDM object.
+    """Insert one node from a type slug + ``data`` dict, with no EDM object.
 
     Generic, EDM-free counterpart to :func:`create_node`: ``node_type`` is
     stored verbatim and the caller's ``data`` becomes the JSONB blob. Mints a
@@ -67,7 +105,7 @@ async def create_node_raw(
     else:
         parent_row = await (
             await conn.execute(
-                "SELECT path FROM node WHERE uuid = %s",
+                f"SELECT path FROM {P}node WHERE uuid = %s",
                 (parent_uuid,),
             )
         ).fetchone()
@@ -76,7 +114,7 @@ async def create_node_raw(
         path = f"{parent_row[0]}/{name}"
 
     await conn.execute(
-        "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+        f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
         (uuid_val, node_type, name, parent_uuid, path, Jsonb(data or {})),
     )
     return uuid_val
@@ -92,14 +130,17 @@ async def create_edge(
 
     Endpoint UUIDs come from ``edm_obj.from_element`` / ``to_element``
     (:class:`Reference`). When ``tree_root`` is provided, every endpoint
-    UUID must be reachable in ``tree_root``'s :class:`Index` — cross-tree
-    edges are rejected here. Pass ``tree_root=None`` for standalone edges
+    UUID must be reachable in ``tree_root``'s :class:`Index`; cross-tree edges
+    are rejected here. Pass ``tree_root=None`` for standalone edges
     where the caller has already verified endpoint existence.
 
     Identity is ``edm_obj.id``. ``ON CONFLICT (uuid)`` updates the row's
-    payload, name, endpoints, and edge_type (the latter only on insert —
-    PG wouldn't actually let you change it via the unique key, but we let
-    the same-uuid update through cleanly).
+    payload, name, endpoints, and edge_type (the last only on insert: the
+    unique key would not allow changing it, but the same-uuid update passes
+    through cleanly). Identity staying UUID-based is
+    what keeps this upsert unaffected by the multigraph key: a *new* uuid
+    colliding on ``(edge_type, from, to, name)`` raises
+    :class:`~energydb.errors.AlreadyExistsError` asking for a distinct name.
     """
     row_data = serialize_edge(edm_obj)
     uuid_val: UUID = row_data["uuid"]
@@ -109,28 +150,29 @@ async def create_edge(
     from_uuid = _endpoint_uuid(edm_obj, "from_element", tree_root)
     to_uuid = _endpoint_uuid(edm_obj, "to_element", tree_root)
 
-    row = await (
-        await conn.execute(
-            """
-        INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (uuid) DO UPDATE
-          SET name           = EXCLUDED.name,
-              from_node_uuid = EXCLUDED.from_node_uuid,
-              to_node_uuid   = EXCLUDED.to_node_uuid,
-              data           = EXCLUDED.data,
-              updated_at     = now()
-          WHERE edge.edge_type = EXCLUDED.edge_type
-        RETURNING uuid
-        """,
-            (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
-        )
-    ).fetchone()
+    async with map_edge_conflict():
+        row = await (
+            await conn.execute(
+                f"""
+            INSERT INTO {P}edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (uuid) DO UPDATE
+              SET name           = EXCLUDED.name,
+                  from_node_uuid = EXCLUDED.from_node_uuid,
+                  to_node_uuid   = EXCLUDED.to_node_uuid,
+                  data           = EXCLUDED.data,
+                  updated_at     = now()
+              WHERE edge.edge_type = EXCLUDED.edge_type
+            RETURNING uuid
+            """,
+                (uuid_val, row_data["edge_type"], row_data["name"], from_uuid, to_uuid, row_data["data"]),
+            )
+        ).fetchone()
 
     if row is None:
         existing = await (
             await conn.execute(
-                "SELECT edge_type FROM edge WHERE uuid = %s",
+                f"SELECT edge_type FROM {P}edge WHERE uuid = %s",
                 (uuid_val,),
             )
         ).fetchone()
@@ -151,9 +193,9 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     """Pull a ``Reference`` off ``edm_obj.<attr>`` and return its uuid.
 
     When ``tree_root`` is given, the endpoint uuid must resolve against the
-    tree's index — cross-tree edges are rejected. When ``tree_root`` is
+    tree's index; cross-tree edges are rejected. When ``tree_root`` is
     None, only the uuid value is required (caller is responsible for
-    ensuring endpoint existence — typically by having created standalone
+    ensuring endpoint existence, typically by having created standalone
     nodes in a previous call).
     """
     ref = getattr(edm_obj, attr, None)
@@ -175,7 +217,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
 
 
 # ---------------------------------------------------------------------------
-# Structure registration — tree walk
+# Structure registration: tree walk
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +231,7 @@ async def register_tree_under(
     """Walk the EDM tree DFS, insert nodes/edges, register series.
 
     Structure-only. Caller manages the transaction. Raises if any
-    ``TimeSeries`` on the tree has a non-empty df attached — write data
+    ``TimeSeries`` on the tree has a non-empty df attached; write data
     separately via ``client.write(df, ...)``.
 
     Creates only. Raises :class:`ValueError` if any node or edge UUID in
@@ -227,7 +269,7 @@ async def register_tree_under(
         )
 
     # Create-only path: every target row is an insert. No need for an
-    # update/delete branch — the existing-uuid pre-check above raises.
+    # update/delete branch: the existing-uuid pre-check above raises.
     diff = TreeDiff(
         node_changes=[NodeChange(old=None, new=s) for s in target_nodes.values()],
         edge_changes=[EdgeChange(old=None, new=s) for s in target_edges.values()],
@@ -242,7 +284,7 @@ async def register_tree_under(
     # lookup is the graft parent's path (which doubles as its existence check).
     parent_path: str | None = None
     if parent_uuid is not None:
-        parent_row = await (await conn.execute("SELECT path FROM node WHERE uuid = %s", (parent_uuid,))).fetchone()
+        parent_row = await (await conn.execute(f"SELECT path FROM {P}node WHERE uuid = %s", (parent_uuid,))).fetchone()
         if parent_row is None:
             raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
         parent_path = parent_row[0]
@@ -262,7 +304,7 @@ async def register_tree_under(
 
     # Plain INSERTs (no upsert): the create-only pre-check above already
     # guarantees none of these uuids exist. A colliding (parent_uuid, name)
-    # pair still surfaces as the DB uniqueness error, exactly as before.
+    # pair still surfaces as the DB uniqueness error.
     edge_rows: list[tuple] = []
     for snap in target_edges.values():
         if snap.name is not None:
@@ -275,21 +317,24 @@ async def register_tree_under(
 
     # One explicit pipeline around all three batches: every INSERT is queued
     # and the whole structure needs a single network sync, rather than
-    # relying on executemany's per-call internal pipelining.
-    async with conn.pipeline(), conn.cursor() as cur:
+    # relying on executemany's per-call internal pipelining. The conflict
+    # mapping wraps the pipeline, not the edge statement: a pipelined error
+    # surfaces when the pipeline syncs on exit, not at the execute that caused
+    # it. Non-edge_uniq violations propagate untouched.
+    async with map_edge_conflict(), conn.pipeline(), conn.cursor() as cur:
         await cur.executemany(
-            "INSERT INTO node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
+            f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
             node_rows,
         )
         if edge_rows:
             await cur.executemany(
-                "INSERT INTO edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data) "
+                f"INSERT INTO {P}edge (uuid, edge_type, name, from_node_uuid, to_node_uuid, data) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",
                 edge_rows,
             )
         if series_rows:
             await cur.executemany(
-                f"INSERT INTO series ({', '.join(SERIES_INSERT_COLUMNS)}) "
+                f"INSERT INTO {P}series ({', '.join(SERIES_INSERT_COLUMNS)}) "
                 f"VALUES ({', '.join(['%s'] * len(SERIES_INSERT_COLUMNS))})",
                 series_rows,
             )
@@ -352,8 +397,8 @@ def _collect_target_state(
     Returns ``(node_snaps, edge_snaps, node_objs, edge_objs, root_uuid)``.
     ``node_objs`` is in DFS order so iterating it satisfies parent-before-
     child for FK resolution. ``edge_objs`` is filled in a second linear
-    pass over the queued edges, after every node has been seen — that's
-    the only way to validate that edge endpoints aren't cross-tree.
+    pass over the queued edges, after every node has been seen: that is the
+    only way to validate that edge endpoints aren't cross-tree.
     """
     node_snaps: dict[UUID, NodeSnapshot] = {}
     node_objs: dict[UUID, Any] = {}
@@ -414,15 +459,15 @@ def _collect_target_state(
 async def _existing_uuids(conn, node_uuids: list[UUID], edge_uuids: list[UUID]) -> tuple[list[UUID], list[UUID]]:
     """The subsets of the payload's node/edge uuids that already exist.
 
-    One round-trip for both tables (UNION ALL over the two indexed probes) —
+    One round-trip for both tables (UNION ALL over the two indexed probes);
     this is the create-only pre-check on ``register_tree``. Lighter than
     ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids`` when the caller
     only needs to know *whether* the rows exist.
     """
     rows = await (
         await conn.execute(
-            "SELECT 0 AS kind, uuid FROM node WHERE uuid = ANY(%s) "
-            "UNION ALL SELECT 1, uuid FROM edge WHERE uuid = ANY(%s)",
+            f"SELECT 0 AS kind, uuid FROM {P}node WHERE uuid = ANY(%s) "
+            f"UNION ALL SELECT 1, uuid FROM {P}edge WHERE uuid = ANY(%s)",
             (node_uuids, edge_uuids),
         )
     ).fetchall()
@@ -434,7 +479,7 @@ async def _fetch_nodes_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, NodeSnaps
         return {}
     rows = await (
         await conn.execute(
-            "SELECT uuid, node_type, name, parent_uuid, data FROM node WHERE uuid = ANY(%s)",
+            f"SELECT uuid, node_type, name, parent_uuid, data FROM {P}node WHERE uuid = ANY(%s)",
             (uuids,),
         )
     ).fetchall()
@@ -448,7 +493,7 @@ async def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnaps
         return {}
     rows = await (
         await conn.execute(
-            "SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM edge WHERE uuid = ANY(%s)",
+            f"SELECT uuid, edge_type, name, from_node_uuid, to_node_uuid, data FROM {P}edge WHERE uuid = ANY(%s)",
             (uuids,),
         )
     ).fetchall()
@@ -468,7 +513,7 @@ async def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnaps
 def _validate_no_inline_data(edm_obj) -> None:
     """Raise if any node/edge in the tree carries non-empty TimeSeries data.
 
-    ``register_tree()`` is structure-only — every ``TimeSeries`` on
+    ``register_tree()`` is structure-only: every ``TimeSeries`` on
     ``element.timeseries`` must be metadata-only (``df=None``). Data is
     written separately via :meth:`client.write`.
     """
@@ -481,7 +526,7 @@ def _validate_no_inline_data(edm_obj) -> None:
                 raise ValidationError(
                     f"register_tree() received {obj_name!r} with inline timeseries data "
                     f"(name={ts.name!r}, rows={ts.df.height}). register_tree() is "
-                    f"structure-only — write data separately with client.write(df)."
+                    f"structure-only: write data separately with client.write(df)."
                 )
         for child in obj.children():
             _check(child)

@@ -3,18 +3,19 @@ timedb read result.
 
 Polars-native. Path data rides along on the resolve-step meta frame (one
 PG round-trip already paid by the resolve), so the attach step is pure
-Python — no extra PG calls.
+Python, with no extra PG calls.
 
 Output column contract:
 
 * Node-routed reads: ``path: Utf8`` (joined with ``/``), plus ``data_type``
   and ``name`` carried through from the manifest.
 * Edge-routed reads: ``from_path: Utf8``, ``to_path: Utf8``, ``edge_type``,
-  plus ``data_type`` / ``name``.
+  ``edge_name`` (the edge's own name, null for an unnamed edge; it is what
+  tells parallel edges apart), plus ``data_type`` / ``name``.
 
 Internal identifiers (``series_id``, ``node_uuid``, ``edge_uuid``,
-``node_type``, etc.) are NOT exposed on the result — callers identify
-series by ``(path, data_type, name)`` (or edge equivalent).
+``node_type``, etc.) are NOT exposed on the result; callers identify series
+by ``(path, data_type, name)`` (or edge equivalent).
 """
 
 from __future__ import annotations
@@ -40,14 +41,24 @@ class SeriesKey(NamedTuple):
 class EdgeSeriesKey(NamedTuple):
     """Typed key for edge-routed ``output="by_path"`` result dicts.
 
-    Tuple-compatible. Holds the 5-element identity of an edge-attached
-    series — both endpoint paths, the edge type, and the series's own
-    ``(data_type, name)`` pair.
+    Tuple-compatible. Holds the 6-element identity of an edge-attached
+    series, both endpoint paths, the edge type, the edge's own ``name``
+    (``None`` for an unnamed edge), and the series's own ``(data_type,
+    name)`` pair.
+
+    ``edge_name`` sits fourth, next to ``edge_type``, so the key reads as
+    edge-identity-then-series-identity. It is what keeps two parallel
+    circuits' series apart: without it they would collide on one key.
+
+    .. versionchanged:: 0.11.0
+       Gained ``edge_name`` (5 → 6 fields). Positional unpackers of the old
+       5-tuple break loudly; keyword/attribute access is unaffected.
     """
 
     from_path: str
     to_path: str
     edge_type: str
+    edge_name: str | None
     data_type: str
     name: str
 
@@ -76,7 +87,7 @@ def attach_node_hierarchy(client, result: pl.DataFrame, meta: pl.DataFrame) -> p
     """Attach ``path`` (Utf8) to a node-routed read result.
 
     *meta* carries ``(series_id, path, data_type, name)`` from the resolve
-    step — ``path`` rode along on the JOIN that resolved series, so no
+    step, ``path`` rode along on the JOIN that resolved series, so no
     extra PG round-trip is needed. ``data_type`` / ``name`` are preserved
     on every row; ``series_id`` is dropped from the public result.
 
@@ -92,21 +103,24 @@ def attach_node_hierarchy(client, result: pl.DataFrame, meta: pl.DataFrame) -> p
 
 
 def attach_edge_hierarchy(client, result: pl.DataFrame, meta: pl.DataFrame) -> pl.DataFrame:
-    """Attach ``from_path``, ``to_path``, ``edge_type`` to an edge-routed result.
+    """Attach ``from_path``, ``to_path``, ``edge_type``, ``edge_name`` to an edge-routed result.
 
-    *meta* carries the endpoint paths and edge type from the resolve step's
-    JOIN through edge → from/to nodes, so no extra PG fetch is needed.
-    ``data_type`` / ``name`` are preserved from the manifest.
-    ``series_id``, ``edge_uuid``, and the edge's own ``name`` (intentionally
-    distinct from series ``name``) are dropped from the public result.
+    *meta* carries the endpoint paths, edge type and edge name from the
+    resolve step's JOIN through edge → from/to nodes, so no extra PG fetch is
+    needed. ``data_type`` / ``name`` are preserved from the manifest.
+    ``series_id`` and ``edge_uuid`` are dropped from the public result.
+
+    The edge's own name surfaces as ``edge_name`` (never as ``name``, which
+    stays the series name): two parallel circuits are otherwise
+    indistinguishable rows.
     """
     del client  # no PG round-trip needed; endpoint paths ride on meta
     if result.is_empty() or meta.is_empty():
         return result
 
-    sid_lookup = meta.select(["series_id", "from_path", "to_path", "edge_type", "data_type", "name"]).unique(
-        subset=["series_id"]
-    )
+    sid_lookup = meta.select(
+        ["series_id", "from_path", "to_path", "edge_type", "edge_name", "data_type", "name"]
+    ).unique(subset=["series_id"])
     return result.join(sid_lookup, on="series_id", how="left").drop("series_id")
 
 
@@ -120,15 +134,15 @@ def partition_node_by_path(client, result: pl.DataFrame, meta: pl.DataFrame) -> 
 
     Skips the per-row broadcast that ``attach_node_hierarchy`` does. Each
     sub-frame carries only the CH data columns (``valid_time``, ``value``,
-    plus opt-in time/audit columns) — ``series_id`` is dropped, and
+    plus opt-in time/audit columns), ``series_id`` is dropped, and
     ``path`` / ``data_type`` / ``name`` live in the key, not the row.
 
-    Keys are :class:`SeriesKey` NamedTuples — tuple-compatible for
+    Keys are :class:`SeriesKey` NamedTuples: tuple-compatible for
     backwards-compat positional access, plus attribute access
     (``key.path``, ``key.data_type``, ``key.name``).
 
     Series that appear in the manifest but for which CH returned no rows
-    get an empty sub-frame with the documented schema — callers can index
+    get an empty sub-frame with the documented schema, callers can index
     by key without ``KeyError``.
     """
     del client  # no PG round-trip needed; path rides on meta
@@ -149,8 +163,10 @@ def partition_edge_by_path(client, result: pl.DataFrame, meta: pl.DataFrame) -> 
     """Partition an edge-routed CH result into ``{EdgeSeriesKey: df}``.
 
     Same shape as :func:`partition_node_by_path` for the data side; the key
-    is :class:`EdgeSeriesKey`, extended with the edge endpoint paths and
-    ``edge_type``. Tuple-compatible for backwards-compat positional access.
+    is :class:`EdgeSeriesKey`, extended with the edge endpoint paths,
+    ``edge_type`` and ``edge_name``. ``edge_name`` is part of the key
+    precisely so parallel edges' series land in separate entries instead of
+    silently overwriting one another.
     """
     del client  # no PG round-trip needed; endpoint paths ride on meta
     if meta.is_empty():
@@ -167,6 +183,7 @@ def partition_edge_by_path(client, result: pl.DataFrame, meta: pl.DataFrame) -> 
             from_path,
             to_path,
             edge_type,
+            row.get("edge_name"),
             row["data_type"],
             row["name"],
         )
@@ -185,7 +202,7 @@ def _build_partition[KeyT: tuple](
     in ``sid_to_key`` that have no rows in ``result`` get an empty
     sub-frame with the CH-side data schema (minus ``series_id``).
 
-    Generic over the key type — ``KeyT`` is bound to ``tuple`` so both
+    Generic over the key type: ``KeyT`` is bound to ``tuple`` so both
     :class:`SeriesKey` and :class:`EdgeSeriesKey` (NamedTuples) are
     accepted and the return type carries through.
     """

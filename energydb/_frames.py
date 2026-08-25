@@ -3,7 +3,7 @@
 Public ``Client`` and scope methods accept either pandas or polars
 on input and return polars by default (``backend="polars"``). The internal
 manifest pipeline (``_io``, ``_join``, ``paths``, ``series``) is polars
-throughout — these helpers are the only conversion points.
+throughout, so these helpers are the only conversion points.
 """
 
 from __future__ import annotations
@@ -49,8 +49,8 @@ def to_backend(
         return result
     if backend == "pandas":
         if isinstance(result, dict):
-            # ty narrows the dict's value type to ``object`` after the isinstance,
-            # so cast explicitly back to ``pl.DataFrame`` — no runtime cost.
+            # ty narrows the dict's value type to object after the isinstance,
+            # so cast explicitly back to pl.DataFrame, at no runtime cost.
             d = cast(dict[SeriesKey | EdgeSeriesKey, pl.DataFrame], result)
             # dict invariance: the runtime dict carries a single key type per call
             # (driven by the routing column), but statically the union has to be

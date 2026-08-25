@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 from uuid6 import uuid7
 
 from energydb.errors import ValidationError
+from energydb.models import SQL_SCHEMA_PREFIX as P
 
 
 class RunRow(NamedTuple):
@@ -33,7 +34,7 @@ class RunRow(NamedTuple):
 
 # INSERT … ON CONFLICT body, shared by the standalone upsert and the foldable
 # CTE. Idempotent under retry; immutable run identity keyed by run_id.
-_RUN_UPSERT_BODY = """INSERT INTO runs
+_RUN_UPSERT_BODY = f"""INSERT INTO {P}runs
             (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (run_id) DO UPDATE SET
@@ -63,7 +64,7 @@ def run_upsert_cte(run: RunRow) -> tuple[str, tuple]:
     """A data-modifying CTE that upserts ``run``, to prepend to another query.
 
     Postgres executes a ``WITH … AS (INSERT …)`` exactly once, even when the
-    main query never references it — so the run is recorded regardless of what
+    main query never references it, so the run is recorded regardless of what
     the folded SELECT returns (preserves "an all-skipped write still records a
     run"). Returns ``(cte_sql, params)``; the params bind before the rest."""
     return f"WITH run_ins AS (\n        {_RUN_UPSERT_BODY}\n    )\n", _run_params(run)
@@ -108,10 +109,10 @@ async def get_runs(conn, run_ids: list[int]) -> list[dict[str, Any]]:
         return []
     rows = await (
         await conn.execute(
-            """
+            f"""
             SELECT run_id, workflow_id, model_name, run_start_time, run_finish_time,
                    run_params, inserted_at
-            FROM runs
+            FROM {P}runs
             WHERE run_id = ANY(%s)
             ORDER BY inserted_at DESC
             """,

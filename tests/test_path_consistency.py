@@ -5,24 +5,24 @@ the edge cases that are most likely to surface drift between the
 authoritative adjacency list (``parent_uuid``) and the denormalized
 ``path`` mirror:
 
-* Prefix-name collisions — names where one is a string prefix of another
+* Prefix-name collisions: names where one is a string prefix of another
   (``A`` vs ``AB``) stress the ``substring`` arithmetic and the
   ``LIKE old_path || '/%%'`` pattern in :meth:`NodeScope.rename` /
   :meth:`NodeScope.move_to`. A wrong predicate would silently corrupt the
   sibling subtree.
-* Deep trees (5+ levels) — verifies the single-UPDATE subtree rewrite
+* Deep trees (5+ levels): verifies the single-UPDATE subtree rewrite
   propagates through more than a couple of levels.
-* Multi-tree isolation — operations on one root must leave every row of
+* Multi-tree isolation: operations on one root must leave every row of
   every other top-level tree byte-identical, including ``updated_at``.
-* parent_uuid ↔ path invariant — after any mixed sequence of inserts,
+* parent_uuid ↔ path invariant: after any mixed sequence of inserts,
   renames, moves, ``add()``-s, and deletes, every row's ``path`` must
   still equal the chain of names walked via ``parent_uuid`` from a root.
-* Transactions — path updates participate in the PG transaction
+* Transactions: path updates participate in the PG transaction
   (rollback restores them) and are visible to subsequent operations
   inside the same txn (the next ``register_tree`` / ``get_node`` on the
   same connection sees the new ``path``).
 
-Live integration tests — skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
+Live integration tests: skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
 aren't set.
 """
 
@@ -40,7 +40,7 @@ from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping path-consistency tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping path-consistency tests",
         allow_module_level=True,
     )
 
@@ -262,7 +262,7 @@ def test_deep_prefix_rename_only_touches_intended_subtree(client):
 def _chain(depth: int) -> Any:
     """Build a linear chain ``L0 → L1 → … → L{depth-1}`` of Sites.
 
-    Wrapping ``Site`` for every non-leaf, ``WindTurbine`` for the leaf —
+    Wrapping ``Site`` for every non-leaf, ``WindTurbine`` for the leaf,
     keeps the schema valid without changing the path semantics.
     """
     assert depth >= 2
@@ -274,7 +274,7 @@ def _chain(depth: int) -> Any:
 
 
 def test_deep_tree_create_sets_full_path(client):
-    """Six-level chain — every level's path is the slash-join of its ancestors."""
+    """Six-level chain, every level's path is the slash-join of its ancestors."""
     client.register_tree(_chain(6))
     by_path = _by_path(_assert_invariant())
     for i in range(6):
@@ -483,7 +483,7 @@ def test_rename_visible_within_txn_before_commit(client):
     )
     with client.transaction() as txn:
         txn.get_node("P", "S").rename("S2")
-        # Resolve via the *new* path — only works if path was rewritten on the
+        # Resolve via the new path: only works if path was rewritten on the
         # txn's connection. .get() forces a SELECT against the open txn.
         assert txn.get_node("P", "S2", "T1").get().name == "T1"
         with pytest.raises(ValueError):
@@ -496,7 +496,7 @@ def test_rename_visible_within_txn_before_commit(client):
 
 
 def test_rename_rolled_back_on_exception_restores_paths(client):
-    """Rename inside a txn that exits via exception is rolled back — paths revert."""
+    """Rename inside a txn that exits via exception is rolled back, paths revert."""
     client.register_tree(
         edb.Portfolio(
             name="P",
@@ -544,7 +544,7 @@ def test_move_inside_txn_committed_atomically(client):
 
 def test_rename_then_add_child_inside_txn_uses_new_parent_path(client):
     """``add()`` inside a txn following a ``rename`` materializes the child's
-    path against the *renamed* parent — proves the create_node SELECT sees
+    path against the *renamed* parent, proves the create_node SELECT sees
     the txn's own write."""
     client.register_tree(edb.Portfolio(name="P", members=[edb.Site(name="S")]))
     with client.transaction() as txn:

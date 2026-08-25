@@ -1,7 +1,7 @@
 """Namespace-view tests.
 
 The view mechanics (clone semantics, lifecycle guards, repr) are pure
-Python — no database needed. ``TimeDBClient`` is stubbed so constructing
+Python, with no database needed. ``TimeDBClient`` is stubbed so constructing
 an :class:`AsyncClient` doesn't dial ClickHouse, and the pool is never
 opened. The GUC round-trip test at the bottom is gated on the live-DB
 env var, same as the integration suite.
@@ -148,7 +148,7 @@ def test_conn_binds_transaction_local_guc(monkeypatch: pytest.MonkeyPatch) -> No
             async with view._conn() as conn:
                 row = await (await conn.execute("SELECT current_setting('energydb.namespace', true)")).fetchone()
                 assert row is not None and row[0] == "ns-guc-test"
-            # A fresh checkout on the ROOT client must not see the value —
+            # A fresh checkout on the ROOT client must not see the value,
             # set_config(..., is_local := true) dies with the transaction.
             # For a custom GUC the post-transaction reading is NULL (never
             # defined on this connection) or '' (defined once, reset value);

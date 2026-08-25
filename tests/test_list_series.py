@@ -1,11 +1,11 @@
-"""``AsyncClient.list_series`` — the series catalog for one owner.
+"""``AsyncClient.list_series``: the series catalog for one owner.
 
 The method had no coverage; this file is it. The behaviour under test that is
 actually new is ``series_id`` in each row, which makes ``list_series`` the
 reverse lookup from ``(owner, data_type, name)`` to the timedb handle. That
 identifier is an *input* to timedb reads and is *returned* by
-``register_series`` — it is not secret. Read **results** still never carry it,
-and ``test_output_modes.py`` is what pins that.
+``register_series``, so it is not secret. Read **results** still never carry
+it, and ``test_output_modes.py`` is what pins that.
 
 Skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are not set.
 """
@@ -86,8 +86,8 @@ def test_every_row_carries_its_own_id_in_catalog_order(client):
 
 def test_edge_owned_series_get_the_id_too(client):
     """``owner_col="edge_uuid"`` is the other half of the catalog and shares the
-    SELECT, but assert it — an edge-owned series is registered through a different
-    scope class."""
+    SELECT, but assert it anyway: an edge-owned series is registered through a
+    different scope class."""
     bus_a, bus_b = edb.grid.JunctionPoint(name="BusA"), edb.grid.JunctionPoint(name="BusB")
     client.register_tree(edb.Portfolio(name="Grid", members=[bus_a, bus_b]))
     line = edb.grid.Line(name="L1", capacity=500, from_element=Reference(bus_a), to_element=Reference(bus_b))

@@ -18,9 +18,10 @@ import pytest
 from energydatamodel.reference import Reference
 from energydb import Client
 from energydb.client import AsyncClient
+from energydb.models import SQL_SCHEMA_PREFIX as P
 
 # ---------------------------------------------------------------------------
-# Unit tests — mocked pool / td
+# Unit tests: mocked pool / td
 # ---------------------------------------------------------------------------
 
 
@@ -42,7 +43,8 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
     dispatch cursors per-SQL (e.g. path resolution vs existence checks).
 
     ``conn.cursor()`` is an async context manager yielding a cursor whose
-    ``executemany`` is awaitable — the batched ``register_tree`` insert path.
+    ``executemany`` is awaitable, as the batched ``register_tree`` insert
+    path needs.
     The cursor is exposed as ``conn._batch_cursor`` for assertions.
     """
     conn = MagicMock()
@@ -67,13 +69,21 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
     return conn
 
 
+def _target_table(sql: str) -> str:
+    """The relation an ``INSERT INTO`` targets, schema prefix stripped.
+
+    energydb's SQL is schema-qualified, so the target reads ``energydb.node``
+    under ``ENERGYDB_SCHEMA=energydb`` and plain ``node`` by default. These
+    assertions are about *which* table, not how it is spelled."""
+    return sql.split("INSERT INTO ")[1].split(" ")[0].removeprefix(P)
+
+
 def _batches(conn: MagicMock) -> dict[str, list[tuple]]:
     """The rows passed to each batched INSERT, keyed by target table."""
     out: dict[str, list[tuple]] = {}
     for call in conn._batch_cursor.executemany.call_args_list:
         sql, rows = call.args
-        table = sql.split("INSERT INTO ")[1].split(" ")[0]
-        out[table] = list(rows)
+        out[_target_table(sql)] = list(rows)
     return out
 
 
@@ -256,11 +266,11 @@ class TestRegisterTree:
                 # resolve_node_uuid materialized-path lookup uses fetchone.
                 res.fetchone = AsyncMock(return_value=(parent_uuid,))
                 res.fetchall = AsyncMock(return_value=[])
-            elif "SELECT path FROM node WHERE uuid" in sql:
+            elif f"SELECT path FROM {P}node WHERE uuid" in sql:
                 res.fetchone = AsyncMock(return_value=("Region/Site",))
                 res.fetchall = AsyncMock(return_value=[])
             else:
-                # New target uuids — not yet in DB (existence pre-check).
+                # New target uuids: not yet in DB (existence pre-check).
                 res.fetchone = AsyncMock(return_value=None)
                 res.fetchall = AsyncMock(return_value=[])
             return res
@@ -293,7 +303,7 @@ class TestTwoPassWalk:
         assert [(r[0], r[2], r[3], r[4]) for r in batches["edge"]] == [(line.id, "L1", bus_a.id, bus_b.id)]
         # nodes are inserted before edges (FK on the endpoints)
         calls = conn._batch_cursor.executemany.call_args_list
-        tables = [c.args[0].split("INSERT INTO ")[1].split(" ")[0] for c in calls]
+        tables = [_target_table(c.args[0]) for c in calls]
         assert tables.index("node") < tables.index("edge")
 
 
@@ -489,7 +499,7 @@ def test_live_edge_triple_manifest_read_matches_uuid(live_edb):
     key = next(iter(kp_triple))
     assert (key.from_path, key.to_path, key.edge_type) == ("Grid/BusA", "Grid/BusB", "Line")
 
-    # get_raw is the light uuid fetch — no EDM reconstruction.
+    # get_raw is the light uuid fetch: no EDM reconstruction.
     raw = live_edb.get_edge("Grid/BusA", "Grid/BusB", type="Line").get_raw()
     assert str(raw["uuid"]) == str(edge_uuid)
     assert raw["edge_type"] == "Line"
@@ -618,6 +628,6 @@ def test_live_edge_triple_read_matches_uuid_read(live_edb):
     by_triple = live_edb.get_edge("Grid2/BusX", "Grid2/BusY", type="Line").read(data_type="actual", name="power_flow")
     assert by_uuid.equals(by_triple)
 
-    # Missing edge under triple addressing raises (same contract as before the collapse).
+    # Missing edge under triple addressing raises, matching uuid addressing.
     with pytest.raises(ValueError, match="Edge not found"):
         live_edb.get_edge("Grid2/BusX", "Grid2/BusY", type="nonexistent").read(data_type="actual", name="power_flow")
