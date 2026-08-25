@@ -40,10 +40,6 @@ from energydb.serialization import serialize_edge, serialize_node
 from energydb.series import SERIES_INSERT_COLUMNS, prepare_series_row, validate_name
 from energydb.units import compute_unit_factor
 
-# ---------------------------------------------------------------------------
-# Edge uniqueness conflicts
-# ---------------------------------------------------------------------------
-
 
 @contextlib.asynccontextmanager
 async def map_edge_conflict():
@@ -73,11 +69,6 @@ async def map_edge_conflict():
             f"Parallel edges between the same endpoints are supported, but each needs a distinct "
             f"name (an unnamed edge counts as a name of its own, so there can be only one)."
         ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Node / edge persistence
-# ---------------------------------------------------------------------------
 
 
 async def create_node_raw(
@@ -216,11 +207,6 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     return uuid_val
 
 
-# ---------------------------------------------------------------------------
-# Structure registration: tree walk
-# ---------------------------------------------------------------------------
-
-
 async def register_tree_under(
     conn,
     edm_obj,
@@ -268,8 +254,6 @@ async def register_tree_under(
             f"or batch them with client.transaction()."
         )
 
-    # Create-only path: every target row is an insert. No need for an
-    # update/delete branch: the existing-uuid pre-check above raises.
     diff = TreeDiff(
         node_changes=[NodeChange(old=None, new=s) for s in target_nodes.values()],
         edge_changes=[EdgeChange(old=None, new=s) for s in target_edges.values()],
@@ -278,10 +262,8 @@ async def register_tree_under(
     if dry_run:
         return root_uuid, diff
 
-    # Batched persistence: the whole structure goes to PG in three pipelined
-    # statements (nodes, edges, series) instead of a few round-trips per row.
-    # Paths are materialized client-side from the DFS walk; the only per-tree
-    # lookup is the graft parent's path (which doubles as its existence check).
+    # Paths are materialized client-side from the DFS walk, so the only per-tree
+    # lookup is the graft parent's path, which doubles as its existence check.
     parent_path: str | None = None
     if parent_uuid is not None:
         parent_row = await (await conn.execute(f"SELECT path FROM {P}node WHERE uuid = %s", (parent_uuid,))).fetchone()
@@ -302,9 +284,8 @@ async def register_tree_under(
         paths[uid] = path
         node_rows.append((uid, snap.node_type, snap.name, snap.parent_uuid, path, Jsonb(snap.data)))
 
-    # Plain INSERTs (no upsert): the create-only pre-check above already
-    # guarantees none of these uuids exist. A colliding (parent_uuid, name)
-    # pair still surfaces as the DB uniqueness error.
+    # Plain INSERTs are safe because the create-only pre-check above guarantees
+    # none of these uuids exist. A colliding (parent_uuid, name) still raises.
     edge_rows: list[tuple] = []
     for snap in target_edges.values():
         if snap.name is not None:
@@ -315,11 +296,8 @@ async def register_tree_under(
 
     series_rows = _collect_series_rows(node_objs, edge_objs)
 
-    # One explicit pipeline around all three batches: every INSERT is queued
-    # and the whole structure needs a single network sync, rather than
-    # relying on executemany's per-call internal pipelining. The conflict
-    # mapping wraps the pipeline, not the edge statement: a pipelined error
-    # surfaces when the pipeline syncs on exit, not at the execute that caused
+    # The conflict mapping wraps the pipeline, not the edge statement: a
+    # pipelined error surfaces at sync-on-exit, not at the execute that caused
     # it. Non-edge_uniq violations propagate untouched.
     async with map_edge_conflict(), conn.pipeline(), conn.cursor() as cur:
         await cur.executemany(
@@ -375,11 +353,6 @@ def _collect_series_rows(node_objs: dict[UUID, Any], edge_objs: dict[UUID, Any])
                         f"retention={prev[_S_RET]!r} vs {row[_S_RET]!r}."
                     )
     return list(rows.values())
-
-
-# ---------------------------------------------------------------------------
-# Collect target state from the EDM tree
-# ---------------------------------------------------------------------------
 
 
 def _collect_target_state(
@@ -449,11 +422,6 @@ def _collect_target_state(
         edge_objs[child.id] = child
 
     return node_snaps, edge_snaps, node_objs, edge_objs, edm_obj.id
-
-
-# ---------------------------------------------------------------------------
-# Fetch current DB state
-# ---------------------------------------------------------------------------
 
 
 async def _existing_uuids(conn, node_uuids: list[UUID], edge_uuids: list[UUID]) -> tuple[list[UUID], list[UUID]]:
@@ -534,11 +502,6 @@ def _validate_no_inline_data(edm_obj) -> None:
     _check(edm_obj)
 
 
-# ---------------------------------------------------------------------------
-# Series registration
-# ---------------------------------------------------------------------------
-
-
 async def _register_descriptors(
     conn,
     *,
@@ -588,11 +551,6 @@ async def _register_one(
 ) -> int:
     """Register one series row using ``series_mod.register_series``."""
     return await series_mod.register_series(conn, owner_col=owner_col, owner_uuid=owner_uuid, **_ts_register_args(ts))
-
-
-# ---------------------------------------------------------------------------
-# Manifest unit conversion (used by the write pipeline)
-# ---------------------------------------------------------------------------
 
 
 def apply_manifest_unit_conversion(resolved: pl.DataFrame) -> pl.DataFrame:

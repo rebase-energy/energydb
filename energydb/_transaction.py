@@ -55,9 +55,9 @@ class Transaction:
         return f"Transaction({state}, {len(self._node_changes)} node + {len(self._edge_changes)} edge changes pending)"
 
     async def __aenter__(self) -> Transaction:
-        # Borrow via the client's checkout point: on a namespaced view this
-        # binds the transaction-local namespace GUC, which covers the whole
-        # batch because the txn commits exactly once (at .commit()).
+        # Borrowing through the client's checkout point binds the
+        # transaction-local namespace GUC, which covers the whole batch because
+        # the txn commits exactly once.
         self._pool_cm = self._client._conn()
         self._conn = await self._pool_cm.__aenter__()
         return self
@@ -66,11 +66,9 @@ class Transaction:
         assert self._conn is not None and self._pool_cm is not None
         try:
             if exc_type is not None:
-                # User code raised: rollback and let the exception propagate.
                 await self._conn.rollback()
                 return False
             if not self._committed:
-                # Clean exit without commit: rollback and raise loudly.
                 await self._conn.rollback()
                 raise RuntimeError(
                     "Transaction exited without .commit(); changes rolled back. "
@@ -79,10 +77,6 @@ class Transaction:
             return False
         finally:
             await self._pool_cm.__aexit__(exc_type, exc, tb)
-
-    # -----------------------------------------------------------------------
-    # Scope factories: mirror Client surface, scopes bound to this txn.
-    # -----------------------------------------------------------------------
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`~energydb.NodeScope` bound to this transaction.
@@ -139,19 +133,11 @@ class Transaction:
         self._edge_changes.extend(diff.edge_changes)
         return root_uuid
 
-    # -----------------------------------------------------------------------
-    # Internal recording: called by scope mutators.
-    # -----------------------------------------------------------------------
-
     def _record_node(self, old, new) -> None:
         self._node_changes.append(NodeChange(old=old, new=new))
 
     def _record_edge(self, old, new) -> None:
         self._edge_changes.append(EdgeChange(old=old, new=new))
-
-    # -----------------------------------------------------------------------
-    # Preview + commit
-    # -----------------------------------------------------------------------
 
     def preview(self) -> TreeDiff:
         """Return a :class:`TreeDiff` aggregating every change so far.

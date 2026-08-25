@@ -35,11 +35,6 @@ class EnergyDBError(Exception):
     """Base class for every exception energydb raises deliberately."""
 
 
-# ---------------------------------------------------------------------------
-# Not found: an addressed entity does not exist
-# ---------------------------------------------------------------------------
-
-
 class NotFoundError(EnergyDBError, ValueError):
     """An addressed entity does not exist."""
 
@@ -108,15 +103,9 @@ class SeriesNotFoundError(NotFoundError):
     ):
         super().__init__(message)
         self.route = route
-        # Sequence on the way in (list is invariant, so a caller's
-        # list[tuple[str, str, str]] would not be assignable); normalized to
-        # a list on the way out so consumers get one predictable type.
+        # Sequence in because list is invariant; list out so consumers get one
+        # predictable type.
         self.missing: list[tuple[str, ...]] | None = None if missing is None else list(missing)
-
-
-# ---------------------------------------------------------------------------
-# Conflict / validation / configuration
-# ---------------------------------------------------------------------------
 
 
 class AlreadyExistsError(EnergyDBError, ValueError):
@@ -174,8 +163,6 @@ class AmbiguousEdgeError(ValidationError):
         self.from_path = from_path
         self.to_path = to_path
         self.edge_type = edge_type
-        # Normalized to a list of plain dicts on the way out, mirroring
-        # SeriesNotFoundError.missing: one predictable type for consumers.
         self.matches: list[dict[str, Any]] | None = None if matches is None else [dict(m) for m in matches]
 
 
@@ -191,8 +178,8 @@ class UnchangedScopeError(ValidationError):
 
     def __init__(self, message: str, *, overlapping_series_ids: Collection[int] | None = None):
         super().__init__(message)
-        # Sorted list on the way out: the raise site holds a frozenset, and an
-        # unordered attribute makes for miserable assertions and log lines.
+        # Sorted, because the raise site holds a frozenset and an unordered
+        # attribute makes assertions and log lines unstable.
         self.overlapping_series_ids: list[int] | None = (
             None if overlapping_series_ids is None else sorted(overlapping_series_ids)
         )

@@ -26,29 +26,17 @@ from sqlalchemy.orm import DeclarativeBase
 
 from energydb._ch_meta_engine import series_meta_view_ddl
 
-# Schema is configurable at import time via ENERGYDB_SCHEMA (default
-# "public"). The default co-locates EnergyDB's tables with a host
-# application's tables in public; a named schema isolates them. SCHEMA
-# is None for "public" so the ORM tables carry no explicit schema, identical
-# to unqualified host tables, which keeps Alembic autogenerate from churning
-# on a redundant schema="public" qualifier.
+# None for "public" so the ORM tables carry no explicit schema, which keeps
+# Alembic autogenerate from churning on a redundant schema="public" qualifier.
 _SCHEMA_ENV = os.environ.get("ENERGYDB_SCHEMA", "public")
 SCHEMA: str | None = None if _SCHEMA_ENV == "public" else _SCHEMA_ENV
 
-# Prefix for every raw-SQL relation reference, written as
-# f"SELECT ... FROM {SQL_SCHEMA_PREFIX}node", so names resolve from the SQL
-# text and energydb never sets, needs, or reads the connection's search path.
-# That is what keeps it correct behind a transaction-mode pooler (PgBouncer,
-# Neon pooled endpoints), where per-connection session state is not the
-# client's to rely on.
-#
-# Empty for the default schema, so unqualified names resolve through the
-# *server-side* default ("$user", public), exactly like the host application's
-# own unqualified tables.
-#
-# SCHEMA goes in unquoted, matching the repo-wide convention
-# (CREATE SCHEMA IF NOT EXISTS {SCHEMA}, _fk); lowercase simple identifiers
-# are an accepted constraint of ENERGYDB_SCHEMA.
+# Every raw-SQL relation reference is prefixed with this, so names resolve from
+# the SQL text and energydb never touches the connection's search path. That is
+# what keeps it correct behind a transaction-mode pooler, where per-connection
+# session state is not the client's to rely on. Empty for the default schema.
+# SCHEMA goes in unquoted, so lowercase simple identifiers are a constraint of
+# ENERGYDB_SCHEMA.
 SQL_SCHEMA_PREFIX: str = f"{SCHEMA}." if SCHEMA else ""
 
 
@@ -61,13 +49,10 @@ class Base(DeclarativeBase):
     pass
 
 
-# Namespace: the generic tenancy partition key. Rows created through a
-# namespaced client view (AsyncClient.namespace(...)) are stamped
-# automatically: the view's _conn() binds the transaction-local
-# energydb.namespace GUC, and this server default reads it back. Rows
-# created through a root client (standalone library users) land in
-# 'default'. The same GUC doubles as the row filter if the host
-# application enables RLS. Write paths therefore never mention the column.
+# The tenancy partition key. A namespaced client view binds the
+# transaction-local energydb.namespace GUC and this server default reads it
+# back, so write paths never mention the column. Root clients land in 'default'.
+# The same GUC doubles as the row filter if the host application enables RLS.
 NAMESPACE_DEFAULT = sa.text("COALESCE(NULLIF(current_setting('energydb.namespace', true), ''), 'default')")
 
 
@@ -85,10 +70,8 @@ class Node(Base):
     updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
-        # FK target for every composite "same namespace" constraint below.
         sa.UniqueConstraint("uuid", "namespace", name="node_uuid_namespace_uniq"),
-        # A child lives in its parent's namespace, structurally. (Roots have
-        # parent_uuid NULL, which composite FKs skip.)
+        # A child lives in its parent's namespace, structurally.
         sa.ForeignKeyConstraint(
             ["parent_uuid", "namespace"],
             [_fk("node.uuid"), _fk("node.namespace")],
@@ -96,7 +79,6 @@ class Node(Base):
             name="node_parent_namespace_fkey",
         ),
         sa.UniqueConstraint("parent_uuid", "name", name="node_child_uniq"),
-        # Path- and root-name-uniqueness are per namespace.
         sa.UniqueConstraint("namespace", "path", name="node_path_uniq"),
         sa.Index(
             "ix_node_root_uniq",
@@ -135,8 +117,7 @@ class Edge(Base):
 
     __table_args__ = (
         sa.UniqueConstraint("uuid", "namespace", name="edge_uuid_namespace_uniq"),
-        # Both endpoints must live in the edge's own namespace; a
-        # cross-namespace edge is unrepresentable, not merely checked.
+        # A cross-namespace edge is unrepresentable, not merely checked.
         sa.ForeignKeyConstraint(
             ["from_node_uuid", "namespace"],
             [_fk("node.uuid"), _fk("node.namespace")],
@@ -149,17 +130,12 @@ class Edge(Base):
             ondelete="CASCADE",
             name="edge_to_node_namespace_fkey",
         ),
-        # Multigraph key: parallel edges (the circuits of a double-circuit
-        # corridor, say) share an endpoint pair and type and are told apart by
-        # name. NULLS NOT DISTINCT keeps the simple-graph guarantee for
-        # unnamed edges: at most one unnamed edge per (type, from, to),
-        # unlimited named ones. Standard NULL semantics would instead accept
-        # unlimited unnamed duplicates, which is strictly worse. Requires
-        # PostgreSQL 15+ (checked by Client.create()).
-        #
-        # namespace needs no seat in the key: node uuids are globally
-        # unique and the composite endpoint FKs already pin the edge's
-        # namespace.
+        # Parallel edges share an endpoint pair and type and are told apart by
+        # name. NULLS NOT DISTINCT gives at most one unnamed edge per
+        # (type, from, to) and unlimited named ones; standard NULL semantics
+        # would accept unlimited unnamed duplicates. Requires PostgreSQL 15+.
+        # namespace needs no seat in the key: node uuids are globally unique and
+        # the composite endpoint FKs already pin the edge's namespace.
         sa.UniqueConstraint(
             "edge_type",
             "from_node_uuid",
@@ -168,8 +144,8 @@ class Edge(Base):
             name="edge_uniq",
             postgresql_nulls_not_distinct=True,
         ),
-        # NULL names are allowed; CHECK runs only when name IS NOT NULL. The
-        # column is part of edge_uniq, so this guards a key column.
+        # The CHECK runs only when name IS NOT NULL, and guards a key column of
+        # edge_uniq.
         sa.CheckConstraint(
             "name IS NULL OR (name !~ '/' AND length(name) > 0)",
             name="edge_name_valid",
@@ -206,7 +182,6 @@ class Series(Base):
 
     __table_args__ = (
         sa.CheckConstraint("(node_uuid IS NULL) <> (edge_uuid IS NULL)", name="series_owner_xor"),
-        # A series lives in its owner's namespace, structurally.
         sa.ForeignKeyConstraint(
             ["node_uuid", "namespace"],
             [_fk("node.uuid"), _fk("node.namespace")],
@@ -250,17 +225,11 @@ class Run(Base):
     )
 
 
-# ---------------------------------------------------------------------------
-# DDL events: schema creation only
-# ---------------------------------------------------------------------------
-
-# A named schema must exist before its tables are created. For the default
-# public schema (SCHEMA is None) this is a no-op: public always exists, and
-# requiring CREATE-on-public privilege would be a needless ask.
+# A no-op for the default public schema, which always exists and whose CREATE
+# privilege would be a needless ask.
 #
-# Series immutability (retention / canonical_unit / owner columns) is enforced
-# in Python by energydb.series.register_series; there is intentionally
-# no DB trigger, so the schema is fully Alembic-autogeneratable.
+# Series immutability is enforced in Python by register_series rather than a DB
+# trigger, so the schema stays fully Alembic-autogeneratable.
 if SCHEMA is not None:
     event.listen(
         Base.metadata,
@@ -268,12 +237,9 @@ if SCHEMA is not None:
         sa.DDL(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"),
     )
 
-# series_meta view: the read-only projection the ClickHouse concurrent read
-# path resolves against, which CH's PostgreSQL table engine selects from. The
-# DDL lives with its engine-table counterpart in _ch_meta_engine; created after
-# the tables by Client.create() and (re)created idempotently by
-# Client.setup_ch_meta_engine(), since Alembic autogenerate does not track
-# views.
+# The read-only projection CH's PostgreSQL table engine selects from. Its DDL
+# lives with the engine-table counterpart in _ch_meta_engine and is recreated by
+# Client.setup_ch_meta_engine(), since Alembic autogenerate does not track views.
 CREATE_SERIES_META_VIEW, DROP_SERIES_META_VIEW = series_meta_view_ddl(SQL_SCHEMA_PREFIX)
 
 event.listen(Base.metadata, "after_create", sa.DDL(CREATE_SERIES_META_VIEW))

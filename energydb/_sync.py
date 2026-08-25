@@ -109,9 +109,8 @@ class _SyncProxy:
 
     @property
     def __class__(self):
-        # Transparent-proxy spoof: isinstance(proxy, NodeScope) holds for
-        # sync callers (scopes look like the real thing), while type(proxy)
-        # stays _SyncProxy so _unwrap still detects proxies.
+        # isinstance(proxy, NodeScope) must hold for sync callers while
+        # type(proxy) stays _SyncProxy, so _unwrap can still detect proxies.
         return type(object.__getattribute__(self, "_obj"))
 
     def __getattr__(self, name: str) -> Any:
@@ -136,9 +135,6 @@ class _SyncProxy:
             return call_and_wrap
         return attr
 
-    # -----------------------------------------------------------------------
-    # async context-manager bridge (e.g. Transaction)
-    # -----------------------------------------------------------------------
     def __enter__(self) -> Any:
         obj = object.__getattribute__(self, "_obj")
         portal = object.__getattribute__(self, "_portal")
@@ -210,9 +206,6 @@ class Client:
         self._proxy = _wrap(self._async, self._portal)
 
     def __getattr__(self, name: str) -> Any:
-        # Only reached for names not found on the instance/class; forward to
-        # the wrapped async client. _portal/_async/_proxy are real
-        # instance attributes and never hit this path.
         return getattr(self._proxy, name)
 
     def __repr__(self) -> str:

@@ -21,10 +21,6 @@ from uuid import UUID
 
 from energydb.errors import ValidationError
 
-# ---------------------------------------------------------------------------
-# Snapshots: the canonical content of one row at one point in time.
-# ---------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
 class NodeSnapshot:
@@ -47,11 +43,6 @@ class EdgeSnapshot:
     from_node_uuid: UUID
     to_node_uuid: UUID
     data: dict[str, Any]
-
-
-# ---------------------------------------------------------------------------
-# Per-row change records
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -148,11 +139,6 @@ class EdgeChange(_BaseChange[EdgeSnapshot]):
         )
 
 
-# ---------------------------------------------------------------------------
-# TreeDiff: the structured result of comparing target vs current state.
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TreeDiff:
     """Structured diff between a target EDM tree and the persisted subtree.
@@ -165,10 +151,6 @@ class TreeDiff:
 
     node_changes: list[NodeChange] = field(default_factory=list)
     edge_changes: list[EdgeChange] = field(default_factory=list)
-
-    # -----------------------------------------------------------------------
-    # Convenience views (computed on the fly: diff is small)
-    # -----------------------------------------------------------------------
 
     @property
     def has_changes(self) -> bool:
@@ -220,10 +202,6 @@ class TreeDiff:
         """Edges removed by this diff."""
         return [c for c in self.edge_changes if c.kind == "delete"]
 
-    # -----------------------------------------------------------------------
-    # Pretty-print (tree-shaped)
-    # -----------------------------------------------------------------------
-
     def render(self, file: IO[str] | None = None) -> None:
         """Render the diff as a tree-shaped textual preview.
 
@@ -241,13 +219,9 @@ class TreeDiff:
         """
         out = file if file is not None else sys.stdout
 
-        # Build a "what should the tree look like AFTER + deletes inline"
-        # view, keyed by uuid. For each uuid we record:
+        # Post-change view of the tree with deletes inline, keyed by uuid:
         #   marker: ' ', '+', '~', '-'
-        #   name: display name
         #   type: display type
-        #   note: bracketed annotation (rename, move, insert, delete, ...)
-        #   parent: uuid of parent in the rendered tree
         view: dict[UUID, _RenderRow] = {}
         children_by_parent: dict[UUID | None, list[UUID]] = {}
 
@@ -256,9 +230,7 @@ class TreeDiff:
             view[change.uuid] = row
             children_by_parent.setdefault(row.parent_uuid, []).append(change.uuid)
 
-        # A change is a render trunk if its parent isn't itself a change:
-        # either parent_uuid is None, or the parent is an unchanged ancestor
-        # (e.g. a renamed Site whose Portfolio parent was not modified).
+        # A change is a render trunk when its parent is not itself a change.
         roots = [uid for uid, row in view.items() if row.parent_uuid not in view]
 
         if not view and not self.edge_changes:
@@ -267,7 +239,6 @@ class TreeDiff:
             for root in roots:
                 _render_subtree(out, view, children_by_parent, root, prefix="", is_last=True, is_root=True)
 
-        # Edges: flat at the bottom.
         if self.edge_changes:
             out.write("edges:\n")
             for change in self.edge_changes:
@@ -275,11 +246,6 @@ class TreeDiff:
                 note = _edge_change_note(change)
                 ftxt, ttxt = _edge_endpoint_str(change)
                 out.write(f"  {marker} {change.display_type} {change.display_name!r} {ftxt} → {ttxt}{note}\n")
-
-
-# ---------------------------------------------------------------------------
-# Render helpers (private)
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -311,7 +277,6 @@ def _render_row_for_node(change: NodeChange) -> _RenderRow:
             parent_uuid=snap.parent_uuid,
         )
 
-    # Fall-through: an update.
     assert change.new is not None and change.old is not None
     notes: list[str] = []
     if change.renamed:

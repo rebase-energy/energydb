@@ -110,7 +110,6 @@ def prepare_series_row(
         retention = _DEFAULT_RETENTION_BY_SHAPE[timeseries_type]
     _validate_retention(retention)
 
-    # Populate the right column based on owner_col; the other stays NULL.
     node_uuid = owner_uuid if owner_col == "node_uuid" else None
     edge_uuid = owner_uuid if owner_col == "edge_uuid" else None
     return (node_uuid, edge_uuid, data_type, name, canonical_unit, timeseries_type, retention, description)
@@ -168,7 +167,6 @@ async def register_series(
     if row is not None:
         return row[0]
 
-    # Conflict: fetch the existing row and verify the immutable fields agree.
     existing = await (
         await conn.execute(
             f"SELECT series_id, canonical_unit, retention "
@@ -243,9 +241,8 @@ async def resolve_subtree_series_for_read(
         where_vals.append(name)
     where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
 
-    # The subtree prefix is the root path or a DB-derived path (start_uuid
-    # branch), so it can't always be escaped Python-side. The LIKE metacharacter
-    # escape is inlined in SQL here, which keeps the resolve to one round-trip.
+    # The prefix can be DB-derived, so it cannot always be escaped Python-side;
+    # escaping LIKE metacharacters in SQL keeps this to one round-trip.
     sql = rf"""
         WITH root AS ({root_cte})
         SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
@@ -343,10 +340,9 @@ async def resolve_edge_series_for_read(
     else:
         raise ValidationError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
 
-    # ::text cast on the uuid column: PG returns strings directly,
-    # skipping psycopg's per-row UUID-object parse. The edge uuid comes from
-    # e rather than s so it is populated on the LEFT-JOIN row of a
-    # series-less edge too: that row is what the ambiguity check counts.
+    # ::text skips psycopg's per-row UUID parse. The edge uuid comes from e, not
+    # s, so it is populated on the LEFT-JOIN row of a series-less edge, which is
+    # the row the ambiguity check counts.
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
         "e.uuid::text, s.data_type, s.name, "
@@ -369,8 +365,8 @@ async def resolve_edge_series_for_read(
                 edge_type=edge_type,
                 name=edge_name,
             )
-        # One row per (edge, matching series): several edges is the ambiguous
-        # case, several series on one edge is the ordinary one.
+        # One row per (edge, matching series): several edges is ambiguous,
+        # several series on one edge is ordinary.
         matched = {r[4]: r[8] for r in rows}
         if len(matched) > 1:
             raise ambiguous_edge_error(

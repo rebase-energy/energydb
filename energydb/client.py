@@ -5,20 +5,19 @@ UUID identity model:
 * A node is uniquely identified by its ``uuid`` (UUID7, set on the EDM
   Element at construction).
 * An edge is uniquely identified by its ``uuid`` (also UUID7).
-* Path-based addressing (``client.get_node("Europe", "Sweden")``) is
-  preserved as a user-friendly fluent CLI; resolution walks
+* Path-based addressing (``client.get_node("Europe", "Sweden")``) resolves
   ``(parent_uuid, name)`` via one indexed recursive CTE.
-* Edge endpoints in storage are ``from_node_uuid`` / ``to_node_uuid``:
-  no path resolution at write or read time.
+* Edge endpoints in storage are ``from_node_uuid`` / ``to_node_uuid``, so
+  there is no path resolution at write or read time.
 
 API split:
 
 * ``register_tree``: structure (nodes, edges, series declarations). Create-only;
   raises if any UUID in the payload already exists, or on inline timeseries data.
 * ``write`` / ``read``: bulk timeseries data via manifest DataFrames.
-* ``get_node`` / ``get_edge``: fluent scope entry points. Reads like
-  English: ``client.get_node("p").where(type="WindTurbine").read()``.
-  Terminate with ``.get()`` to fetch the EDM object eagerly.
+* ``get_node`` / ``get_edge``: fluent scope entry points, e.g.
+  ``client.get_node("p").where(type="WindTurbine").read()``. Terminate with
+  ``.get()`` to fetch the EDM object eagerly.
 """
 
 from __future__ import annotations
@@ -92,11 +91,9 @@ class AsyncClient:
     :class:`energydb.Client`, a thin blocking facade over this class.
     """
 
-    # Namespace binding, as *class-level defaults* so that instances built
-    # without __init__ (test fixtures, namespace clones) behave like
-    # root clients unless overridden. None → no GUC set on checkouts.
-    # Views created via namespace shadow both per-instance and never
-    # own the (shared) pool's lifecycle.
+    # Class-level defaults so instances built without __init__ behave like root
+    # clients. None means no GUC is set on checkouts. Views created via
+    # namespace shadow both per-instance and never own the pool's lifecycle.
     _namespace: str | None = None
     _owns_pool: bool = True
 
@@ -128,14 +125,10 @@ class AsyncClient:
         self._dsn = conninfo
 
         async def _configure(conn):
-            # prepare_threshold=1 makes psycopg cache a server-side
-            # prepared statement after the first execution of each SQL text.
-            # Saves ~4-8ms on the repeated 6000-uuid resolve query at scale=200
-            # (PG parse+plan stage skipped on subsequent calls).
-            # Client-side attribute only: no round-trip, no transaction opened,
-            # hence no commit. Nothing else belongs here: energydb's SQL is
-            # schema-qualified, so a connection needs no session state to
-            # resolve relation names (see models.SQL_SCHEMA_PREFIX).
+            # Caches a server-side prepared statement per SQL text, skipping
+            # PG's parse and plan on repeat calls. Client-side attribute only,
+            # so no round-trip and no transaction. Nothing else belongs here:
+            # energydb's SQL is schema-qualified and needs no session state.
             conn.prepare_threshold = 1
 
         self._pool = AsyncConnectionPool(
@@ -146,8 +139,7 @@ class AsyncClient:
             configure=_configure,
         )
         self.td = TimeDBClient(ch_url=ch_url)
-        # Set on the first engine-read failure, or by the env kill-switch: the
-        # rest of the session uses the sequential resolve without re-trying the
+        # Once set, the session uses the sequential resolve without retrying the
         # engine. setup_ch_meta_engine() resets it.
         self._engine_unavailable = os.environ.get("ENERGYDB_DISABLE_ENGINE") == "1"
 
@@ -174,27 +166,23 @@ class AsyncClient:
         ns = f", namespace={self._namespace!r}" if self._namespace is not None else ""
         return f"AsyncClient(pg={self._safe_dsn()!r}{ns})"
 
-    # -----------------------------------------------------------------------
-    # Namespacing
-    # -----------------------------------------------------------------------
-
     def namespace(self, ns: str) -> AsyncClient:
         """Return a view of this client bound to one namespace.
 
-        The view shares the parent's connection pool and ClickHouse client;
-        it is a cheap, disposable dict-copy: create one per request. Every
-        PG round-trip made through the view binds the ``energydb.namespace``
-        GUC (see :meth:`_conn` / :meth:`_read_conn`), which row-level
-        security policies, when installed, use to filter every table to
-        that namespace, and which the columns' server defaults use to stamp
-        writes. Lifecycle and schema operations (:meth:`open`, :meth:`close`,
-        :meth:`create`, :meth:`delete`, :meth:`setup_ch_meta_engine`) stay
-        with the root client and raise on a view.
+        The view shares the parent's connection pool and ClickHouse client and
+        is a cheap, disposable dict-copy: create one per request. Every PG
+        round-trip through the view binds the ``energydb.namespace`` GUC (see
+        :meth:`_conn` / :meth:`_read_conn`), which row-level security policies
+        use to filter every table to that namespace and the columns' server
+        defaults use to stamp writes. Lifecycle and schema operations
+        (:meth:`open`, :meth:`close`, :meth:`create`, :meth:`delete`,
+        :meth:`setup_ch_meta_engine`) stay with the root client and raise on a
+        view.
 
-        Engine-parallel reads are disabled on views: the ClickHouse meta
-        engine table reads PG with its own (RLS-bypassing) credentials, so
-        until its predicate carries the namespace, views always take the
-        sequential resolve (identical results, namespace-enforced).
+        Engine-parallel reads are disabled on views: the ClickHouse meta engine
+        table reads PG with its own RLS-bypassing credentials, so views always
+        take the sequential resolve until its predicate carries the namespace.
+        Results are identical and namespace-enforced.
         """
         if not ns:
             raise ValidationError("namespace must be a non-empty string")
@@ -257,23 +245,17 @@ class AsyncClient:
             finally:
                 await conn.execute("SELECT set_config('energydb.namespace', '', false)")
 
-    # -----------------------------------------------------------------------
-    # Schema management
-    # -----------------------------------------------------------------------
-
     async def create(self) -> None:
         """Create PG schema + CH tables, and provision the CH meta engine table.
 
         Schema is defined by the SQLAlchemy models in :mod:`energydb.models`
-        (the ``series_meta`` view rides on the DDL events). SQLAlchemy's
-        ``create_all`` and TimeDB's create are synchronous, so they run in a
-        worker thread to keep the event loop free.
+        (the ``series_meta`` view rides on the DDL events), created in a worker
+        thread because ``create_all`` and TimeDB's create are synchronous.
 
         The engine table is best-effort: a CH role that cannot create
-        ``PostgreSQL()`` engine tables must not break ``create()`` for
-        deployments that never enable ``concurrent``; those get a logged
-        warning and reads fall back to the sequential path.
-        :meth:`setup_ch_meta_engine` is the explicit, raising alternative.
+        ``PostgreSQL()`` engine tables gets a logged warning and reads fall
+        back to the sequential path. :meth:`setup_ch_meta_engine` is the
+        explicit, raising alternative.
 
         For production, set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named
         collection holding the PostgreSQL connection; otherwise the credentials
@@ -294,9 +276,8 @@ class AsyncClient:
                 exc_info=True,
             )
 
-    # UNIQUE NULLS NOT DISTINCT on edge_uniq (the multigraph key) is
-    # PostgreSQL 15+ syntax. Checking it up front turns a cryptic mid-DDL
-    # syntax error into one sentence naming the version and the reason.
+    # UNIQUE NULLS NOT DISTINCT on edge_uniq is PostgreSQL 15+ syntax; checking
+    # up front turns a cryptic mid-DDL syntax error into a clear one.
     _MIN_SERVER_VERSION_NUM = 150000
     _MIN_SERVER_VERSION = "15"
 
@@ -314,9 +295,8 @@ class AsyncClient:
             )
 
     def _provision_engine_table_blocking(self) -> None:
-        # Warn before issuing the DDL, and from here rather than from
-        # engine_table_ddl(), so DDL construction stays side-effect-free and the
-        # warning fires exactly when the credential is about to be written.
+        # Warn from here, not engine_table_ddl(), so DDL construction stays
+        # side-effect-free and the warning fires as the credential is written.
         if inlines_pg_password(self._dsn):
             logger.warning(
                 "energydb: provisioning the ClickHouse meta-engine table %r with inline "
@@ -326,13 +306,10 @@ class AsyncClient:
                 "ENERGYDB_CH_PG_COLLECTION to its name.",
                 CH_ENGINE_TABLE,
             )
-        # DROP + CREATE rather than IF NOT EXISTS alone: the engine table is
-        # stateless, and recreating it picks up view/column upgrades on
-        # existing deployments.
+        # The engine table is stateless, so recreating it picks up view and
+        # column upgrades on existing deployments.
         self.td._ch.command(DROP_ENGINE_TABLE)
         if DROP_LEGACY_ENGINE_TABLE:
-            # Remove a stale bare-named table left by an older named-schema
-            # deployment.
             self.td._ch.command(DROP_LEGACY_ENGINE_TABLE)
         self.td._ch.command(engine_table_ddl(self._dsn, SCHEMA or "public"))
 
@@ -395,10 +372,6 @@ class AsyncClient:
         self._require_root("close")
         await self._pool.close()
 
-    # -----------------------------------------------------------------------
-    # Fluent entry: scopes for navigation & single-element ops
-    # -----------------------------------------------------------------------
-
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`NodeScope` for a node or subtree.
 
@@ -459,10 +432,6 @@ class AsyncClient:
             edge_name=name,
         )
 
-    # -----------------------------------------------------------------------
-    # Transactions
-    # -----------------------------------------------------------------------
-
     def transaction(self) -> Transaction:
         """Open an atomic batch of scope mutations.
 
@@ -480,10 +449,6 @@ class AsyncClient:
         from energydb._transaction import Transaction
 
         return Transaction(self)
-
-    # -----------------------------------------------------------------------
-    # Structure: register_tree, edges, queries
-    # -----------------------------------------------------------------------
 
     async def register_tree(
         self,
@@ -507,13 +472,11 @@ class AsyncClient:
         under which the tree's root is grafted; ``None`` means create at
         root. Raises if ``under`` points at a non-existent parent.
 
-        Series declarations attached to nodes/edges on the tree **are**
-        registered alongside their owners but are not represented in the
-        returned :class:`TreeDiff`. Adding a series to a node that
-        already exists in the DB is not supported here (the create-only
-        pre-check rejects the whole payload); use
-        :meth:`NodeScope.register_series` /
-        :meth:`EdgeScope.register_series` instead.
+        Series declarations on the tree **are** registered alongside their
+        owners but do not appear in the returned :class:`TreeDiff`. Adding a
+        series to a node that already exists in the DB is not supported here,
+        since the create-only pre-check rejects the whole payload; use
+        :meth:`NodeScope.register_series` / :meth:`EdgeScope.register_series`.
 
         Returns the ``uuid`` of the tree's root, except when
         ``dry_run=True`` (which returns the :class:`TreeDiff`).
@@ -628,10 +591,6 @@ class AsyncClient:
             edge_uuid = await create_edge(conn, edm_obj, tree_root=None)
             await conn.commit()
         return edge_uuid
-
-    # -----------------------------------------------------------------------
-    # Generic raw node API: store/read by (node_type, data), no EDM class
-    # -----------------------------------------------------------------------
 
     async def create_node(
         self,
@@ -772,8 +731,6 @@ class AsyncClient:
             sql += " LIMIT %s"
             params.append(limit)
         async with self._read_conn() as conn:
-            # Dynamic WHERE from the allowlisted fragments above; same
-            # ty-ignored f-string as query_nodes.
             rows = await (await conn.execute(sql, params)).fetchall()  # ty: ignore[invalid-argument-type]
         return [
             {
@@ -813,7 +770,6 @@ class AsyncClient:
             ).fetchall()
         return [
             {
-                # series_id first: it reads as the row identity.
                 "series_id": r[0],
                 "name": r[1],
                 "data_type": r[2],
@@ -894,10 +850,6 @@ class AsyncClient:
             for r in rows
         ]
 
-    # -----------------------------------------------------------------------
-    # Tree reconstruction
-    # -----------------------------------------------------------------------
-
     async def get_tree(
         self,
         *names_or_path,
@@ -926,9 +878,8 @@ class AsyncClient:
         else:
             raise ValidationError("Provide a path or uuid=.")
 
-        # One statement for the subtree (the root resolve and the prefix
-        # scan are inlined); with include_series a second, independent
-        # statement joins the series: both ride ONE pipeline flush.
+        # The root resolve and prefix scan are inlined into one statement; with
+        # include_series a second statement rides the same pipeline flush.
         subtree_on, prefix_params = self._subtree_on("n", joined)
         subtree_from = f"FROM {P}node r JOIN {P}node n ON {subtree_on}"
         params = [*prefix_params, addr_param]
@@ -976,16 +927,11 @@ class AsyncClient:
                     node_obj.timeseries = []
                 node_obj.timeseries.append(series)
 
-        # Attach children to their parents (flat pass, uuid-based, order-agnostic).
         for node_uuid, parent_uuid in parent_map.items():
             if parent_uuid is not None and parent_uuid in nodes:
                 nodes[parent_uuid].add_child(nodes[node_uuid])
 
         return nodes[root_uuid]
-
-    # -----------------------------------------------------------------------
-    # Bulk timeseries I/O: manifest DataFrames only
-    # -----------------------------------------------------------------------
 
     async def write(
         self,
@@ -1013,10 +959,10 @@ class AsyncClient:
         ``skip_unchanged`` drops rows whose latest stored value is unchanged
         before the insert. ``unchanged_scope`` picks the comparison key:
 
-        * ``"auto"`` (default): per series, using each series' registered
-          type: FLAT compares per ``valid_time``, OVERLAPPING per
-          ``(valid_time, knowledge_time)``. One call handles a mixed manifest;
-          for a FLAT-only manifest it is identical to ``"valid_time"``.
+        * ``"auto"`` (default): per series, by its registered type. FLAT
+          compares per ``valid_time``, OVERLAPPING per
+          ``(valid_time, knowledge_time)``, so one call handles a mixed
+          manifest. Identical to ``"valid_time"`` for a FLAT-only manifest.
         * ``"knowledge_time"``: that key uniformly.
         * ``"valid_time"``: that key uniformly. Raises
           :class:`~energydb.errors.UnchangedScopeError` if the manifest
@@ -1075,9 +1021,9 @@ class AsyncClient:
         * ``node_uuid`` / ``edge_uuid``: series by owner uuid.
         * ``from_path`` + ``to_path`` + ``edge_type``: edge series by their
           endpoint paths and type (all three required together), resolved
-          server-side the same way node ``path`` is. Symmetric with the edge
-          output columns below, so an edge read's own output can be fed back in
-          as a manifest without a UUID-resolution round-trip.
+          server-side the same way node ``path`` is. Matches the edge output
+          columns, so an edge read's output can be fed back as a manifest
+          without a UUID-resolution round-trip.
         * ``edge_name``: optional fourth column on that route, picking one of
           several *parallel* edges sharing a triple (null = the unnamed edge).
           A triple matching more than one edge without it raises
@@ -1091,36 +1037,32 @@ class AsyncClient:
           name, valid_time, value, …)`` for edge-routed reads. ``path`` /
           ``from_path`` / ``to_path`` are ``Utf8`` joined with ``/``;
           ``edge_name`` is the edge's own name, always present and null for
-          unnamed edges.
-          Optional columns appear when ``include_knowledge_time`` /
-          ``include_updates`` are set.
-        * ``output="by_path"``: a ``dict`` keyed by
-          :class:`SeriesKey` (node-routed: ``path``, ``data_type``, ``name``)
-          or :class:`EdgeSeriesKey` (edge-routed: ``from_path``, ``to_path``,
-          ``edge_type``, ``edge_name``, ``data_type``, ``name``) with per-series DataFrames
-          carrying only the data columns (``valid_time``, ``value``, plus
-          opt-in time/audit columns). Keys are NamedTuples, so positional
-          access (``result[(path, dt, name)]``) and attribute access
-          (``key.path``) both work. Each sub-frame is sorted by
-          ``valid_time`` ascending; secondary sort keys are
-          ``knowledge_time`` and/or ``change_time`` when requested.
+          unnamed edges. Optional columns appear when
+          ``include_knowledge_time`` / ``include_updates`` are set.
+        * ``output="by_path"``: a ``dict`` keyed by :class:`SeriesKey`
+          (node-routed: ``path``, ``data_type``, ``name``) or
+          :class:`EdgeSeriesKey` (edge-routed: ``from_path``, ``to_path``,
+          ``edge_type``, ``edge_name``, ``data_type``, ``name``), valued by
+          per-series DataFrames carrying only the data columns
+          (``valid_time``, ``value``, plus opt-in time/audit columns). Keys are
+          NamedTuples, so positional (``result[(path, dt, name)]``) and
+          attribute (``key.path``) access both work. Sub-frames are sorted by
+          ``valid_time`` ascending, then ``knowledge_time`` / ``change_time``
+          when requested.
 
-        ``backend="polars"`` (default) returns polars frames;
-        ``backend="pandas"`` converts at the boundary. Internal
-        identifiers (``series_id``, ``node_uuid``, ``edge_uuid``) are
-        never exposed on the result.
+        ``backend="polars"`` (default) returns polars frames; ``"pandas"``
+        converts at the boundary. Internal identifiers (``series_id``,
+        ``node_uuid``, ``edge_uuid``) are never exposed on the result.
 
         **``on_missing`` changes the return type.** With the default
         ``"raise"``, an unregistered ``(owner, data_type, name)`` triple fails
-        the whole call with
-        :class:`~energydb.errors.SeriesNotFoundError` (naming every unresolved
-        triple) and the return value is as described above. With ``"skip"``,
-        those triples are dropped from the read and the call returns a
-        :class:`ReadResult` of ``(data, missing)``, so one unregistered series
-        can't cost a 1,500-series batch and the skipped triples are still
-        reported. Only unregistered series are affected: a structurally invalid
-        manifest (missing/ambiguous routing column, wrong dtype, null routing
-        value) raises either way.
+        the whole call with :class:`~energydb.errors.SeriesNotFoundError`,
+        naming every unresolved triple, and the return value is as described
+        above. With ``"skip"``, those triples are dropped and the call returns a
+        :class:`ReadResult` of ``(data, missing)``, reporting them there. Only
+        unregistered series are affected: a structurally invalid manifest
+        (missing or ambiguous routing column, wrong dtype, null routing value)
+        raises either way.
         """
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
@@ -1209,15 +1151,10 @@ class AsyncClient:
         """
         data = to_backend(result, backend)
         if on_missing == "skip":
-            # missing is always a plain frame, never the by_path dict shape,
-            # but to_backend is typed for the whole read-result union, narrow
-            # it back before it lands on ReadResult.missing.
+            # to_backend is typed for the whole read-result union, but missing is
+            # always a plain frame; narrow before it lands on ReadResult.missing.
             return ReadResult(data, cast("pl.DataFrame | pd.DataFrame", to_backend(missing, backend)))
         return data
-
-    # -----------------------------------------------------------------------
-    # Runs
-    # -----------------------------------------------------------------------
 
     async def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
         """Return runs that wrote data for a given series_id, latest first."""
@@ -1226,10 +1163,6 @@ class AsyncClient:
             return []
         async with self._read_conn() as conn:
             return await runs_mod.get_runs(conn, run_ids)
-
-    # -----------------------------------------------------------------------
-    # Internals
-    # -----------------------------------------------------------------------
 
     def _sqlalchemy_url(self) -> str:
         return f"postgresql+psycopg://{self._dsn.split('://', 1)[-1]}"

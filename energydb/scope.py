@@ -56,11 +56,6 @@ if TYPE_CHECKING:
     from energydb.client import AsyncClient
 
 
-# ---------------------------------------------------------------------------
-# Module-level helpers
-# ---------------------------------------------------------------------------
-
-
 def _dry_run_unsupported_in_txn() -> None:
     raise ValidationError("dry_run is not supported inside a transaction(); use txn.preview() instead.")
 
@@ -248,11 +243,6 @@ def _attach_routing(
     return df.with_columns(cols)
 
 
-# ---------------------------------------------------------------------------
-# _BaseScope: shared plumbing for NodeScope and EdgeScope
-# ---------------------------------------------------------------------------
-
-
 class _BaseScope:
     """Shared connection / mutation plumbing.
 
@@ -263,10 +253,6 @@ class _BaseScope:
 
     _client: AsyncClient
     _txn: Transaction | None
-
-    # -----------------------------------------------------------------------
-    # shared properties / connection management
-    # -----------------------------------------------------------------------
 
     @property
     def _pool(self):
@@ -290,7 +276,7 @@ class _BaseScope:
             async with annotate_undefined_table():
                 yield self._txn._conn
             return
-        # Client checkout point: binds the namespace GUC on namespaced views.
+        # The checkout point binds the namespace GUC on namespaced views.
         async with self._client._conn() as conn:
             yield conn
 
@@ -307,14 +293,9 @@ class _BaseScope:
             async with annotate_undefined_table():
                 yield self._txn._conn
             return
-        # Client checkout point (autocommit): binds the namespace GUC at
-        # session level on namespaced views. Annotates already.
+        # Autocommit checkout binds the namespace GUC at session level.
         async with self._client._read_conn() as conn:
             yield conn
-
-    # -----------------------------------------------------------------------
-    # subclass contract (overridden in NodeScope / EdgeScope)
-    # -----------------------------------------------------------------------
 
     _owner_col: Literal["node_uuid", "edge_uuid"]
 
@@ -375,10 +356,6 @@ class _BaseScope:
             result = _strip_scope_identity(result, is_edge=(self._owner_col == "edge_uuid"))
         return to_backend(result, backend)
 
-    # -----------------------------------------------------------------------
-    # shared mutation machinery
-    # -----------------------------------------------------------------------
-
     async def _apply_mutation(
         self,
         exec_fn: Callable[[Any, UUID], Awaitable[None]],
@@ -415,10 +392,6 @@ class _BaseScope:
                 return self._wrap_in_diff(before, after)
             await conn.commit()
         return None
-
-    # -----------------------------------------------------------------------
-    # shared series + timeseries I/O
-    # -----------------------------------------------------------------------
 
     async def register_series(
         self,
@@ -488,9 +461,8 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("write")
-        # A path-addressed NodeScope routes by its materialized path, so the
-        # manifest resolve + runs upsert collapse to ONE PG round-trip
-        # (resolve_manifest's path route) and the separate uuid resolve is skipped.
+        # Routing by materialized path collapses the manifest resolve and runs
+        # upsert into one round-trip, skipping the separate uuid resolve.
         route = self._write_route()
         if route is not None:
             owner_col, owner_val = route
@@ -556,8 +528,7 @@ class _BaseScope:
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
-        # Scope reads route by subtree, not by a manifest: "nothing matched"
-        # already returns an empty result rather than raising, so there is no
+        # Subtree reads return empty rather than raising, so there is no
         # on_missing to expose and the third element is always empty.
         result, n_series, _missing = await execute_read(
             self._pool,
@@ -688,11 +659,6 @@ class _BaseScope:
         return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
 
 
-# ---------------------------------------------------------------------------
-# NodeScope
-# ---------------------------------------------------------------------------
-
-
 class NodeScope(_BaseScope):
     """Accumulated scope for navigating and operating on a single node.
 
@@ -704,9 +670,6 @@ class NodeScope(_BaseScope):
     _owner_col = "node_uuid"
 
     def _write_route(self) -> tuple[str, str] | None:
-        # Path-addressed: route by materialized path (one-round-trip folded
-        # resolve + runs upsert). uuid-addressed scopes fall back to the uuid
-        # resolve.
         return ("path", "/".join(self._path)) if self._path else None
 
     def __init__(
@@ -765,10 +728,6 @@ class NodeScope(_BaseScope):
             "</div>"
         )
 
-    # -----------------------------------------------------------------------
-    # Subclass contract for _BaseScope._apply_mutation
-    # -----------------------------------------------------------------------
-
     async def _resolve_uuid(self, conn) -> UUID:
         return await self._resolve_node_uuid(conn)
 
@@ -784,10 +743,6 @@ class NodeScope(_BaseScope):
 
     def _not_found_error(self, uuid_: UUID) -> NotFoundError:
         return NodeNotFoundError(f"Node not found: uuid={uuid_}", uuid=uuid_)
-
-    # -----------------------------------------------------------------------
-    # Navigation (lazy)
-    # -----------------------------------------------------------------------
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Lazy navigation. Accepts a ``/``-joined string, variadic names,
@@ -835,10 +790,6 @@ class NodeScope(_BaseScope):
             where_filters=filters,
             txn=self._txn,
         )
-
-    # -----------------------------------------------------------------------
-    # Internal: resolve scope → uuid(s)
-    # -----------------------------------------------------------------------
 
     async def _resolve_node_uuid(self, conn) -> UUID:
         if self._path:
@@ -888,10 +839,8 @@ class NodeScope(_BaseScope):
             if not self._where_filters:
                 return await resolve_subtree_uuids(conn, root_uuid)
 
-            # Two-step: fetch root path, then LIKE with escaped prefix as
-            # bind param so PG can Index Scan via ix_node_path_prefix.
-            # Drop the n alias since the JOIN is gone; the filter predicates
-            # now run directly on node.
+            # The escaped prefix goes in as a bind param so PG can Index Scan
+            # via ix_node_path_prefix.
             filter_conds, filter_params = build_filter_conditions(self._where_filters, type_col="node_type")
             extra = (" AND " + " AND ".join(filter_conds)) if filter_conds else ""
             root_path_row = await (
@@ -910,10 +859,6 @@ class NodeScope(_BaseScope):
             """
             rows = await (await conn.execute(sql, (root_path, _like_escape(root_path), *filter_params))).fetchall()
             return [r[0] for r in rows]
-
-    # -----------------------------------------------------------------------
-    # Get / hierarchy queries
-    # -----------------------------------------------------------------------
 
     async def get(self):
         """Reconstruct this node as an EnergyDataModel object.
@@ -1044,10 +989,6 @@ class NodeScope(_BaseScope):
             raise self._missing_error()
         return tuple(row[0].split("/"))
 
-    # -----------------------------------------------------------------------
-    # Single-element mutations
-    # -----------------------------------------------------------------------
-
     async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
         """Rename this node in place: same uuid, one ``UPDATE``.
 
@@ -1057,10 +998,8 @@ class NodeScope(_BaseScope):
         """
 
         async def _do(conn, node_uuid: UUID) -> None:
-            # One SELECT to grab the node's current path and its parent's path,
-            # then a single UPDATE rewrites path for self + every descendant
-            # via the ix_node_path_prefix index. name is only changed on
-            # the renamed row itself.
+            # A single UPDATE rewrites path for self and every descendant via
+            # ix_node_path_prefix; name changes only on the renamed row.
             row = await (
                 await conn.execute(
                     f"""
@@ -1152,9 +1091,8 @@ class NodeScope(_BaseScope):
             if new_parent_uuid == node_uuid:
                 raise ValidationError("Cannot move a node into itself.")
 
-            # Cycle iff the prospective new parent is at or under the moving
-            # node's own path. Fetch the moving node's path to Python and escape
-            # it as a bind param rather than in SQL.
+            # A cycle exists iff the new parent is at or under the moving node's
+            # own path.
             subj_row = await (
                 await conn.execute(
                     f"SELECT path FROM {P}node WHERE uuid = %s",
@@ -1179,9 +1117,8 @@ class NodeScope(_BaseScope):
             if cycle_row and cycle_row[0]:
                 raise ValidationError("Cannot move a node into its own subtree (would create a cycle).")
 
-            # Fetch old path, the new parent's path, and the moving node's own
-            # name. LEFT JOIN against the new parent so a move-to-root
-            # (new_parent_uuid IS NULL) returns new_parent_path = None.
+            # LEFT JOIN the new parent so a move-to-root returns
+            # new_parent_path = None.
             row = await (
                 await conn.execute(
                     f"""
@@ -1246,10 +1183,6 @@ class NodeScope(_BaseScope):
             await conn.commit()
         return NodeScope(self._client, node_uuid=root_uuid)
 
-    # -----------------------------------------------------------------------
-    # Manifest builder for the shared _BaseScope read/read_relative
-    # -----------------------------------------------------------------------
-
     def _engine_meta(self, *, data_type: str | None, name: str | None) -> PgEngineMeta | None:
         """Engine predicate for a node subtree: the path-prefix match.
 
@@ -1288,9 +1221,8 @@ class NodeScope(_BaseScope):
             )
         else:
             where_conds, where_params = [], []
-        # Reads are guarded against txn-bound scopes upstream, so this always
-        # borrows from the pool; autocommit skips psycopg's implicit BEGIN
-        # round-trip (and the pool's rollback-on-return).
+        # Guarded against txn-bound scopes upstream, so this always borrows from
+        # the pool; autocommit skips psycopg's implicit BEGIN round-trip.
         async with autocommit_read_conn(self._pool) as conn:
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
                 if self._path and self._node_uuid is None:
@@ -1315,11 +1247,6 @@ class NodeScope(_BaseScope):
                 else:
                     raise ValidationError("NodeScope has no path or uuid to resolve.")
         return None if meta.is_empty() else meta
-
-
-# ---------------------------------------------------------------------------
-# EdgeScope
-# ---------------------------------------------------------------------------
 
 
 class EdgeScope(_BaseScope):
@@ -1379,10 +1306,6 @@ class EdgeScope(_BaseScope):
             base += ", txn=True"
         return base + ")"
 
-    # -----------------------------------------------------------------------
-    # Subclass contract for _BaseScope._apply_mutation
-    # -----------------------------------------------------------------------
-
     async def _resolve_uuid(self, conn) -> UUID:
         return await self._resolve_edge_uuid(conn)
 
@@ -1398,10 +1321,6 @@ class EdgeScope(_BaseScope):
 
     def _not_found_error(self, uuid_: UUID) -> NotFoundError:
         return EdgeNotFoundError(f"Edge not found: uuid={uuid_}", uuid=uuid_)
-
-    # -----------------------------------------------------------------------
-    # Internal: identity resolution + endpoint helpers
-    # -----------------------------------------------------------------------
 
     async def _resolve_edge_uuid(self, conn) -> UUID:
         if self._edge_uuid is not None:
@@ -1439,8 +1358,7 @@ class EdgeScope(_BaseScope):
             raise ValidationError("EdgeScope has no uuid or (from_path, to_path, edge_type) triple to resolve.")
         rows = await (await conn.execute(sql, params)).fetchall()
         if len(rows) > 1:
-            # uuid- and name-narrowed addressing are unique by construction, so
-            # this is always a bare triple over parallel edges.
+            # uuid- and name-narrowed addressing are unique by construction.
             assert self._from_path is not None and self._to_path is not None and self._edge_type is not None
             raise ambiguous_edge_error(
                 from_path="/".join(self._from_path),
@@ -1476,10 +1394,6 @@ class EdgeScope(_BaseScope):
         if row is None:
             await self._edge_not_found(conn)
         return row[4], row[5]
-
-    # -----------------------------------------------------------------------
-    # get / navigation
-    # -----------------------------------------------------------------------
 
     async def get(self):
         """Reconstruct this edge as an EnergyDataModel object, endpoints
@@ -1539,10 +1453,6 @@ class EdgeScope(_BaseScope):
         async with self._use_read_conn() as conn:
             _, to_uuid = await self._endpoints(conn)
         return NodeScope(self._client, node_uuid=to_uuid, txn=self._txn)
-
-    # -----------------------------------------------------------------------
-    # CRUD
-    # -----------------------------------------------------------------------
 
     async def rename(self, new_name: str, *, dry_run: bool = False) -> TreeDiff | None:
         """Rename this edge in place: same uuid, one ``UPDATE``.
@@ -1622,10 +1532,6 @@ class EdgeScope(_BaseScope):
             await conn.execute(f"DELETE FROM {P}edge WHERE uuid = %s", (edge_uuid,))
 
         return await self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
-
-    # -----------------------------------------------------------------------
-    # Manifest builder for the shared _BaseScope read/read_relative
-    # -----------------------------------------------------------------------
 
     def _engine_meta(self, *, data_type: str | None, name: str | None) -> PgEngineMeta | None:
         """Engine predicate for an edge read: owner-uuid match or the exact triple.

@@ -24,8 +24,8 @@ from psycopg.types.json import Jsonb
 
 from energydb.errors import ValidationError
 
-# id is round-tripped via the dedicated uuid column, not through the
-# data JSONB blob. Same for fields stored as their own columns.
+# id round-trips via the uuid column, not the data JSONB blob, as do all
+# fields stored as their own columns.
 _NODE_EXCLUDES = {"id", "timeseries"}
 _EDGE_EXCLUDES = {"id", "from_element", "to_element", "timeseries"}
 
@@ -53,11 +53,6 @@ def _build_storage_dict(row: dict[str, Any], *, type_col: str) -> dict[str, Any]
     uuid_val = row["uuid"]
     data["id"] = str(uuid_val) if isinstance(uuid_val, UUID) else uuid_val
     return data
-
-
-# ---------------------------------------------------------------------------
-# Node serialization
-# ---------------------------------------------------------------------------
 
 
 def serialize_node(edm_obj) -> dict[str, Any]:
@@ -97,11 +92,6 @@ def reconstruct_node(row: dict[str, Any]):
     return edm.element_from_json(_build_storage_dict(row, type_col="node_type"))
 
 
-# ---------------------------------------------------------------------------
-# Edge serialization
-# ---------------------------------------------------------------------------
-
-
 def serialize_edge(edm_obj) -> dict[str, Any]:
     """Convert an EDM Edge to a dict suitable for database insertion.
 
@@ -136,10 +126,8 @@ def reconstruct_edge(row: dict[str, Any]):
     if not issubclass(cls, edm.Edge):
         raise TypeError(f"edge table row has type {edge_type} which is not an Edge subclass")
 
-    # Endpoints come from the FK columns, not the JSONB blob; those are the
-    # authoritative source. They are attached as Reference after
-    # element_from_json, so stale endpoint refs surviving in data are
-    # overwritten unconditionally.
+    # The FK columns are authoritative for endpoints, so they are attached after
+    # element_from_json and overwrite any stale refs left in data.
     obj = edm.element_from_json(_build_storage_dict(row, type_col="edge_type"))
     from_uuid = row.get("from_node_uuid")
     to_uuid = row.get("to_node_uuid")

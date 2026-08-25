@@ -124,11 +124,6 @@ def attach_edge_hierarchy(client, result: pl.DataFrame, meta: pl.DataFrame) -> p
     return result.join(sid_lookup, on="series_id", how="left").drop("series_id")
 
 
-# ---------------------------------------------------------------------------
-# By-path partition (output="by_path")
-# ---------------------------------------------------------------------------
-
-
 def partition_node_by_path(client, result: pl.DataFrame, meta: pl.DataFrame) -> dict[SeriesKey, pl.DataFrame]:
     """Partition a node-routed CH result into ``{SeriesKey: df}``.
 
@@ -211,14 +206,13 @@ def _build_partition[KeyT: tuple](
     out: dict[KeyT, pl.DataFrame] = {}
     if not result.is_empty():
         parts = result.partition_by("series_id", as_dict=True, include_key=False)
-        # parts is keyed by tuple of partition values, here (series_id,).
+        # parts is keyed by a tuple of partition values, here (series_id,).
         for k_tuple, sub in parts.items():
             sid = k_tuple[0]
             key = sid_to_key.get(sid)
             if key is not None:
                 out[key] = sub
 
-    # Fill in empty sub-frames for series with no CH rows.
     for key in sid_to_key.values():
         if key not in out:
             out[key] = pl.DataFrame(schema=data_schema)

@@ -49,12 +49,10 @@ def to_backend(
         return result
     if backend == "pandas":
         if isinstance(result, dict):
-            # ty narrows the dict's value type to object after the isinstance,
-            # so cast explicitly back to pl.DataFrame, at no runtime cost.
+            # ty narrows the value type to object after the isinstance.
             d = cast(dict[SeriesKey | EdgeSeriesKey, pl.DataFrame], result)
-            # dict invariance: the runtime dict carries a single key type per call
-            # (driven by the routing column), but statically the union has to be
-            # collapsed before assigning into the narrower return type.
+            # dict invariance: one key type per call at runtime, but the union
+            # must be collapsed statically before assigning to the return type.
             return cast(
                 dict[SeriesKey, pd.DataFrame] | dict[EdgeSeriesKey, pd.DataFrame],
                 {k: v.to_pandas() for k, v in d.items()},

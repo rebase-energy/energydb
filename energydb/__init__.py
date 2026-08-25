@@ -2,9 +2,8 @@
 
 from dotenv import load_dotenv
 
-# Load only the .env in the current working directory (no upward tree-walk).
-# override=False so an already-set env var (Docker, CI, uv run --env-file, a
-# caller that loaded its own .env first) always wins over this dev fallback.
+# cwd only, no upward tree-walk. override=False so an already-set env var wins
+# over this dev fallback.
 load_dotenv(".env")
 
 from energydatamodel import (  # noqa: E402
@@ -37,7 +36,7 @@ from energydatamodel import (  # noqa: E402
     SynchronousArea,
     VirtualPowerPlant,
     WeatherCell,
-    # Sub-namespaces: tech-specific equipment lives here
+    # Sub-namespaces
     battery,
     build_metric,
     building,
@@ -170,7 +169,7 @@ __all__ = [
     "Quantity",
     "Scope",
     "build_metric",
-    # Sub-namespaces (tech-specific equipment)
+    # Sub-namespaces
     "battery",
     "building",
     "grid",

@@ -32,8 +32,8 @@ class RunRow(NamedTuple):
     run_params: dict | None = None
 
 
-# INSERT … ON CONFLICT body, shared by the standalone upsert and the foldable
-# CTE. Idempotent under retry; immutable run identity keyed by run_id.
+# Shared by the standalone upsert and the foldable CTE. Idempotent under retry;
+# run identity is immutable and keyed by run_id.
 _RUN_UPSERT_BODY = f"""INSERT INTO {P}runs
             (run_id, workflow_id, model_name, run_start_time, run_finish_time, run_params)
         VALUES (%s, %s, %s, %s, %s, %s)

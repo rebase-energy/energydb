@@ -32,16 +32,15 @@ _ENGINE_SCHEMA = os.environ.get("ENERGYDB_SCHEMA", "public") or "public"
 CH_ENGINE_TABLE = _engine_table_name(_ENGINE_TABLE_BASE, _ENGINE_SCHEMA)
 
 DROP_ENGINE_TABLE = f"DROP TABLE IF EXISTS {CH_ENGINE_TABLE}"
-# An older deployment on a named schema left a bare-named table targeting that
-# schema. Drop it on (re)provision so it can't later mislead a public client
-# (which expects the bare name to mean public). None when this already is the
-# bare name.
+# A bare-named table left by an older named-schema deployment would mislead a
+# public client, which expects the bare name to mean public. None when this
+# already is the bare name.
 DROP_LEGACY_ENGINE_TABLE = (
     None if CH_ENGINE_TABLE == _ENGINE_TABLE_BASE else f"DROP TABLE IF EXISTS {_ENGINE_TABLE_BASE}"
 )
 
-# The engine table mirrors the view. LEFT-JOIN-sourced columns are Nullable: path /
-# node_uuid are NULL for edge-owned series, the edge columns for node-owned ones.
+# LEFT-JOIN-sourced columns are Nullable: path and node_uuid are NULL for
+# edge-owned series, the edge columns for node-owned ones.
 _ENGINE_COLS = (
     "(series_id Int64, path Nullable(String), data_type String, name String, "
     "canonical_unit String, retention String, timeseries_type String, "
@@ -121,9 +120,8 @@ def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
     """
     named_collection = os.environ.get("ENERGYDB_CH_PG_COLLECTION")
     if named_collection:
-        # schema must be passed explicitly: without it the engine table inherits
-        # whatever schema the named collection encodes (default public), so a
-        # deployment on a named schema would resolve against the wrong series_meta.
+        # Without an explicit schema the engine table inherits whatever the named
+        # collection encodes, resolving against the wrong series_meta.
         source = f"{named_collection}, table = 'series_meta', schema = '{pg_schema}'"
     else:
         u = urlparse(pg_dsn)
