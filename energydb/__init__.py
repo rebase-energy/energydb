@@ -1,4 +1,4 @@
-"""EnergyDB — Energy database extending TimeDB with hierarchical asset management."""
+"""EnergyDB: Energy database extending TimeDB with hierarchical asset management."""
 
 from dotenv import load_dotenv
 
@@ -37,7 +37,7 @@ from energydatamodel import (  # noqa: E402
     SynchronousArea,
     VirtualPowerPlant,
     WeatherCell,
-    # Sub-namespaces — tech-specific equipment lives here
+    # Sub-namespaces: tech-specific equipment lives here
     battery,
     build_metric,
     building,

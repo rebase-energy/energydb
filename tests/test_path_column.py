@@ -4,7 +4,7 @@ Verify that the column is populated on insert, kept consistent on rename
 and move (self + descendants in one atomic UPDATE), and that the unique /
 non-empty constraints fire as designed.
 
-Live integration tests — skipped if ``TIMEDB_PG_DSN`` /
+Live integration tests: skipped if ``TIMEDB_PG_DSN`` /
 ``TIMEDB_CH_URL`` aren't set.
 """
 
@@ -20,7 +20,7 @@ from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping path-column tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping path-column tests",
         allow_module_level=True,
     )
 

@@ -1,13 +1,13 @@
 """Correctness tests for the UUID identity model + path-based fluent CLI.
 
-Live integration tests — skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
+Live integration tests: skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
 aren't set. UUID identity makes most of the formerly-tricky path issues
 trivial; the fluent CLI's path resolution still needs to handle special
 characters and disambiguation.
 
 * Duplicate names under different parents resolve independently.
 * Names with dots and unicode round-trip cleanly (``/`` is reserved as
-  the path separator and is rejected by name validation — see
+  the path separator and is rejected by name validation, see
   ``test_name_validation.py``).
 * Edges are addressed by ``uuid`` or by the ``(from_path, to_path,
   edge_type)`` triple.
@@ -30,7 +30,7 @@ from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping path-identity tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping path-identity tests",
         allow_module_level=True,
     )
 
@@ -176,7 +176,7 @@ def test_move_to_preserves_uuid_and_series(client):
     out = client.get_node("P", "NewSite", "T01").read(data_type="actual", name="capacity")
     assert out["value"].to_list() == [3.5, 3.5]
     # series_id is no longer surfaced on the public result; the per-call sid
-    # we registered above is still valid internally — confirmed by data integrity.
+    # we registered above is still valid internally, confirmed by data integrity.
     _ = sid
 
 
@@ -197,14 +197,14 @@ def test_move_to_collision_raises(client):
 
 
 def test_move_to_self_rejected(client):
-    """Moving a node into itself must raise — that would orphan it from the tree."""
+    """Moving a node into itself must raise; that would orphan it from the tree."""
     client.register_tree(edb.Portfolio(name="P", members=[edb.Site(name="S")]))
     with pytest.raises(ValueError, match="into itself"):
         client.get_node("P", "S").move_to(client.get_node("P", "S"))
 
 
 def test_move_to_descendant_rejected(client):
-    """Moving a node into one of its descendants must raise — would create a
+    """Moving a node into one of its descendants must raise; that would create a
     cycle in the parent chain."""
     client.register_tree(
         edb.Portfolio(
@@ -228,14 +228,14 @@ def test_same_name_different_type_rejected_under_one_parent(client):
     client.register_tree(edb.wind.WindTurbine(name="X", capacity=3.5), under=("P",))
 
     # Same name + different type under the same parent → rejected by the
-    # ``UNIQUE (parent_uuid, name)`` constraint (different uuid for Battery,
+    # UNIQUE (parent_uuid, name) constraint (different uuid for Battery,
     # so ON CONFLICT (uuid) doesn't fire; the unique key collision surfaces).
     with pytest.raises(psycopg.errors.UniqueViolation):
         client.register_tree(edb.battery.Battery(name="X", storage_capacity=10), under=("P",))
 
 
 # ---------------------------------------------------------------------------
-# Canonical `/`-joined string path form
+# Canonical /-joined string path form
 # ---------------------------------------------------------------------------
 
 

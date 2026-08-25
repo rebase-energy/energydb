@@ -21,7 +21,7 @@ from energydb.client import AsyncClient
 from energydb.models import SQL_SCHEMA_PREFIX as P
 
 # ---------------------------------------------------------------------------
-# Unit tests — mocked pool / td
+# Unit tests: mocked pool / td
 # ---------------------------------------------------------------------------
 
 
@@ -43,7 +43,8 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
     dispatch cursors per-SQL (e.g. path resolution vs existence checks).
 
     ``conn.cursor()`` is an async context manager yielding a cursor whose
-    ``executemany`` is awaitable — the batched ``register_tree`` insert path.
+    ``executemany`` is awaitable, as the batched ``register_tree`` insert
+    path needs.
     The cursor is exposed as ``conn._batch_cursor`` for assertions.
     """
     conn = MagicMock()
@@ -269,7 +270,7 @@ class TestRegisterTree:
                 res.fetchone = AsyncMock(return_value=("Region/Site",))
                 res.fetchall = AsyncMock(return_value=[])
             else:
-                # New target uuids — not yet in DB (existence pre-check).
+                # New target uuids: not yet in DB (existence pre-check).
                 res.fetchone = AsyncMock(return_value=None)
                 res.fetchall = AsyncMock(return_value=[])
             return res
@@ -498,7 +499,7 @@ def test_live_edge_triple_manifest_read_matches_uuid(live_edb):
     key = next(iter(kp_triple))
     assert (key.from_path, key.to_path, key.edge_type) == ("Grid/BusA", "Grid/BusB", "Line")
 
-    # get_raw is the light uuid fetch — no EDM reconstruction.
+    # get_raw is the light uuid fetch: no EDM reconstruction.
     raw = live_edb.get_edge("Grid/BusA", "Grid/BusB", type="Line").get_raw()
     assert str(raw["uuid"]) == str(edge_uuid)
     assert raw["edge_type"] == "Line"
@@ -627,6 +628,6 @@ def test_live_edge_triple_read_matches_uuid_read(live_edb):
     by_triple = live_edb.get_edge("Grid2/BusX", "Grid2/BusY", type="Line").read(data_type="actual", name="power_flow")
     assert by_uuid.equals(by_triple)
 
-    # Missing edge under triple addressing raises (same contract as before the collapse).
+    # Missing edge under triple addressing raises, matching uuid addressing.
     with pytest.raises(ValueError, match="Edge not found"):
         live_edb.get_edge("Grid2/BusX", "Grid2/BusY", type="nonexistent").read(data_type="actual", name="power_flow")

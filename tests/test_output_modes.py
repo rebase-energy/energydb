@@ -27,7 +27,7 @@ from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping output-mode tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping output-mode tests",
         allow_module_level=True,
     )
 
@@ -230,7 +230,7 @@ def test_manifest_with_list_utf8_paths_is_rejected(client):
 def test_scope_single_series_read_strips_identity(client):
     """Scope-style read on a fully-qualified single series drops path/data_type/name.
 
-    The caller already knows them via the scope expression — re-broadcasting
+    The caller already knows them via the scope expression, re-broadcasting
     on every row is pure noise.
     """
     out = client.get_node("P", "T1").read(data_type="actual", name="power")
@@ -248,7 +248,7 @@ def test_scope_single_series_read_pandas_strips_identity(client):
 def test_scope_subtree_read_keeps_full_shape(client):
     """When the scope resolves to multiple series, identity cols stay.
 
-    ``get_node("P").read()`` spans all WindTurbines under P (T1, T2, T3 — each
+    ``get_node("P").read()`` spans all WindTurbines under P (T1, T2, T3, each
     with one series), so the manifest has 3 rows. With a multi-series read we
     can't infer a single identity, so ``path`` / ``data_type`` / ``name``
     remain on every row.
@@ -263,7 +263,7 @@ def test_scope_subtree_read_keeps_full_shape(client):
 
 
 def test_scope_single_series_with_by_path_returns_dict(client):
-    """``output='by_path'`` skips auto-strip — caller asked for the dict shape explicitly."""
+    """``output='by_path'`` skips auto-strip: caller asked for the dict shape explicitly."""
     out = client.get_node("P", "T1").read(data_type="actual", name="power", output="by_path")
     assert isinstance(out, dict)
     assert ("P/T1", "actual", "power") in out
@@ -287,7 +287,7 @@ def test_by_path_keys_are_series_key(client):
     assert all(isinstance(k, edb.SeriesKey) for k in keys)
     # Backwards-compat: positional access still works (NamedTuple == tuple).
     assert out[("P/T1", "actual", "power")]["value"].to_list() == [1.0, 2.0]
-    # Attribute access — the whole point.
+    # Attribute access: the whole point.
     one = [k for k in keys if k.path == "P/T1"][0]
     assert one.path == "P/T1"
     assert one.data_type == "actual"
@@ -340,7 +340,7 @@ def test_engine_read_matches_sequential(client, monkeypatch):
     through the same engine path in the live edge tests.)
 
     Skips if the engine can't reach Postgres from ClickHouse's network vantage (the
-    CREATE TABLE never dials PG, so an unreachable engine only surfaces on first use —
+    CREATE TABLE never dials PG, so an unreachable engine only surfaces on first use,
     e.g. local docker without ENERGYDB_CH_PG_HOST=postgres:5432). Runs in strict mode so
     a broken engine path raises instead of silently falling back (which would trivially pass).
     """

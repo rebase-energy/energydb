@@ -15,7 +15,7 @@ from energydb import AsyncClient, Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping integration tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping integration tests",
         allow_module_level=True,
     )
 
@@ -172,7 +172,7 @@ def test_cross_retention_read_is_single_query(edb):
     result = asset.read()
     # Two series × 2 rows = 4 rows
     assert len(result) == 4
-    # Two distinct (data_type, name) pairs on the result — series_id is internal
+    # Two distinct (data_type, name) pairs on the result; series_id is internal
     # and no longer surfaced.
     pairs = set(zip(result["data_type"].to_list(), result["name"].to_list(), strict=True))
     assert pairs == {("actual", "capacity"), ("forecast", "power")}
@@ -269,7 +269,9 @@ def test_default_polars_empty_read(edb):
     assert len(result) == 0
 
 
-# ── write_manifest run-row semantics (autocommit fold, W2) ────────────────────
+# ---------------------------------------------------------------------------
+# write_manifest run-row semantics (autocommit fold, W2)
+# ---------------------------------------------------------------------------
 
 
 def _runs_rows() -> list[int]:

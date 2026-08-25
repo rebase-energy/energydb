@@ -4,7 +4,7 @@ The original join-based implementation could leak internal ``_dt`` /
 ``_name`` columns into the resolved frame; the current hash-prejoin
 implementation can't, but the no-leak contract is still pinned here.
 Also covers the ``(resolved, summary)`` return shape and per-row column
-contract (``series_id`` / ``retention`` / ``canonical_unit`` only —
+contract (``series_id`` / ``retention`` / ``canonical_unit`` only,
 ``timeseries_type`` lives in the summary now).
 """
 
@@ -29,7 +29,7 @@ def _mock_conn_with_series(rows: list[tuple]) -> MagicMock:
 
 def test_node_manifest_resolve_does_not_leak_internal_join_columns():
     node_uuid = uuid4()
-    # PG returns owner uuid as ``::text`` after the SQL cast — mock with str.
+    # PG returns owner uuid as :text after the SQL cast; mock with str.
     # Column order: owner::text, data_type, name, series_id, canonical_unit,
     #               timeseries_type, retention, [path when attach_path=True].
     rows = [
@@ -137,7 +137,7 @@ def test_overlapping_surfaces_in_summary():
 def test_summary_names_only_the_overlapping_series_by_uuid_route():
     """``overlapping_series_ids`` is what lets one write dedupe FLAT and
     OVERLAPPING series by different keys, so it must name exactly the
-    OVERLAPPING ones — not all resolved series, not just a boolean."""
+    OVERLAPPING ones, not all resolved series, not just a boolean."""
     n1, n2, n3 = uuid4(), uuid4(), uuid4()
     rows = [
         (str(n1), "actual", "power", 1, "MW", "FLAT", "forever", "P/A"),
@@ -158,7 +158,7 @@ def test_summary_names_only_the_overlapping_series_by_uuid_route():
 
 
 def test_summary_names_only_the_overlapping_series_by_path_route():
-    """Same contract on the path route — the ids come from the resolved metadata
+    """Same contract on the path route: the ids come from the resolved metadata
     either way, so both routes must agree."""
     rows = [
         ("P/A", "actual", "power", 10, "MW", "FLAT", "forever", str(uuid4())),
@@ -184,7 +184,7 @@ def test_summary_is_empty_for_a_flat_only_manifest():
 
     assert summary.overlapping_series_ids == frozenset()
     assert summary.has_overlapping is False
-    # ``missing`` is always present — zero-row, with the route's schema — so a
+    # missing is always present: zero-row, with the route's schema, so a
     # caller can select on it without first checking whether anything was skipped.
     assert summary.missing.is_empty()
     assert summary.missing.columns == ["path", "data_type", "name"]
@@ -193,7 +193,7 @@ def test_summary_is_empty_for_a_flat_only_manifest():
 def test_unresolved_triple_raises_with_owner_message():
     """A triple not returned by PG raises with the historical owner/dt/name message."""
     node_uuid = uuid4()
-    # PG returns nothing — every triple in the manifest is unresolved.
+    # PG returns nothing: every triple in the manifest is unresolved.
     conn = _mock_conn_with_series([])
 
     manifest = pl.DataFrame(
@@ -270,7 +270,7 @@ def test_edge_triple_manifest_resolves_in_one_round_trip():
     assert resolved["from_path"].to_list() == ["Grid/A"]
     assert resolved["to_path"].to_list() == ["Grid/B"]
     assert resolved["edge_type"].to_list() == ["Line"]
-    # The edge's own name rides along too — null here, for an unnamed edge.
+    # The edge's own name rides along too, null here for an unnamed edge.
     assert resolved["edge_name"].to_list() == [None]
     assert summary.has_overlapping is False
 

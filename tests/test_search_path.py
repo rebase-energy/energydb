@@ -1,12 +1,12 @@
 """energydb must not care what ``search_path`` is.
 
-This module used to pin *how* energydb set the search path — first a ``SET`` +
+Earlier versions pinned *how* energydb set the search path: first a ``SET`` +
 commit in the pool's ``configure`` callback, then a libpq startup ``options``
 parameter. Both were transports for the same idea: put the schema into
 per-connection session state and let unqualified relation names resolve against
 it. Behind a transaction-mode pooler that idea does not hold. PgBouncer-based
 poolers (Neon's pooled endpoints) reject the ``options`` startup parameter
-outright — every connect fails — and the older ``SET`` is worse than it looks,
+outright, so every connect fails; and the older ``SET`` is worse than it looks,
 because a pooler hands out a possibly-different server connection per
 transaction, so the session state a client set is not the state its next
 statement runs under.
@@ -18,7 +18,7 @@ someone else's business: whatever the server, the role, or a proxy says, it does
 not change what energydb reads or writes.
 
 The tests below are that contract. :func:`test_no_relation_reference_is_left_unqualified`
-is the regression lock — it scans the package source, so SQL added next year is
+is the regression lock: it scans the package source, so SQL added later is
 covered without anyone remembering this file exists.
 """
 
@@ -50,14 +50,14 @@ def _package_sources() -> list[Path]:
 
 
 # The two spellings of "a schema prefix is interpolated here" that exist in the
-# package: ``{P}`` (``models.SQL_SCHEMA_PREFIX``, aliased at every import site)
-# and ``{qualifier}`` (``_ch_meta_engine.series_meta_view_ddl``, whose prefix is
-# a parameter). A third spelling should fail this test until it is added here —
+# package: {P} (models.SQL_SCHEMA_PREFIX, aliased at every import site)
+# and {qualifier} (_ch_meta_engine.series_meta_view_ddl, whose prefix is
+# a parameter). A third spelling should fail this test until it is added here;
 # that is a deliberate speed bump, not an oversight.
 _QUALIFIERS = ("{P}", "{qualifier}")
 
-# The SQL positions where a bare word is a relation name. ``DELETE FROM`` is
-# covered by the ``FROM`` branch; it is spelled out so the intent is readable.
+# The SQL positions where a bare word is a relation name. DELETE FROM is
+# covered by the FROM branch; it is spelled out so the intent is readable.
 _RELATION_POSITION = r"\b(?:DELETE\s+FROM|FROM|JOIN|INTO|UPDATE)\s+"
 
 
@@ -94,7 +94,7 @@ def test_no_relation_reference_is_left_unqualified():
     """**The regression lock.** Every ``FROM`` / ``JOIN`` / ``INTO`` / ``UPDATE``
     naming one of energydb's own relations must carry the schema prefix, in every
     module, forever. An unqualified name would silently reintroduce the
-    search_path dependency — and would keep working on the author's direct
+    search_path dependency, and would keep working on the author's direct
     PostgreSQL connection while failing behind a pooler."""
     offenders = [hit for path in _package_sources() for hit in _unqualified_hits(path.read_text(), path.name)]
 
@@ -127,7 +127,7 @@ pytestmark_live = pytest.mark.skipif(
 
 @pytestmark_live
 def test_the_pool_gets_the_callers_conninfo_verbatim():
-    """There is no conninfo rewrite any more — the pool and ``_dsn`` both hold
+    """There is no conninfo rewrite: the pool and ``_dsn`` both hold
     exactly what the caller passed. Rewriting it was how the 0.9.0 startup-option
     transport worked, and how it broke every pooled deployment; assert the
     absence so nobody quietly adds a new augmentation."""
@@ -136,8 +136,8 @@ def test_the_pool_gets_the_callers_conninfo_verbatim():
     try:
         assert c._async._dsn == caller_dsn
         assert str(c._async._pool.conninfo) == caller_dsn
-        # The URI form is what ``_sqlalchemy_url`` / ``engine_table_ddl`` /
-        # ``_safe_dsn`` all parse, so it has to survive intact.
+        # The URI form is what _sqlalchemy_url / engine_table_ddl /
+        # _safe_dsn all parse, so it has to survive intact.
         assert c._async._sqlalchemy_url().startswith("postgresql+psycopg://")
         assert "***@" in c._async._safe_dsn()
     finally:
@@ -148,7 +148,7 @@ def test_the_pool_gets_the_callers_conninfo_verbatim():
 def test_the_connection_is_not_left_in_a_transaction():
     """``configure`` sets a client-side attribute and nothing else. If anything
     there opened a transaction, ``psycopg_pool`` would reject the connection on
-    return — so borrow and return one twice."""
+    return, so borrow and return one twice."""
     c = Client()
     try:
         for _ in range(2):
@@ -170,8 +170,8 @@ def hostile_search_path(monkeypatch):
     of energydb's relations.
 
     Patches the pool *class* energydb constructs rather than an already-built
-    pool, so connections created later — including ones the pool grows under
-    load — get the hostile setting too. Direct PostgreSQL accepts a
+    pool, so connections created later, including ones the pool grows under
+    load, get the hostile setting too. Direct PostgreSQL accepts a
     per-connection ``SET`` fine; the point is not that the setting is exotic but
     that energydb is indifferent to it.
     """
@@ -198,8 +198,8 @@ def hostile_search_path(monkeypatch):
     reason="the default (public) schema resolves through the server's own search path by design",
 )
 def test_a_hostile_search_path_changes_nothing(hostile_search_path):
-    """**The behaviour the qualification buys.** A full lifecycle — provision,
-    structure, series registration, write, read, catalog listing, teardown — on
+    """**The behaviour the qualification buys.** A full lifecycle (provision,
+    structure, series registration, write, read, catalog listing, teardown) on
     connections whose search path contains none of energydb's tables. Any query
     still leaning on session state fails loudly right here.
 
@@ -237,8 +237,8 @@ def test_a_hostile_search_path_changes_nothing(hostile_search_path):
             name="flow", canonical_unit="MW", data_type="actual", timeseries_type="FLAT", retention="forever"
         )
 
-        # The catalog read (``series``) and the run-recording write path
-        # (``runs`` + the folded resolve CTE).
+        # The catalog read (series) and the run-recording write path
+        # (runs + the folded resolve CTE).
         assert [r["series_id"] for r in c.list_series(node_uuid)] == [sid]
         assert [r["name"] for r in c.list_series(edge_uuid, owner_col="edge_uuid")] == ["flow"]
 
@@ -258,7 +258,7 @@ def test_a_hostile_search_path_changes_nothing(hostile_search_path):
 
 @pytestmark_live
 def test_the_full_cycle_still_works():
-    """End-to-end smoke on the configured schema, with the pool left alone —
+    """End-to-end smoke on the configured schema, with the pool left alone:
     the same cycle as above minus the hostility, so a failure here separates
     "energydb is broken" from "energydb depends on the search path"."""
     import energydb as edb

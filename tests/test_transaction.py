@@ -23,7 +23,7 @@ from energydb import Client, TreeDiff
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping transaction tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping transaction tests",
         allow_module_level=True,
     )
 
@@ -139,7 +139,7 @@ def test_preview_includes_register_tree(populated):
 def test_mid_txn_read_sees_uncommitted_writes(populated):
     with populated.transaction() as txn:
         txn.get_node("P", "S", "T1").rename("T1-A")
-        # Re-fetch via txn — must reflect the rename.
+        # Re-fetch via txn: must reflect the rename.
         node = txn.get_node("P", "S", "T1-A").get()
         assert node.name == "T1-A"
         txn.commit()

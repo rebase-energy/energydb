@@ -1,7 +1,7 @@
 """Dry-run integration tests for NodeScope and EdgeScope mutators.
 
 Each mutator with ``dry_run=True`` returns a :class:`TreeDiff` describing
-the change and rolls the transaction back — the DB is unchanged after.
+the change and rolls the transaction back; the DB is unchanged after.
 
 Skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL`` are not set.
 """
@@ -17,7 +17,7 @@ from energydb import Client, TreeDiff
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping dry_run tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping dry_run tests",
         allow_module_level=True,
     )
 

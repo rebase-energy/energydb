@@ -3,11 +3,11 @@
 Thin layer over EDM's JSON round-trip system (``energydatamodel.json_io``).
 Each EDM element maps to a single DB row with structural columns
 (``uuid``, ``node_type`` / ``edge_type``, ``name``, FK uuids)
-plus a single ``data`` JSONB column carrying every remaining field —
+plus a single ``data`` JSONB column carrying every remaining field:
 geometry (GeoJSON), tz (ZoneInfo), commissioning_date (ISO), sensor
 height, and all domain properties.
 
-Identity is the EDM ``Element.id`` (UUID7) — round-tripped as the row's
+Identity is the EDM ``Element.id`` (UUID7): round-tripped as the row's
 ``uuid`` PK on both ``node`` and ``edge``.
 """
 
@@ -24,8 +24,8 @@ from psycopg.types.json import Jsonb
 
 from energydb.errors import ValidationError
 
-# ``id`` is round-tripped via the dedicated ``uuid`` column, not through the
-# ``data`` JSONB blob. Same for fields stored as their own columns.
+# id is round-tripped via the dedicated uuid column, not through the
+# data JSONB blob. Same for fields stored as their own columns.
 _NODE_EXCLUDES = {"id", "timeseries"}
 _EDGE_EXCLUDES = {"id", "from_element", "to_element", "timeseries"}
 
@@ -34,7 +34,7 @@ _EDGE_EXCLUDES = {"id", "from_element", "to_element", "timeseries"}
 def _type_registry() -> dict[str, type]:
     """Name → class lookup for every EDM Element subclass.
 
-    Cached for the process lifetime — the EDM class hierarchy is fixed at
+    Cached for the process lifetime: the EDM class hierarchy is fixed at
     import time, so we don't need to re-walk it on every reconstruct call.
     """
     return get_registry()
@@ -65,7 +65,7 @@ def serialize_node(edm_obj) -> dict[str, Any]:
 
     Returns a dict with structural columns (``uuid``, ``node_type``, ``name``)
     and a JSONB-wrapped ``data`` blob carrying everything else. Children are
-    excluded — tree structure is stored via the ``parent_uuid`` column.
+    excluded; tree structure is stored via the ``parent_uuid`` column.
     """
     storage = edm.element_to_storage_dict(edm_obj, extra_excludes=_NODE_EXCLUDES)
     node_type = storage.pop("__type__")
@@ -107,7 +107,7 @@ def serialize_edge(edm_obj) -> dict[str, Any]:
 
     The edge name is a human label, not an identifier (the triple
     ``(edge_type, from_node_uuid, to_node_uuid)`` is the upsert key).
-    ``from_element`` / ``to_element`` are excluded from ``data`` — they're
+    ``from_element`` / ``to_element`` are excluded from ``data``; they're
     stored as ``from_node_uuid`` / ``to_node_uuid`` FK columns.
     """
     storage = edm.element_to_storage_dict(edm_obj, extra_excludes=_EDGE_EXCLUDES)
@@ -126,8 +126,8 @@ def reconstruct_edge(row: dict[str, Any]):
 
     Expects ``row`` to have ``uuid``, ``edge_type``, ``name``, ``data``,
     ``from_node_uuid``, ``to_node_uuid``. Endpoints are returned as
-    :class:`Reference` objects holding the endpoint uuids — no path round-
-    trip needed.
+    :class:`Reference` objects holding the endpoint uuids, with no path
+    round-trip needed.
     """
     edge_type = row["edge_type"]
     cls = _type_registry().get(edge_type)
@@ -136,10 +136,10 @@ def reconstruct_edge(row: dict[str, Any]):
     if not issubclass(cls, edm.Edge):
         raise TypeError(f"edge table row has type {edge_type} which is not an Edge subclass")
 
-    # Endpoints come from the FK columns, not the JSONB blob — those are
-    # the authoritative source. We attach them as ``Reference`` after
-    # ``element_from_json`` so stale endpoint refs that might survive in
-    # ``data`` are overwritten unconditionally.
+    # Endpoints come from the FK columns, not the JSONB blob; those are the
+    # authoritative source. They are attached as Reference after
+    # element_from_json, so stale endpoint refs surviving in data are
+    # overwritten unconditionally.
     obj = edm.element_from_json(_build_storage_dict(row, type_col="edge_type"))
     from_uuid = row.get("from_node_uuid")
     to_uuid = row.get("to_node_uuid")

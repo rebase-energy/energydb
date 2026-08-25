@@ -3,21 +3,21 @@
 Every exception energydb raises deliberately derives from
 :class:`EnergyDBError`. Every class that replaced a bare ``ValueError`` raise
 site *also* derives from :class:`ValueError`, so any existing
-``except ValueError`` handler keeps working unchanged — the taxonomy is
+``except ValueError`` handler keeps working unchanged; the taxonomy is
 additive by construction.
 
 The not-found family carries structured identifier fields (``path``,
-``uuid``, ``route``, ``missing``, …) so callers — API servers in particular —
+``uuid``, ``route``, ``missing``, …) so callers, API servers in particular,
 can react programmatically instead of matching message text. Fields are
 keyword-only, stored under their own name, and default to ``None`` when the
-raise site doesn't know them. ``message`` stays ``args[0]``, so ``str(e)`` is
-unchanged from the bare-``ValueError`` era.
+raise site doesn't know them. ``message`` stays ``args[0]``, so ``str(e)``
+matches the bare-``ValueError`` form.
 
 This module sits at the bottom of the package dependency graph: it imports
 nothing from the rest of energydb at runtime, so every other module can
 import it freely. :class:`IncompatibleUnitError` keeps its definition in
 :mod:`energydb.units` (import stability) and is re-exported here lazily via
-:pep:`562` — ``units`` imports this module for :class:`EnergyDBError`, so a
+:pep:`562`: ``units`` imports this module for :class:`EnergyDBError`, so a
 module-level re-export would be a cycle.
 """
 
@@ -36,7 +36,7 @@ class EnergyDBError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Not found — an *addressed* entity does not exist
+# Not found: an addressed entity does not exist
 # ---------------------------------------------------------------------------
 
 
@@ -64,7 +64,7 @@ class EdgeNotFoundError(NotFoundError):
 
     ``name`` is the edge name that narrowed the lookup, or ``None`` when the
     caller addressed by the bare triple (which, for a multigraph, may match
-    several edges — see :class:`AmbiguousEdgeError`).
+    several edges, see :class:`AmbiguousEdgeError`).
     """
 
     def __init__(
@@ -93,7 +93,7 @@ class SeriesNotFoundError(NotFoundError):
 
     ``missing`` carries *every* unresolved key, not just the one named in the
     message. Each entry is the route's owner identity followed by
-    ``(data_type, name)`` — a 3-tuple for the single-column routes
+    ``(data_type, name)``: a 3-tuple for the single-column routes
     (``(owner, data_type, name)``), and a 5-tuple for ``"edge_triple"``, whose
     owner is itself the ``(from_path, to_path, edge_type)`` triple. Read the
     last two elements for the series, and the leading ones for the owner.
@@ -108,8 +108,8 @@ class SeriesNotFoundError(NotFoundError):
     ):
         super().__init__(message)
         self.route = route
-        # ``Sequence`` on the way in (``list`` is invariant, so a caller's
-        # ``list[tuple[str, str, str]]`` would not be assignable); normalized to
+        # Sequence on the way in (list is invariant, so a caller's
+        # list[tuple[str, str, str]] would not be assignable); normalized to
         # a list on the way out so consumers get one predictable type.
         self.missing: list[tuple[str, ...]] | None = None if missing is None else list(missing)
 
@@ -148,8 +148,8 @@ class AmbiguousEdgeError(ValidationError):
     """An edge triple matches more than one edge and no ``name`` narrowed it.
 
     ``edge`` is a multigraph: ``(edge_type, from_node_uuid, to_node_uuid,
-    name)`` is the unique key, so several *parallel* edges — the six circuits
-    of a double-circuit corridor, say — can share one endpoint pair and type
+    name)`` is the unique key, so several *parallel* edges (the six circuits
+    of a double-circuit corridor, say) can share one endpoint pair and type
     and are told apart by their ``name``. Any triple-addressed lookup that
     lands on more than one of them is a genuinely ambiguous address, and
     energydb refuses to guess.
@@ -175,7 +175,7 @@ class AmbiguousEdgeError(ValidationError):
         self.to_path = to_path
         self.edge_type = edge_type
         # Normalized to a list of plain dicts on the way out, mirroring
-        # ``SeriesNotFoundError.missing``: one predictable type for consumers.
+        # SeriesNotFoundError.missing: one predictable type for consumers.
         self.matches: list[dict[str, Any]] | None = None if matches is None else [dict(m) for m in matches]
 
 

@@ -1,4 +1,4 @@
-"""``read(on_missing=)`` — read past unregistered series instead of failing.
+"""``read(on_missing=)``: read past unregistered series instead of failing.
 
 ``resolve_manifest`` used to raise on the *first* unresolvable
 ``(owner, data_type, name)`` triple, so a manifest of 1,500 series returned
@@ -9,9 +9,9 @@ nothing because one series wasn't registered. Two changes:
 * ``on_missing="skip"`` drops them from the read and returns
   ``ReadResult(data, missing)`` instead.
 
-Writes are deliberately left strict — dropping rows there is data loss, not a
-completeness report — and structural manifest errors raise under both settings,
-because they are caller bugs rather than catalog gaps.
+Writes are deliberately left strict, since dropping rows there is data loss
+rather than a completeness report. Structural manifest errors raise under both
+settings, because they are caller bugs rather than catalog gaps.
 
 The pure tests drive the resolver over a mocked connection; the live tests cover
 the client return shapes, output/backend modes, and engine-vs-sequential parity.
@@ -61,7 +61,7 @@ def _path_manifest(*paths: str) -> pl.DataFrame:
 
 def test_a_single_miss_keeps_the_historical_message():
     """One unresolved triple is the overwhelmingly common case and its message is
-    already good — callers (and psd) match on this exact prefix."""
+    already good; callers (and psd) match on this exact prefix."""
     conn = _mock_conn_with_series([])
     with pytest.raises(SeriesNotFoundError) as excinfo:
         asyncio.run(resolve_manifest(conn, _path_manifest("P/A")))
@@ -149,7 +149,7 @@ def test_skip_with_everything_missing_returns_an_empty_frame_not_a_raise():
     resolved, summary = asyncio.run(resolve_manifest(conn, _path_manifest("P/A", "P/B"), on_missing="skip"))
 
     assert resolved.height == 0
-    # Still the full resolved schema — downstream projection selects these by name.
+    # Still the full resolved schema; downstream projection selects these by name.
     for col in ("path", "data_type", "name", "series_id", "canonical_unit", "retention", "node_uuid"):
         assert col in resolved.columns
     assert set(summary.missing.rows()) == {("P/A", "actual", "power"), ("P/B", "actual", "power")}
@@ -283,7 +283,7 @@ def test_an_invalid_on_missing_value_is_rejected():
             )
         )
 
-    # The message must name the valid values — the caller has to be able to fix
+    # The message must name the valid values; the caller has to be able to fix
     # the typo without reading the source.
     assert "['raise', 'skip']" in str(excinfo.value)
     assert "'ignore'" in str(excinfo.value)
@@ -316,7 +316,7 @@ def test_read_result_is_a_public_unpackable_namedtuple():
 
 def test_the_sync_facade_passes_read_result_through_untouched():
     """``_wrap`` only proxies objects with an async surface. A ``NamedTuple`` of
-    frames has none, so the sync ``Client`` must hand back the real thing —
+    frames has none, so the sync ``Client`` must hand back the real thing,
     otherwise ``data, missing = client.read(...)`` would unpack a proxy.
 
     ``portal=None`` is the point: a portal-free object must never reach for one.
@@ -341,7 +341,7 @@ BASE = datetime(2026, 3, 1, tzinfo=UTC)
 @pytest.fixture
 def client():
     """Two turbines with a registered ``actual/power`` series and data; a third
-    turbine exists as a *node* but has no series registered — the catalog gap."""
+    turbine exists as a *node* but has no series registered: the catalog gap."""
     c = Client()
     c.delete()
     c.create()
@@ -385,8 +385,8 @@ def test_one_unregistered_series_no_longer_costs_the_whole_batch(client):
 
     data, missing = client.read(_manifest("P/T1", "P/T2", "P/T3"), on_missing="skip")
 
-    # Byte-identical to reading the pre-filtered manifest — "skip" changes what is
-    # asked for, never how the rest is read.
+    # Byte-identical to reading the pre-filtered manifest: "skip" changes what
+    # is asked for, never how the rest is read.
     assert data.equals(client.read(_manifest("P/T1", "P/T2")))
     assert missing.rows() == [("P/T3", "actual", "power")]
 
@@ -408,7 +408,7 @@ def test_skip_returns_a_read_result_and_raise_returns_the_bare_frame(client):
 
 @pytestmark_live
 def test_skip_with_every_triple_missing_yields_the_empty_read_shape(client):
-    """No raise, no rows, and the gap fully reported — the all-or-nothing case a
+    """No raise, no rows, and the gap fully reported: the all-or-nothing case a
     caller hits when a whole workflow's series were never registered."""
     manifest = _manifest("P/T3")
 
@@ -434,7 +434,7 @@ def test_skip_with_by_path_output_omits_the_missing_keys(client):
 @pytestmark_live
 def test_skip_follows_the_pandas_backend_for_both_elements(client):
     """``missing`` is user-facing output, so it converts at the same boundary
-    ``data`` does — a caller who asked for pandas gets pandas throughout."""
+    ``data`` does: a caller who asked for pandas gets pandas throughout."""
     data, missing = client.read(_manifest("P/T1", "P/T3"), backend="pandas", on_missing="skip")
 
     assert isinstance(data, pd.DataFrame)
@@ -447,7 +447,8 @@ def test_skip_follows_the_pandas_backend_for_both_elements(client):
 def test_skip_is_identical_over_the_engine_and_the_sequential_path(client, monkeypatch):
     """The engine predicate is a superset built from the *unfiltered* manifest, so
     a skipped triple must not be able to leak values in through it. The values are
-    semi-joined against the exact resolve, which is what makes that true — pin it.
+    semi-joined against the exact resolve, which is what makes that true; this
+    test pins it.
     """
     import energydb._io as _io
 
@@ -467,7 +468,7 @@ def test_skip_is_identical_over_the_engine_and_the_sequential_path(client, monke
 @pytestmark_live
 def test_read_relative_takes_on_missing_too(client):
     """``read`` and ``read_relative`` share the manifest resolve, so the parameter
-    has to reach both — a caller on the relative window shouldn't have to switch
+    has to reach both: a caller on the relative window shouldn't have to switch
     APIs to survive a catalog gap."""
     # A huge issue_offset keeps the fixture's rows inside their window.
     data, missing = client.read_relative(

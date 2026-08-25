@@ -1,4 +1,4 @@
-"""Integration tests for ``register_tree`` — create-only semantics, dry_run,
+"""Integration tests for ``register_tree``: create-only semantics, dry_run,
 type-change rejection, cross-tree edge rejection, "already exists" guard.
 
 Modifications to existing rows go through scope mutators or
@@ -19,7 +19,7 @@ from energydb import Client, TreeDiff
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping register_tree tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping register_tree tests",
         allow_module_level=True,
     )
 
@@ -52,7 +52,7 @@ def test_register_creates_tree(client):
 
 
 def test_register_existing_uuid_raises(client):
-    """Re-registering the same tree should raise — register_tree is create-only."""
+    """Re-registering the same tree should raise: register_tree is create-only."""
     tree = edb.Portfolio(
         name="P",
         members=[edb.Site(name="S", members=[edb.wind.WindTurbine(name="T", capacity=3.5)])],
@@ -130,7 +130,7 @@ def test_cross_tree_edge_rejected(client):
 
 
 # ---------------------------------------------------------------------------
-# Type change rejection — would only fire if a duplicate UUID survived the
+# Type change rejection: would only fire if a duplicate UUID survived the
 # create-only guard. Kept as a defense-in-depth check.
 # ---------------------------------------------------------------------------
 

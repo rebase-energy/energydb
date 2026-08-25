@@ -56,7 +56,7 @@ class TestFlattenSegments:
         assert _flatten_segments(("P", "Site", "T01")) == ("P", "Site", "T01")
 
     def test_string_with_slash_splits(self):
-        # Structured form with an embedded separator — still split.
+        # Structured form with an embedded separator, still split.
         assert _flatten_segments(("P/Site", "T01")) == ("P", "Site", "T01")
 
     def test_all_strings_split(self):
@@ -88,7 +88,7 @@ class TestCoercePath:
         assert _coerce_path((["P", "Site", "T01"],)) == ("P", "Site", "T01")
 
     def test_tuple_arg_with_string_segments_split(self):
-        # Strings inside a tuple are still split — full consistency.
+        # Strings inside a tuple are still split, for full consistency.
         assert _coerce_path((("P/Site", "T01"),)) == ("P", "Site", "T01")
 
     def test_kwarg_string(self):
@@ -101,8 +101,8 @@ class TestCoercePath:
         assert _coerce_path((), kwarg=["P", "Site", "T01"]) == ("P", "Site", "T01")
 
     def test_empty_args_empty_kwarg_returns_empty(self):
-        # Caller-side empty input: preserves the historical contract that
-        # downstream resolvers raise on empty paths, not _coerce_path itself.
+        # Caller-side empty input: by contract the downstream resolvers raise
+        # on empty paths, not _coerce_path itself.
         assert _coerce_path(()) == ()
 
     def test_empty_string_arg_raises(self):

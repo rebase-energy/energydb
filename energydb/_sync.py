@@ -2,21 +2,21 @@
 
 The library is async-native: :class:`energydb.client.AsyncClient` is the
 single implementation. Synchronous callers (scripts, notebooks, the test
-suite) get :class:`Client` — a thin, *generic* facade that runs the async
+suite) get :class:`Client`, a thin, *generic* facade that runs the async
 client's coroutines to completion on a dedicated background event loop and
 returns plain results.
 
 Two mechanisms, no per-method code and no codegen:
 
-* **Portal** — a daemon thread running one asyncio event loop for the
+* **Portal**: a daemon thread running one asyncio event loop for the
   client's whole lifetime. Coroutines are submitted to it with
   :func:`asyncio.run_coroutine_threadsafe` and awaited via ``.result()``,
   which blocks the caller and re-raises any exception. Because the pool is
   opened on this loop and every call runs on it, all connections stay bound
   to a single loop (psycopg's requirement). psycopg constrains the *kind* of
-  loop too, not just how many — see :func:`_new_portal_loop`.
-* **Reflection proxy** — :func:`_wrap` inspects the wrapped object: coroutine
-  methods become blocking calls; sync methods that return fluent scopes /
+  loop too, not just how many; see :func:`_new_portal_loop`.
+* **Reflection proxy**: :func:`_wrap` inspects the wrapped object, so
+  coroutine methods become blocking calls; sync methods that return scopes /
   transactions get their results wrapped too (so chains like
   ``client.get_node(...).where(...).get()`` work); async context managers
   (``Transaction``) are bridged to the sync ``with`` protocol. Plain results
@@ -41,7 +41,7 @@ def _new_portal_loop(platform: str = sys.platform) -> asyncio.AbstractEventLoop:
     psycopg refuses to run in async mode on Windows' default
     ``ProactorEventLoop``: ``AsyncConnection.connect`` raises ``InterfaceError``
     on sight of one, before it ever dials the server. Inside a pool that
-    failure is invisible — the background connect worker only *logs* it, so the
+    failure is invisible: the background connect worker only *logs* it, so the
     caller blocks for the full timeout and gets a bare ``PoolTimeout`` naming
     nothing but the database it never contacted.
 
@@ -93,7 +93,7 @@ def _has_coro_methods(obj: Any) -> bool:
 
 
 class _SyncProxy:
-    """Synchronous view over an async object — see :func:`_wrap`.
+    """Synchronous view over an async object: see :func:`_wrap`.
 
     Coroutine methods are run on the portal and their results re-wrapped;
     sync methods returning further async objects are wrapped too; async
@@ -109,9 +109,9 @@ class _SyncProxy:
 
     @property
     def __class__(self):
-        # Transparent-proxy spoof: ``isinstance(proxy, NodeScope)`` holds for
-        # sync callers (scopes look like the real thing), while ``type(proxy)``
-        # stays ``_SyncProxy`` so :func:`_unwrap` still detects proxies.
+        # Transparent-proxy spoof: isinstance(proxy, NodeScope) holds for
+        # sync callers (scopes look like the real thing), while type(proxy)
+        # stays _SyncProxy so _unwrap still detects proxies.
         return type(object.__getattribute__(self, "_obj"))
 
     def __getattr__(self, name: str) -> Any:
@@ -136,7 +136,9 @@ class _SyncProxy:
             return call_and_wrap
         return attr
 
-    # -- async context-manager bridge (e.g. Transaction) --------------
+    # -----------------------------------------------------------------------
+    # async context-manager bridge (e.g. Transaction)
+    # -----------------------------------------------------------------------
     def __enter__(self) -> Any:
         obj = object.__getattribute__(self, "_obj")
         portal = object.__getattribute__(self, "_portal")
@@ -185,18 +187,16 @@ def _wrap(obj: Any, portal: _Portal) -> Any:
 
 
 class Client:
-    """Synchronous EnergyDB client — a blocking facade over :class:`AsyncClient`.
+    """Synchronous EnergyDB client: a blocking facade over :class:`AsyncClient`.
 
     Accepts the same constructor arguments as :class:`AsyncClient`. The
     connection pool is opened eagerly on construction.
 
     ``client.namespace(ns)`` works here too: the reflection proxy wraps the
     returned :class:`AsyncClient` view, so the result is a sync,
-    namespace-bound view sharing this client's pool (and, like the async
-    view, refuses lifecycle/schema operations). The
-    connection pool is opened eagerly on construction, so the client is ready
-    to use immediately. Always call :meth:`close` (or use it as a context
-    manager) to release the pool and stop the background loop.
+    namespace-bound view sharing this client's pool (and, like the async view,
+    refuses lifecycle/schema operations). Always call :meth:`close` (or use it
+    as a context manager) to release the pool and stop the background loop.
 
     >>> with Client(pg_conninfo=..., ch_url=...) as client:
     ...     client.create_node(node_type="site", name="S1")
@@ -210,8 +210,8 @@ class Client:
         self._proxy = _wrap(self._async, self._portal)
 
     def __getattr__(self, name: str) -> Any:
-        # Only reached for names not found on the instance/class — forward to
-        # the wrapped async client. ``_portal``/``_async``/``_proxy`` are real
+        # Only reached for names not found on the instance/class; forward to
+        # the wrapped async client. _portal/_async/_proxy are real
         # instance attributes and never hit this path.
         return getattr(self._proxy, name)
 

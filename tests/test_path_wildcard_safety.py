@@ -3,7 +3,7 @@ sibling subtrees through the LIKE prefix queries on ``node.path``.
 
 The bug class (before the ESCAPE fix):
     SELECT ... WHERE n.path LIKE r.path || '/%'
-where ``r.path`` could contain ``_`` (legal in names — e.g. ``Site_A``,
+where ``r.path`` could contain ``_`` (legal in names, e.g. ``Site_A``,
 ``bench_root_200``). ``_`` is a LIKE metacharacter matching any single
 character, so the pattern ``Site_A/%`` also matches paths under a sibling
 named ``SiteXA``. Reads return cross-subtree rows; the two ``UPDATE``
@@ -11,11 +11,11 @@ statements in ``rename`` / ``move_to`` rewrite paths in unrelated subtrees
 (silent data corruption).
 
 Fixture is one tree with two siblings that lexically alias under a buggy
-LIKE — ``Site_A`` and ``SiteXA`` — each with leaf children. Every test
+LIKE, ``Site_A`` and ``SiteXA``, each with leaf children. Every test
 goes through the public ``energydb`` API the same way a user would.
 
 LIKE-on-path sites covered (5 of 7 directly; the remaining 2 share the
-same SQL pattern after the fix — see the in-test comments):
+same SQL pattern after the fix; see the in-test comments):
   paths.resolve_subtree_uuids       → client.query_nodes(within=...)
   client.get_tree                   → client.get_tree(...)
   scope.NodeScope.descendants       → client.get_node(...).descendants()
@@ -34,7 +34,7 @@ from energydb import Client
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping wildcard-safety tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping wildcard-safety tests",
         allow_module_level=True,
     )
 
@@ -99,7 +99,7 @@ def test_query_nodes_within_excludes_lex_alias(tree):
     nodes = tree.query_nodes(within="root/Site_A")
     names = {n.name for n in nodes}
     # Site_A itself + its two turbines. SiteXA and T03/T04 are siblings'
-    # subtree — buggy LIKE would include them via ``_`` matching ``X``.
+    # subtree: buggy LIKE would include them via _ matching X.
     assert names == {"Site_A", "T01", "T02"}
 
 
@@ -129,7 +129,7 @@ def test_get_tree_excludes_lex_alias(tree):
 def test_descendants_excludes_lex_alias(tree):
     nodes = tree.get_node("root", "Site_A").descendants()
     names = {n["name"] for n in nodes}
-    # ``descendants()`` excludes self by design — just the two turbines.
+    # descendants() excludes self by design: just the two turbines.
     assert names == {"T01", "T02"}
 
 
@@ -141,9 +141,9 @@ def test_descendants_excludes_lex_alias(tree):
 def test_move_to_cycle_check_does_not_false_positive_on_lex_alias(tree):
     # Move Site_A under a node inside the SiteXA subtree (specifically T03).
     # Buggy code would compute the cycle check as:
-    #     T03.path = 'root/SiteXA/T03' LIKE 'root/Site_A/%'   -- ``_`` matches ``X``
-    # and reject the move as creating a cycle. Fixed code escapes ``_`` and
-    # the match correctly fails — the move proceeds.
+    #     T03.path = 'root/SiteXA/T03' LIKE 'root/Site_A/%'   (_ matches X)
+    # and reject the move as creating a cycle. Fixed code escapes _ and
+    # the match correctly fails: the move proceeds.
     tree.get_node("root", "Site_A").move_to(tree.get_node("root", "SiteXA", "T03"))
 
     paths = _fetch_paths()

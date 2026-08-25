@@ -2,15 +2,15 @@
 
 The series table is owned by exactly one of ``node_uuid`` / ``edge_uuid``
 (DB CHECK enforces). Internal APIs use a single ``(owner_col, owner_uuid)``
-shape — callers always know which side they're on, so encoding "set one,
-leave the other None" buys nothing.
+shape: callers always know which side they're on, so encoding "set one, leave
+the other None" buys nothing.
 
-``series_id BIGINT`` stays as the timedb-internal handle — it never leaves
-the energydb / timedb pair.
+``series_id BIGINT`` stays as the timedb-internal handle; it never leaves the
+energydb / timedb pair.
 
 Retention tier names are owned by timedb (see :data:`timedb.RETENTION_TIERS`).
 energydb consumes the set as a runtime guard but does not encode the values
-into its PG schema — adding a tier in timedb does not require an energydb
+into its PG schema, so adding a tier in timedb does not require an energydb
 migration.
 """
 
@@ -72,8 +72,8 @@ def validate_name(name: str, *, kind: str) -> None:
         )
 
 
-# Column order of SERIES_INSERT_SQL params -- shared by the single-row upsert
-# below and the batched register_tree path in ``_persist``.
+# Column order of SERIES_INSERT_SQL params: shared by the single-row upsert
+# below and the batched register_tree path in _persist.
 SERIES_INSERT_COLUMNS = (
     "node_uuid",
     "edge_uuid",
@@ -178,7 +178,7 @@ async def register_series(
         )
     ).fetchone()
     if existing is None:
-        raise RuntimeError("Insert conflict but no existing row found — concurrency bug")
+        raise RuntimeError("Insert conflict but no existing row found: concurrency bug")
     existing_sid, existing_unit, existing_retention = existing
     if existing_unit != canonical_unit or existing_retention != retention:
         raise AlreadyExistsError(
@@ -186,7 +186,7 @@ async def register_series(
             f"already exists with canonical_unit={existing_unit!r}, "
             f"retention={existing_retention!r}; cannot re-register with "
             f"canonical_unit={canonical_unit!r}, retention={retention!r}. "
-            f"These fields are immutable — register a new series instead."
+            f"These fields are immutable, register a new series instead."
         )
     return existing_sid
 
@@ -244,9 +244,8 @@ async def resolve_subtree_series_for_read(
     where_clause = (" AND " + " AND ".join(where_parts)) if where_parts else ""
 
     # The subtree prefix is the root path or a DB-derived path (start_uuid
-    # branch), so it can't always be escaped Python-side; inline the LIKE
-    # metacharacter escape in SQL — the former ``energydb._like_esc`` helper,
-    # dropped from the schema, expanded here — to keep the resolve one round-trip.
+    # branch), so it can't always be escaped Python-side. The LIKE metacharacter
+    # escape is inlined in SQL here, which keeps the resolve to one round-trip.
     sql = rf"""
         WITH root AS ({root_cte})
         SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention,
@@ -310,17 +309,17 @@ async def resolve_edge_series_for_read(
     the post-read attach step needs no further PG calls.
 
     ``name`` / ``data_type`` filter the *series*; ``edge_name`` identifies the
-    *edge* — the two names are deliberately separate.
+    *edge*, the two names are deliberately separate.
 
     ``series`` is LEFT-JOINed so an existing edge with no (matching) series
-    still returns a row — distinguishing "edge not found" from "no series":
+    still returns a row, distinguishing "edge not found" from "no series":
 
     * triple-addressed + edge missing → raises
-      :class:`~energydb.errors.EdgeNotFoundError` (same contract as the former
-      ``resolve_edge_uuid`` lookup);
+      :class:`~energydb.errors.EdgeNotFoundError` (the same contract as a
+      standalone ``resolve_edge_uuid`` lookup);
     * triple-addressed + several parallel edges matched → raises
       :class:`~energydb.errors.AmbiguousEdgeError` (pass ``edge_name``);
-    * uuid-addressed + edge missing → empty df (historical contract);
+    * uuid-addressed + edge missing → empty df, by contract;
     * edge exists, nothing matches → empty df.
     """
     join_conds = ["s.edge_uuid = e.uuid"]
@@ -344,10 +343,10 @@ async def resolve_edge_series_for_read(
     else:
         raise ValidationError("resolve_edge_series_for_read needs edge_uuid or (from_path, to_path, edge_type).")
 
-    # ``::text`` cast on the uuid column: PG returns strings directly,
+    # ::text cast on the uuid column: PG returns strings directly,
     # skipping psycopg's per-row UUID-object parse. The edge uuid comes from
-    # ``e`` rather than ``s`` so it is populated on the LEFT-JOIN row of a
-    # series-less edge too — that row is what the ambiguity check counts.
+    # e rather than s so it is populated on the LEFT-JOIN row of a
+    # series-less edge too: that row is what the ambiguity check counts.
     sql = (
         "SELECT s.series_id, s.canonical_unit, s.timeseries_type, s.retention, "
         "e.uuid::text, s.data_type, s.name, "
@@ -370,7 +369,7 @@ async def resolve_edge_series_for_read(
                 edge_type=edge_type,
                 name=edge_name,
             )
-        # One row per (edge, matching series): several *edges* is the ambiguous
+        # One row per (edge, matching series): several edges is the ambiguous
         # case, several series on one edge is the ordinary one.
         matched = {r[4]: r[8] for r in rows}
         if len(matched) > 1:

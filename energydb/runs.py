@@ -64,7 +64,7 @@ def run_upsert_cte(run: RunRow) -> tuple[str, tuple]:
     """A data-modifying CTE that upserts ``run``, to prepend to another query.
 
     Postgres executes a ``WITH … AS (INSERT …)`` exactly once, even when the
-    main query never references it — so the run is recorded regardless of what
+    main query never references it, so the run is recorded regardless of what
     the folded SELECT returns (preserves "an all-skipped write still records a
     run"). Returns ``(cte_sql, params)``; the params bind before the rest."""
     return f"WITH run_ins AS (\n        {_RUN_UPSERT_BODY}\n    )\n", _run_params(run)

@@ -1,4 +1,4 @@
-"""Write helpers — node/edge inserts, series registration, tree walks.
+"""Write helpers: node/edge inserts, series registration, tree walks.
 
 These helpers all take an open ``conn`` and do **not** commit. The caller
 controls the transaction boundary, which is how ``client.register_tree``
@@ -8,14 +8,14 @@ is structure-only (no timeseries data); manifest data writes go through
 
 Identity is the EDM ``Element.id`` (UUID7). ``register_tree_under`` is
 create-only (it pre-validates that no payload uuid exists) and persists the
-whole structure in three pipelined batches — nodes, edges, series — with
+whole structure in three pipelined batches, nodes, edges, series, with
 materialized paths computed client-side from the DFS walk, so a tree costs
 a handful of round-trips instead of a few per row. Renames, moves, and
 property edits go through the scope mutators on :class:`NodeScope`.
 ``create_edge`` keeps an ``ON CONFLICT`` upsert because it's exposed as
 :meth:`Client.create_edge` and documented as idempotent. Edge endpoints are
-written straight into the FK columns ``from_node_uuid`` / ``to_node_uuid``
-— no path resolution at write time.
+written straight into the FK columns ``from_node_uuid`` / ``to_node_uuid``,
+with no path resolution at write time.
 """
 
 from __future__ import annotations
@@ -51,14 +51,14 @@ async def map_edge_conflict():
 
     ``edge_uniq`` is ``(edge_type, from_node_uuid, to_node_uuid, name)`` with
     ``NULLS NOT DISTINCT``, so it fires when a *new* edge (or a rename / move
-    of an existing one) lands on a quadruple another edge already occupies —
+    of an existing one) lands on a quadruple another edge already occupies,
     including two unnamed edges on the same endpoint pair and type. Wrap the
     statement rather than the whole transaction: the caller owns the
     transaction boundary, and every other integrity error stays untouched.
 
     PostgreSQL's DETAIL line already names the colliding key, so it is quoted
-    verbatim rather than re-derived — the raise site does not need to know
-    which of the four columns the caller was changing.
+    verbatim rather than re-derived; the raise site does not need to know which
+    of the four columns the caller was changing.
     """
     try:
         yield
@@ -67,7 +67,7 @@ async def map_edge_conflict():
         if getattr(diag, "constraint_name", None) != "edge_uniq":
             raise
         detail = (getattr(diag, "message_detail", None) or "").strip()
-        collision = f" — {detail}" if detail else "."
+        collision = f": {detail}" if detail else "."
         raise AlreadyExistsError(
             f"An edge with this (edge_type, from_node_uuid, to_node_uuid, name) already exists{collision} "
             f"Parallel edges between the same endpoints are supported, but each needs a distinct "
@@ -89,7 +89,7 @@ async def create_node_raw(
     parent_uuid: UUID | None,
     uuid: UUID | None = None,
 ) -> UUID:
-    """Insert one node from a type slug + ``data`` dict — no EDM object.
+    """Insert one node from a type slug + ``data`` dict, with no EDM object.
 
     Generic, EDM-free counterpart to :func:`create_node`: ``node_type`` is
     stored verbatim and the caller's ``data`` becomes the JSONB blob. Mints a
@@ -130,14 +130,14 @@ async def create_edge(
 
     Endpoint UUIDs come from ``edm_obj.from_element`` / ``to_element``
     (:class:`Reference`). When ``tree_root`` is provided, every endpoint
-    UUID must be reachable in ``tree_root``'s :class:`Index` — cross-tree
-    edges are rejected here. Pass ``tree_root=None`` for standalone edges
+    UUID must be reachable in ``tree_root``'s :class:`Index`; cross-tree edges
+    are rejected here. Pass ``tree_root=None`` for standalone edges
     where the caller has already verified endpoint existence.
 
     Identity is ``edm_obj.id``. ``ON CONFLICT (uuid)`` updates the row's
-    payload, name, endpoints, and edge_type (the latter only on insert —
-    PG wouldn't actually let you change it via the unique key, but we let
-    the same-uuid update through cleanly). Identity staying UUID-based is
+    payload, name, endpoints, and edge_type (the last only on insert: the
+    unique key would not allow changing it, but the same-uuid update passes
+    through cleanly). Identity staying UUID-based is
     what keeps this upsert unaffected by the multigraph key: a *new* uuid
     colliding on ``(edge_type, from, to, name)`` raises
     :class:`~energydb.errors.AlreadyExistsError` asking for a distinct name.
@@ -193,9 +193,9 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
     """Pull a ``Reference`` off ``edm_obj.<attr>`` and return its uuid.
 
     When ``tree_root`` is given, the endpoint uuid must resolve against the
-    tree's index — cross-tree edges are rejected. When ``tree_root`` is
+    tree's index; cross-tree edges are rejected. When ``tree_root`` is
     None, only the uuid value is required (caller is responsible for
-    ensuring endpoint existence — typically by having created standalone
+    ensuring endpoint existence, typically by having created standalone
     nodes in a previous call).
     """
     ref = getattr(edm_obj, attr, None)
@@ -217,7 +217,7 @@ def _endpoint_uuid(edm_obj, attr: str, tree_root: edm.Element | None) -> UUID:
 
 
 # ---------------------------------------------------------------------------
-# Structure registration — tree walk
+# Structure registration: tree walk
 # ---------------------------------------------------------------------------
 
 
@@ -231,7 +231,7 @@ async def register_tree_under(
     """Walk the EDM tree DFS, insert nodes/edges, register series.
 
     Structure-only. Caller manages the transaction. Raises if any
-    ``TimeSeries`` on the tree has a non-empty df attached — write data
+    ``TimeSeries`` on the tree has a non-empty df attached; write data
     separately via ``client.write(df, ...)``.
 
     Creates only. Raises :class:`ValueError` if any node or edge UUID in
@@ -269,7 +269,7 @@ async def register_tree_under(
         )
 
     # Create-only path: every target row is an insert. No need for an
-    # update/delete branch — the existing-uuid pre-check above raises.
+    # update/delete branch: the existing-uuid pre-check above raises.
     diff = TreeDiff(
         node_changes=[NodeChange(old=None, new=s) for s in target_nodes.values()],
         edge_changes=[EdgeChange(old=None, new=s) for s in target_edges.values()],
@@ -304,7 +304,7 @@ async def register_tree_under(
 
     # Plain INSERTs (no upsert): the create-only pre-check above already
     # guarantees none of these uuids exist. A colliding (parent_uuid, name)
-    # pair still surfaces as the DB uniqueness error, exactly as before.
+    # pair still surfaces as the DB uniqueness error.
     edge_rows: list[tuple] = []
     for snap in target_edges.values():
         if snap.name is not None:
@@ -318,9 +318,9 @@ async def register_tree_under(
     # One explicit pipeline around all three batches: every INSERT is queued
     # and the whole structure needs a single network sync, rather than
     # relying on executemany's per-call internal pipelining. The conflict
-    # mapping wraps the *pipeline*, not the edge statement: a pipelined error
+    # mapping wraps the pipeline, not the edge statement: a pipelined error
     # surfaces when the pipeline syncs on exit, not at the execute that caused
-    # it. Non-``edge_uniq`` violations propagate untouched.
+    # it. Non-edge_uniq violations propagate untouched.
     async with map_edge_conflict(), conn.pipeline(), conn.cursor() as cur:
         await cur.executemany(
             f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
@@ -397,8 +397,8 @@ def _collect_target_state(
     Returns ``(node_snaps, edge_snaps, node_objs, edge_objs, root_uuid)``.
     ``node_objs`` is in DFS order so iterating it satisfies parent-before-
     child for FK resolution. ``edge_objs`` is filled in a second linear
-    pass over the queued edges, after every node has been seen — that's
-    the only way to validate that edge endpoints aren't cross-tree.
+    pass over the queued edges, after every node has been seen: that is the
+    only way to validate that edge endpoints aren't cross-tree.
     """
     node_snaps: dict[UUID, NodeSnapshot] = {}
     node_objs: dict[UUID, Any] = {}
@@ -459,7 +459,7 @@ def _collect_target_state(
 async def _existing_uuids(conn, node_uuids: list[UUID], edge_uuids: list[UUID]) -> tuple[list[UUID], list[UUID]]:
     """The subsets of the payload's node/edge uuids that already exist.
 
-    One round-trip for both tables (UNION ALL over the two indexed probes) —
+    One round-trip for both tables (UNION ALL over the two indexed probes);
     this is the create-only pre-check on ``register_tree``. Lighter than
     ``_fetch_nodes_by_uuids`` / ``_fetch_edges_by_uuids`` when the caller
     only needs to know *whether* the rows exist.
@@ -513,7 +513,7 @@ async def _fetch_edges_by_uuids(conn, uuids: list[UUID]) -> dict[UUID, EdgeSnaps
 def _validate_no_inline_data(edm_obj) -> None:
     """Raise if any node/edge in the tree carries non-empty TimeSeries data.
 
-    ``register_tree()`` is structure-only — every ``TimeSeries`` on
+    ``register_tree()`` is structure-only: every ``TimeSeries`` on
     ``element.timeseries`` must be metadata-only (``df=None``). Data is
     written separately via :meth:`client.write`.
     """
@@ -526,7 +526,7 @@ def _validate_no_inline_data(edm_obj) -> None:
                 raise ValidationError(
                     f"register_tree() received {obj_name!r} with inline timeseries data "
                     f"(name={ts.name!r}, rows={ts.df.height}). register_tree() is "
-                    f"structure-only — write data separately with client.write(df)."
+                    f"structure-only: write data separately with client.write(df)."
                 )
         for child in obj.children():
             _check(child)

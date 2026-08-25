@@ -109,7 +109,7 @@ class TestSeriesModel:
     def test_check_constraints(self):
         names = {c.name for c in Series.__table__.constraints if hasattr(c, "name") and c.name}
         assert "valid_timeseries_type" in names
-        # retention vocabulary is owned by timedb (RETENTION_TIERS) — no PG CHECK
+        # retention vocabulary is owned by timedb (RETENTION_TIERS), no PG CHECK
         assert "valid_retention" not in names
 
 
@@ -135,7 +135,7 @@ class TestRunModel:
 
 
 class TestNamespaceTenancy:
-    """The namespace partition key is structural — composite FKs make
+    """The namespace partition key is structural: composite FKs make
     cross-namespace children/edges/series unrepresentable."""
 
     def test_namespace_columns_not_nullable(self):

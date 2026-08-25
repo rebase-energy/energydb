@@ -1,4 +1,4 @@
-"""Transaction — atomic batch of scope mutations with preview support.
+"""Transaction: atomic batch of scope mutations with preview support.
 
 A :class:`Transaction` owns one borrowed pool connection for its whole
 lifetime. Mutations executed through ``txn.get_node(...)`` /
@@ -29,8 +29,8 @@ class Transaction:
     """Context manager wrapping a single pool connection for atomic batches.
 
     Mid-transaction reads see the transaction's own uncommitted writes
-    (single physical connection). Time-series I/O —
-    ``scope.write(df, ...)`` / ``scope.read(...)`` — does not participate
+    (single physical connection). Time-series I/O
+    (``scope.write(df, ...)`` / ``scope.read(...)``) does not participate
     in the PG transaction and is **rejected with a RuntimeError** on a
     txn-bound scope: call :meth:`Client.write` / :meth:`Client.read`
     directly outside the transaction instead.
@@ -45,7 +45,7 @@ class Transaction:
         self._edge_changes: list[EdgeChange] = []
 
     def __repr__(self) -> str:
-        """Plain-text repr — no I/O. Shows state + pending-change counts."""
+        """Plain-text repr: no I/O. Shows state + pending-change counts."""
         if self._committed:
             state = "committed"
         elif self._conn is not None:
@@ -66,11 +66,11 @@ class Transaction:
         assert self._conn is not None and self._pool_cm is not None
         try:
             if exc_type is not None:
-                # User code raised — rollback and let the exception propagate.
+                # User code raised: rollback and let the exception propagate.
                 await self._conn.rollback()
                 return False
             if not self._committed:
-                # Clean exit without commit — rollback and raise loudly.
+                # Clean exit without commit: rollback and raise loudly.
                 await self._conn.rollback()
                 raise RuntimeError(
                     "Transaction exited without .commit(); changes rolled back. "
@@ -80,9 +80,9 @@ class Transaction:
         finally:
             await self._pool_cm.__aexit__(exc_type, exc, tb)
 
-    # ------------------------------------------------------------------
-    # Scope factories — mirror Client surface, scopes bound to this txn.
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Scope factories: mirror Client surface, scopes bound to this txn.
+    # -----------------------------------------------------------------------
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`~energydb.NodeScope` bound to this transaction.
@@ -90,7 +90,7 @@ class Transaction:
         Same addressing as :meth:`Client.get_node <energydb.AsyncClient.get_node>`,
         but every mutation runs on the transaction's connection and stays
         uncommitted until :meth:`commit`. Time-series ``read`` / ``write`` /
-        ``read_relative`` on the returned scope raise ``RuntimeError`` — they
+        ``read_relative`` on the returned scope raise ``RuntimeError``; they
         do not participate in the PostgreSQL transaction.
         """
         scope = self._client.get_node(*names_or_path, uuid=uuid)
@@ -139,9 +139,9 @@ class Transaction:
         self._edge_changes.extend(diff.edge_changes)
         return root_uuid
 
-    # ------------------------------------------------------------------
-    # Internal recording — called by scope mutators.
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Internal recording: called by scope mutators.
+    # -----------------------------------------------------------------------
 
     def _record_node(self, old, new) -> None:
         self._node_changes.append(NodeChange(old=old, new=new))
@@ -149,15 +149,15 @@ class Transaction:
     def _record_edge(self, old, new) -> None:
         self._edge_changes.append(EdgeChange(old=old, new=new))
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Preview + commit
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def preview(self) -> TreeDiff:
         """Return a :class:`TreeDiff` aggregating every change so far.
 
-        Repeated mutations on the same uuid appear as multiple entries —
-        no collapsing is done. The result is read-only; call again to
+        Repeated mutations on the same uuid appear as multiple entries; no
+        collapsing is done. The result is read-only; call again to
         re-snapshot after additional mutations.
         """
         return TreeDiff(

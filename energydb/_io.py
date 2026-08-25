@@ -1,4 +1,4 @@
-"""Manifest I/O pipeline — bulk timeseries read and write.
+"""Manifest I/O pipeline: bulk timeseries read and write.
 
 A *manifest* is a polars DataFrame with a routing column (``node_uuid``,
 ``edge_uuid``, or ``path``), ``data_type``, ``name``, and (for writes) the
@@ -63,8 +63,8 @@ _ROUTING_AND_META_COLS = (
 )
 
 # Edge-triple routing columns; their joint presence marks an edge-routed manifest
-# even before ``edge_uuid`` is attached during resolution. The optional
-# ``edge_name`` fourth column narrows the triple to one parallel edge; it never
+# even before edge_uuid is attached during resolution. The optional
+# edge_name fourth column narrows the triple to one parallel edge; it never
 # routes on its own, so it plays no part in that detection.
 _EDGE_TRIPLE_COLS = ("from_path", "to_path", "edge_type")
 
@@ -88,7 +88,7 @@ class WriteResult(int):
 
     @property
     def run_id(self) -> int:
-        """The run id for this write — the same value as ``int(result)``."""
+        """The run id for this write: the same value as ``int(result)``."""
         return int(self)
 
     def __repr__(self) -> str:
@@ -100,19 +100,18 @@ class ReadResult(NamedTuple):
 
     Returned by :meth:`~energydb.AsyncClient.read` /
     :meth:`~energydb.AsyncClient.read_relative` **only** when
-    ``on_missing="skip"`` — the default (``"raise"``) returns ``data`` bare, so
-    existing callers never see this type. Opting in is new code by definition,
-    which is what makes the changed return shape safe.
+    ``on_missing="skip"``; the default (``"raise"``) returns ``data`` bare, so
+    existing callers never see this type.
 
     ``data`` is exactly what the same call would return without ``on_missing``
     (honouring ``output`` and ``backend``, including the empty shapes).
-    ``missing`` holds the unique unresolvable triples — the manifest's routing
+    ``missing`` holds the unique unresolvable triples: the manifest's routing
     column(s) plus ``data_type`` / ``name``, ``Utf8`` throughout (uuids
     stringified), zero-row with the right schema when everything resolved. It
     follows ``backend`` like ``data`` does.
 
     A :class:`~typing.NamedTuple`, so ``data, missing = await client.read(...)``
-    unpacks — mirroring :class:`WriteResult`'s enriched-but-simple shape.
+    unpacks, mirroring :class:`WriteResult`'s enriched-but-simple shape.
     """
 
     data: (
@@ -130,7 +129,7 @@ def _check_unchanged_scope(summary: ResolveSummary, *, skip_unchanged: bool, unc
     """Reject a uniform ``valid_time`` comparison over OVERLAPPING series.
 
     That key ignores ``knowledge_time``, so a republication whose values match
-    the previous vintage would be dropped — unrecoverable for a forecast, which
+    the previous vintage would be dropped: unrecoverable for a forecast, which
     is exactly why the series is OVERLAPPING. The caller asked for it
     explicitly (the default is ``"auto"``), so raising beats silently losing
     data. No-op unless ``skip_unchanged`` is actually on.
@@ -173,24 +172,25 @@ async def write_manifest(
     ``skip_unchanged`` drops rows whose stored value already matches;
     ``unchanged_scope`` picks the comparison key:
 
-    * ``"auto"`` (default) — per series: FLAT series compare per
-      ``valid_time``, OVERLAPPING series per ``(valid_time, knowledge_time)``,
-      in one call. The resolve already knows each series' type, so the
+    * ``"auto"`` (default): per series, so FLAT series compare per
+      ``valid_time`` and OVERLAPPING series per
+      ``(valid_time, knowledge_time)``, in one call. The resolve already knows each series' type, so the
       OVERLAPPING ids ride along as timedb's ``knowledge_time_scoped_series``.
       For a FLAT-only manifest this is identical to ``"valid_time"``.
-    * ``"knowledge_time"`` — that key uniformly, for every series.
-    * ``"valid_time"`` — that key uniformly. **Raises**
+    * ``"knowledge_time"``: that key uniformly, for every series.
+    * ``"valid_time"``: that key uniformly. **Raises**
       :class:`~energydb.errors.UnchangedScopeError` when the manifest contains
       OVERLAPPING series, because ignoring ``knowledge_time`` for them would
       silently drop genuine republications.
 
     ``unchanged_scope`` is ignored entirely when ``skip_unchanged`` is false.
     The ``runs`` row is upserted regardless, so an all-skipped write still
-    records a run (with no ``run_series`` mapping). Returns a :class:`WriteResult`
-    — an ``int`` run_id carrying ``written`` / ``skipped`` counts.
+    records a run (with no ``run_series`` mapping). Returns a
+    :class:`WriteResult`, an ``int`` run_id carrying ``written`` / ``skipped``
+    counts.
 
     PG round-trips: when ``knowledge_time`` is known (kwarg or manifest column)
-    the resolve statement runs on an autocommit connection — psycopg's implicit
+    the resolve statement runs on an autocommit connection: psycopg's implicit
     ``BEGIN`` and the explicit ``COMMIT`` (one round-trip each) both disappear,
     leaving a single round-trip on the path route. A client-side resolve
     failure then compensates the already-committed folded runs row (auto-generated
@@ -211,7 +211,7 @@ async def write_manifest(
     kt_known = knowledge_time is not None or "knowledge_time" in df.columns
 
     # Raw checkout on purpose (not client._conn()): the fast path below
-    # flips autocommit, which psycopg refuses inside a transaction — and a
+    # flips autocommit, which psycopg refuses inside a transaction, and a
     # namespaced _conn() opens one for its SET LOCAL. Namespace binding is
     # therefore per-branch: session-level around the autocommit resolve
     # (cleared in the finally), transaction-local on the classic branch.
@@ -219,7 +219,7 @@ async def write_manifest(
     async with annotate_undefined_table(), client._pool.connection() as conn:
         if kt_known:
             # The knowledge_time-required check cannot fire here, so no rollback is
-            # needed for it. The unchanged_scope check *can*, and it runs inside the
+            # needed for it. The unchanged_scope check can, and it runs inside the
             # try below where the orphan-run compensation covers it.
             await conn.set_autocommit(True)
             if client._namespace is not None:
@@ -231,11 +231,11 @@ async def write_manifest(
                 with profiling._phase(profiling.PHASE_EDB_RESOLVE):
                     try:
                         # Writes drop path / edge meta before the CH insert anyway, so
-                        # skip the hierarchy JOIN. ``run`` folds the runs upsert into
+                        # skip the hierarchy JOIN. run folds the runs upsert into
                         # the resolve statement on every route (one round-trip).
                         resolved, summary = await resolve_manifest(conn, df, attach_path=False, run=run)
                         # Only answerable after resolve, and on this path the folded
-                        # runs upsert has already committed — so it must raise inside
+                        # runs upsert has already committed, so it must raise inside
                         # this block to get the same orphan-row compensation.
                         _check_unchanged_scope(summary, skip_unchanged=skip_unchanged, unchanged_scope=unchanged_scope)
                     except Exception:
@@ -260,8 +260,8 @@ async def write_manifest(
                 resolved, summary = await resolve_manifest(conn, df, attach_path=False, run=run)
 
             # OVERLAPPING contract: knowledge_time must be supplied (kwarg or column).
-            # Raising here (before commit) rolls back the folded run upsert too — a bad
-            # call records no run, same as before the fold.
+            # Raising here (before commit) rolls back the folded run upsert too, so
+            # a bad call records no run.
             if summary.has_overlapping:
                 raise ValidationError(
                     "knowledge_time is required for OVERLAPPING series; "
@@ -283,11 +283,11 @@ async def write_manifest(
         write_df = resolved.select(keep).with_columns(pl.lit(rid, dtype=pl.Int64).alias("run_id"))
 
     # PG state is committed; CH write happens after. A CH failure leaves an
-    # orphaned runs row but no PG inconsistency — detectable by run_id. TimeDB is
+    # orphaned runs row but no PG inconsistency, detectable by run_id. TimeDB is
     # synchronous (clickhouse-connect), so offload the CH leg to a worker thread
     # to keep the event loop free.
     # timedb needs the id set only for the per-series ("auto") comparison, and
-    # rejects it alongside any other scope — pass it exactly when it applies.
+    # rejects it alongside any other scope: pass it exactly when it applies.
     kt_scoped = summary.overlapping_series_ids if (skip_unchanged and unchanged_scope == "auto") else None
     counts = await asyncio.to_thread(
         td.write,
@@ -333,14 +333,13 @@ async def annotate_undefined_table():
     """Attach an actionable note to ``UndefinedTable`` for energydb's own relations.
 
     A client pointed at a schema without the energydb tables (wrong
-    ``ENERGYDB_SCHEMA``, or ``create()`` never ran) used to fail with a bare
-    ``relation "node" does not exist`` from inside whatever query happened to run
-    first — no mention of which schema was searched, that a schema knob exists, or
-    what to do.
+    ``ENERGYDB_SCHEMA``, or ``create()`` never ran) otherwise fails with a bare
+    ``relation "node" does not exist`` from inside whatever query ran first,
+    naming neither the schema searched nor the knob that controls it.
 
     Annotates rather than wraps (:pep:`678`): the exception stays an
     ``UndefinedTable``, so anything downstream catching psycopg errors is
-    unaffected and there is no new class to document — every traceback just gains
+    unaffected and there is no new class to document; every traceback just gains
     the missing context. The sync facade propagates the object as-is, notes
     included, so it needs no changes.
     """
@@ -369,8 +368,8 @@ async def autocommit_read_conn(pool):
 
     psycopg opens the implicit transaction with a separate ``BEGIN`` command
     (one round-trip) and the pool rolls it back when the connection returns
-    (another). Read resolves are pure SELECTs under READ COMMITTED — each
-    statement gets its own snapshot with or without the wrapping transaction —
+    (another). Read resolves are pure SELECTs under READ COMMITTED; each
+    statement gets its own snapshot with or without the wrapping transaction,
     so autocommit drops both round-trips without changing visibility.
     Autocommit is switched back off before the connection returns to the pool.
 
@@ -396,8 +395,8 @@ async def _execute_read(
     """Execute a read given fully-resolved per-series ``meta``.
 
     ``meta`` must carry ``series_id``, ``retention``, ``canonical_unit``,
-    ``data_type``, ``name``, plus exactly one of ``node_uuid`` / ``edge_uuid``
-    — one row per series. The hierarchy-attach step is purely polars-side:
+    ``data_type``, ``name``, plus exactly one of ``node_uuid`` / ``edge_uuid``,
+    one row per series. The hierarchy-attach step is purely polars-side:
     paths already ride on ``meta`` from :func:`resolve_manifest`
     (``attach_path=True``), so no second PG round-trip is needed.
     """
@@ -405,7 +404,7 @@ async def _execute_read(
         raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
     series_ids = meta["series_id"].unique().to_list()
     retentions = meta["retention"].unique().to_list()
-    # TimeDB (clickhouse-connect) is synchronous — offload the CH read so the
+    # TimeDB (clickhouse-connect) is synchronous: offload the CH read so the
     # event loop stays free.
     result = await asyncio.to_thread(td_call, series_ids, retentions)
     return _finish_read(pool, result, meta, unit=unit, output=output)
@@ -421,9 +420,10 @@ def _finish_read(
 ) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
     """Unit-convert then attach/partition the labelled hierarchy onto a CH value frame.
 
-    The shared tail of every read: joins ``meta`` (path / data_type / name / canonical_unit)
-    onto ``result`` by ``series_id``. Pure polars — no DB round-trip. Both the sequential and
-    the engine-parallel branch of :func:`execute_read` converge here.
+    The shared tail of every read: joins ``meta`` (path / data_type / name /
+    canonical_unit) onto ``result`` by ``series_id``. Pure polars, no DB
+    round-trip. Both the sequential and the engine-parallel branch of
+    :func:`execute_read` converge here.
     """
     is_edge = "edge_uuid" in meta.columns
 
@@ -438,7 +438,7 @@ def _finish_read(
             return partition_node_by_path(pool, result, meta)
 
     if result.is_empty():
-        # CH returned no rows — drop the internal series_id and bail. The
+        # CH returned no rows: drop the internal series_id and bail. The
         # public column shape is incomplete on empty (no path / data_type /
         # name) but callers typically branch on is_empty() first.
         return result.drop("series_id") if "series_id" in result.columns else result
@@ -452,7 +452,7 @@ def _finish_read(
 logger = logging.getLogger(__name__)
 
 # Strict mode: an engine-read failure raises instead of degrading to the sequential
-# path -- for tests/debugging, so a broken engine is loud rather than masked.
+# path, for tests/debugging, so a broken engine is loud rather than masked.
 _ENGINE_STRICT = os.environ.get("ENERGYDB_ENGINE_STRICT") == "1"
 
 
@@ -461,13 +461,13 @@ class _EngineReadError(RuntimeError):
 
     Lets :func:`execute_read` distinguish engine trouble (degrade the session +
     fall back to the sequential path) from resolve/user errors raised by the
-    parallel PG leg (propagate unchanged -- e.g. unregistered series).
+    parallel PG leg (propagate unchanged, e.g. unregistered series).
     """
 
 
 # ClickHouse's UNKNOWN_TABLE (error code 60). clickhouse-connect exposes no
-# structured error code -- server errors arrive as a DatabaseError whose message
-# embeds the server text -- so the match is on tokens from that text. The name is
+# structured error code: server errors arrive as a DatabaseError whose message
+# embeds the server text, so the match is on tokens from that text. The name is
 # the primary marker; the code is a fallback for a server locale/format that
 # omits it.
 _UNKNOWN_TABLE_MARKERS = ("UNKNOWN_TABLE", "Code: 60.")
@@ -478,7 +478,7 @@ def _is_unknown_table(exc: BaseException | None) -> bool:
 
     That is a *configuration state*, not an anomaly: any deployment that never
     provisions the engine table sits in it permanently, and a traceback teaches
-    those operators to silence the log with ``ENERGYDB_DISABLE_ENGINE=1`` --
+    those operators to silence the log with ``ENERGYDB_DISABLE_ENGINE=1``,
     which then hides real engine failures too. Everything else (network, auth,
     schema drift, CH-side PG connectivity) stays loud.
 
@@ -554,21 +554,21 @@ def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
     """Superset engine predicate for a routing manifest, or ``None`` if inexpressible.
 
     Built from the manifest's routing column plus the ``data_type`` / ``name``
-    value sets — single-column ``IN`` conditions only (guaranteed pushdown
+    value sets, using single-column ``IN`` conditions only (guaranteed pushdown
     through the PostgreSQL engine). The resulting series set is the cartesian
     superset of the manifest's triples; :func:`execute_read` trims values
     against the exactly-resolved meta, so correctness never depends on it.
 
-    Returns ``None`` for anything the engine can't cleanly express — missing or
-    null-carrying columns, and non-Utf8 ``path`` / edge-triple columns — so the
-    read runs sequentially and ``resolve_manifest`` surfaces the proper error.
+    Returns ``None`` for anything the engine can't cleanly express: missing or
+    null-carrying columns, and non-Utf8 ``path`` / edge-triple columns. The read
+    then runs sequentially and ``resolve_manifest`` surfaces the proper error.
     The ``node_uuid`` / ``edge_uuid`` routes accept *any* representation of a
     uuid (``Utf8``, an ``Object`` column of :class:`uuid.UUID`, anything
     ``str()``-able) and stay engine-eligible: they are the routes callers reach
     for most, so degrading them to the sequential path would be an invisible
     performance regression.
 
-    Total by construction — never raises. Callers rely on that: a crash here
+    Total by construction: never raises. Callers rely on that: a crash here
     would break ``read()`` outright, including for sessions that never take the
     engine path.
     """
@@ -605,11 +605,11 @@ def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
         paths = tuple(dict.fromkeys(col.to_list()))
         return PgEngineMeta(table=CH_ENGINE_TABLE, paths=paths, data_type=dts, name=names)
 
-    # uuid routes: normalize to strings *before* deduplicating. ``to_list()``
-    # works for every dtype (including the ``Object`` column a manifest of
-    # ``uuid.UUID`` produces, which ``unique()`` cannot handle), and
-    # ``dict.fromkeys`` dedupes dtype-independently in first-seen order.
-    # ``null_count()`` is unreliable on ``Object``, hence the explicit scan.
+    # uuid routes: normalize to strings before deduplicating. to_list()
+    # works for every dtype (including the Object column a manifest of
+    # uuid.UUID produces, which unique() cannot handle), and
+    # dict.fromkeys dedupes dtype-independently in first-seen order.
+    # null_count() is unreliable on Object, hence the explicit scan.
     raw = col.to_list()
     if any(v is None for v in raw):
         return None
@@ -643,10 +643,10 @@ async def execute_read(
 
     Callers hand in exactly one of:
 
-    * ``resolve`` — a zero-arg factory for the scope's exact PG resolve
+    * ``resolve``: a zero-arg factory for the scope's exact PG resolve
       (single round-trip via ``resolve_subtree_series_for_read`` /
       ``resolve_edge_series_for_read``; ``None`` result = nothing matched), or
-    * ``manifest`` — a routing manifest (``Client.read`` /
+    * ``manifest``: a routing manifest (``Client.read`` /
       ``Client.read_relative``), resolved via :func:`resolve_manifest` +
       :func:`_project_meta`.
 
@@ -660,7 +660,7 @@ async def execute_read(
     When the factory yields a predicate, the PG resolve runs **in parallel**
     with a CH value read that self-resolves its ``series_id`` set through the
     PostgreSQL engine table; values are then trimmed against the exact resolve
-    (engine predicates may be supersets) and joined client-side —
+    (engine predicates may be supersets) and joined client-side,
     byte-identical to the sequential path. On an engine failure the session
     degrades (``client._engine_unavailable``) and the read falls back to the
     sequential path; resolve/user errors propagate unchanged.
@@ -672,7 +672,7 @@ async def execute_read(
     ``relative`` picks ``td.read_relative`` (window args in ``td_kwargs``) over
     ``td.read`` (explicit bitemporal args). Returns
     ``(result, n_series, missing)``, where ``missing`` is the unresolved-triple
-    frame from the resolve — always zero-row under the default ``"raise"``, and
+    frame from the resolve, always zero-row under the default ``"raise"``, and
     schema-less for ``resolve=`` callers, which route by subtree rather than by
     a manifest and so have no routing column to report.
     """
@@ -695,7 +695,7 @@ async def execute_read(
         }
     )
 
-    # ``missing`` is set by the resolve leg and read by every return path below.
+    # missing is set by the resolve leg and read by every return path below.
     missing = pl.DataFrame()
 
     async def _resolve_meta() -> pl.DataFrame | None:
@@ -745,11 +745,11 @@ async def execute_read(
                 raise (err.__cause__ or err) from None
             client._engine_unavailable = True
             if _is_unknown_table(err.__cause__):
-                # Not provisioned. One line, no traceback -- there is no anomaly to
+                # Not provisioned. One line, no traceback: there is no anomaly to
                 # investigate, just a feature that was never turned on.
                 logger.info(
                     "energydb: ClickHouse meta-engine table %r not provisioned "
-                    "(ENERGYDB_SCHEMA=%r) -- using sequential reads for this session. "
+                    "(ENERGYDB_SCHEMA=%r); using sequential reads for this session. "
                     "Provision it once with `await client.setup_ch_meta_engine()` to "
                     "enable parallel engine reads.",
                     CH_ENGINE_TABLE,
@@ -761,13 +761,13 @@ async def execute_read(
                     "(ENERGYDB_SCHEMA=%r); falling back to the slower sequential read path "
                     "(higher latency and an extra PostgreSQL round-trip per read) for the rest "
                     "of this session. The usual cause after an upgrade or an ENERGYDB_SCHEMA "
-                    "change is a missing or mis-targeted meta-engine table -- (re)provision it "
+                    "change is a missing or mis-targeted meta-engine table; (re)provision it "
                     "once with `await client.setup_ch_meta_engine()` (or `create()`).",
                     CH_ENGINE_TABLE,
                     os.environ.get("ENERGYDB_SCHEMA", "public"),
                     exc_info=err.__cause__,
                 )
-            # The parallel leg already resolved meta exactly -- fall back to the
+            # The parallel leg already resolved meta exactly; fall back to the
             # sequential CH read without paying the resolve again.
         else:
             if meta is None or meta.height == 0:

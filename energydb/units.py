@@ -1,4 +1,4 @@
-"""Unit conversion for energydb — thin wrapper around pint.
+"""Unit conversion for energydb: thin wrapper around pint.
 
 Moved from timedb so that timedb can drop the pint dependency.
 """
@@ -21,8 +21,8 @@ class IncompatibleUnitError(EnergyDBError, ValueError):
 def compute_unit_factor(from_unit: str, to_unit: str) -> float | None:
     """Return the pint conversion factor from *from_unit* to *to_unit*.
 
-    Returns ``None`` when no multiplication is needed (same unit, or dimensionless
-    input — caller decides what dimensionless means).
+    Returns ``None`` when no multiplication is needed (same unit, or a
+    dimensionless input, where the caller decides what dimensionless means).
     Raises :class:`IncompatibleUnitError` when not dimensionally compatible.
     """
     if from_unit == to_unit or from_unit == "dimensionless":

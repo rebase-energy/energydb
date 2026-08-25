@@ -1,4 +1,4 @@
-"""TreeDiff — compute and represent the difference produced by a mutation.
+"""TreeDiff: compute and represent the difference produced by a mutation.
 
 Categorizes node/edge changes into insert / update / delete buckets, keyed
 by UUID, and renders a tree-shaped preview. Returned by
@@ -6,8 +6,8 @@ by UUID, and renders a tree-shaped preview. Returned by
 when called with ``dry_run=True``, and by :meth:`Transaction.preview`.
 
 With UUID identity, a rename (name changed) and a move (parent_uuid
-changed) are *not* delete-then-insert — the row keeps its uuid and just
-has its column updated. The diff structure exposes "renamed" and "moved"
+changed) are *not* delete-then-insert; the row keeps its uuid and just has
+its column updated. The diff structure exposes "renamed" and "moved"
 booleans on each update so the user-facing print can label changes
 accurately.
 """
@@ -22,7 +22,7 @@ from uuid import UUID
 from energydb.errors import ValidationError
 
 # ---------------------------------------------------------------------------
-# Snapshots — the canonical content of one row at one point in time.
+# Snapshots: the canonical content of one row at one point in time.
 # ---------------------------------------------------------------------------
 
 
@@ -149,7 +149,7 @@ class EdgeChange(_BaseChange[EdgeSnapshot]):
 
 
 # ---------------------------------------------------------------------------
-# TreeDiff — the structured result of comparing target vs current state.
+# TreeDiff: the structured result of comparing target vs current state.
 # ---------------------------------------------------------------------------
 
 
@@ -166,9 +166,9 @@ class TreeDiff:
     node_changes: list[NodeChange] = field(default_factory=list)
     edge_changes: list[EdgeChange] = field(default_factory=list)
 
-    # ------------------------------------------------------------------
-    # Convenience views (computed on the fly — diff is small)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Convenience views (computed on the fly: diff is small)
+    # -----------------------------------------------------------------------
 
     @property
     def has_changes(self) -> bool:
@@ -220,9 +220,9 @@ class TreeDiff:
         """Edges removed by this diff."""
         return [c for c in self.edge_changes if c.kind == "delete"]
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Pretty-print (tree-shaped)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def render(self, file: IO[str] | None = None) -> None:
         """Render the diff as a tree-shaped textual preview.
@@ -243,11 +243,11 @@ class TreeDiff:
 
         # Build a "what should the tree look like AFTER + deletes inline"
         # view, keyed by uuid. For each uuid we record:
-        #   marker  — ' ', '+', '~', '-'
-        #   name    — display name
-        #   type    — display type
-        #   note    — bracketed annotation (rename, move, insert, delete, ...)
-        #   parent  — uuid of parent in the rendered tree
+        #   marker: ' ', '+', '~', '-'
+        #   name: display name
+        #   type: display type
+        #   note: bracketed annotation (rename, move, insert, delete, ...)
+        #   parent: uuid of parent in the rendered tree
         view: dict[UUID, _RenderRow] = {}
         children_by_parent: dict[UUID | None, list[UUID]] = {}
 
@@ -256,7 +256,7 @@ class TreeDiff:
             view[change.uuid] = row
             children_by_parent.setdefault(row.parent_uuid, []).append(change.uuid)
 
-        # A change is a render trunk if its parent isn't itself a change —
+        # A change is a render trunk if its parent isn't itself a change:
         # either parent_uuid is None, or the parent is an unchanged ancestor
         # (e.g. a renamed Site whose Portfolio parent was not modified).
         roots = [uid for uid, row in view.items() if row.parent_uuid not in view]
@@ -311,7 +311,7 @@ def _render_row_for_node(change: NodeChange) -> _RenderRow:
             parent_uuid=snap.parent_uuid,
         )
 
-    # update
+    # Fall-through: an update.
     assert change.new is not None and change.old is not None
     notes: list[str] = []
     if change.renamed:

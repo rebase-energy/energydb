@@ -1,18 +1,18 @@
 """Path-based addressing primitives for the fluent CLI.
 
-After the UUID identity rewrite, ``node.uuid`` is the row PK and the value
-held by every :class:`energydatamodel.Reference`. Paths are still a
-user-friendly addressing form though — the fluent CLI lets you write
-``client.get_node("Europe", "Sweden", "Lillgrund")`` and resolve the path
+``node.uuid`` is the row PK and the value held by every
+:class:`energydatamodel.Reference`. Paths remain the user-friendly
+addressing form: the fluent CLI lets you write
+``client.get_node("Europe", "Sweden", "Lillgrund")`` and resolves the path
 chain to a UUID with one indexed recursive CTE on ``(parent_uuid, name)``.
 
-A node is identified at the storage layer by its ``uuid``; an edge by its
-``uuid`` (or by the ``(from_node_uuid, to_node_uuid, edge_type, name)``
-quadruple, which is the unique key on :class:`energydb.models.Edge`).
-``edge`` is a multigraph — several parallel edges may share the triple and
-differ only by ``name`` — so every triple-addressed lookup here resolves a
-unique match or raises :class:`~energydb.errors.AmbiguousEdgeError`; none of
-them ever picks an arbitrary edge.
+At the storage layer a node is identified by its ``uuid``, an edge by its
+``uuid`` or by the ``(from_node_uuid, to_node_uuid, edge_type, name)``
+quadruple that is the unique key on :class:`energydb.models.Edge`. Because
+``edge`` is a multigraph, parallel edges may share the triple and differ only
+by ``name``, so every triple-addressed lookup here resolves a unique match or
+raises :class:`~energydb.errors.AmbiguousEdgeError`. None of them ever picks
+an arbitrary edge.
 """
 
 from __future__ import annotations
@@ -34,9 +34,9 @@ from energydb.errors import (
 from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.runs import RunRow, run_upsert_cte
 
-# What to do with a manifest triple that has no registered series. ``"raise"``
-# is the default everywhere; ``"skip"`` is opt-in on reads only (writes must
-# never silently drop rows — that would be data loss).
+# What to do with a manifest triple that has no registered series. "raise"
+# is the default everywhere; "skip" is opt-in on reads only (writes must
+# never silently drop rows: that would be data loss).
 OnMissing = Literal["raise", "skip"]
 _ON_MISSING_VALUES = ("raise", "skip")
 
@@ -50,21 +50,20 @@ def _check_on_missing(on_missing: str) -> None:
 class ResolveSummary(NamedTuple):
     """Set-level signals derived during :func:`resolve_manifest`.
 
-    Lifts ``OVERLAPPING`` detection out of the per-row resolved frame — it
-    is a property of the *series set*, not the data rows, so paying
-    linear-in-rows for it was wasted work. Powers the knowledge_time-
-    required check and the per-series ``skip_unchanged`` comparison in
-    :func:`energydb._io.write_manifest`.
+    ``OVERLAPPING`` is a property of the *series set*, not of the data rows,
+    so it is detected here instead of linear-in-rows on the resolved frame.
+    Powers the knowledge_time-required check and the per-series
+    ``skip_unchanged`` comparison in :func:`energydb._io.write_manifest`.
 
-    The ids (rather than a bare boolean) are what let one write call dedupe
-    FLAT and OVERLAPPING series by different keys: they become timedb's
-    ``knowledge_time_scoped_series``. Collected while walking the resolved
-    metadata that is already in hand, so no extra DB work.
+    The ids rather than a bare boolean are what let one write call dedupe FLAT
+    and OVERLAPPING series by different keys: they become timedb's
+    ``knowledge_time_scoped_series``. Collected while walking metadata already
+    in hand, so no extra DB work.
 
-    ``missing`` carries the manifest triples that resolved to no series —
+    ``missing`` carries the manifest triples that resolved to no series. It is
     always present, and zero-row (with the route's column schema) unless
-    ``on_missing="skip"`` actually dropped something. Riding on the summary
-    keeps the resolver's ``(resolved, summary)`` return arity stable.
+    ``on_missing="skip"`` dropped something; riding on the summary keeps the
+    resolver's ``(resolved, summary)`` return arity stable.
     """
 
     overlapping_series_ids: frozenset[int]
@@ -91,7 +90,7 @@ def _missing_frame(cols: Sequence[str], rows: Sequence[tuple[str, ...]]) -> pl.D
 
     ``rows`` come from the resolver's deduplicated triple set, so the frame is
     already unique. Zero-row (correct schema, never a schema-less empty frame)
-    when everything resolved — callers can select/join on it unconditionally.
+    when everything resolved, so callers can select/join on it unconditionally.
     """
     return pl.DataFrame(
         {c: [r[i] for r in rows] for i, c in enumerate(cols)},
@@ -108,9 +107,9 @@ def _series_not_found_error(
 ) -> SeriesNotFoundError:
     """Build the all-triples :class:`SeriesNotFoundError` for a failed resolve.
 
-    The resolvers used to raise on the *first* unresolvable triple, so a
-    manifest of 1,500 series reported one gap per retry. The message now leads
-    with that same first-triple sentence (callers match on the
+    Reports every unresolved triple at once rather than only the first, so a
+    1,500-series manifest does not surface one gap per retry. The message leads
+    with the first-triple sentence (callers match on the
     ``Series not registered for <route>=…`` prefix), then names the total and
     spells out up to :data:`_MISSING_PREVIEW` of them; ``.missing`` on the
     exception carries every one structurally.
@@ -137,9 +136,9 @@ def _overlapping_ids(hash_to_meta: dict[int, tuple]) -> frozenset[int]:
 Path = tuple[str, ...]
 
 
-# LIKE-escape helper for bind-param prefixes: escape PG LIKE metacharacters so
-# a literal path prefix is matched literally with ``... LIKE %s ESCAPE '\\'``.
-# Subtree queries fetch the prefix into Python and pass it as a bind param.
+# Escape PG LIKE metacharacters so a literal path prefix matches literally in
+# ... LIKE %s ESCAPE '\\'. Subtree queries fetch the prefix into Python and
+# bind it.
 _LIKE_TRANS = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 
 
@@ -156,7 +155,7 @@ def derived_prefix_like(expr: str) -> str:
 
     The single-round-trip hierarchy queries derive the subtree prefix inside
     the statement (e.g. from a joined root row), so it can't be escaped
-    Python-side with :func:`_like_escape` — the LIKE metacharacter escape is
+    Python-side with :func:`_like_escape`; the LIKE metacharacter escape is
     inlined in SQL instead. Combine as
     ``path LIKE {derived_prefix_like('r.path')} ESCAPE '\'`` and pair with an
     explicit ``path = r.path`` term when the root row itself should match.
@@ -174,8 +173,8 @@ async def resolve_node_uuid(conn, path: Path, *, start_uuid: UUID | None = None)
 
     Single indexed equality on the materialized ``node.path`` column
     (``node_path_uniq`` btree). When ``start_uuid`` is supplied the lookup
-    keys off ``<start.path>/<joined-path>`` instead — one query with a
-    self-join on the same column, still one round-trip.
+    keys off ``<start.path>/<joined-path>`` instead: one query with a self-join
+    on the same column, still one round-trip.
     """
     if not path:
         if start_uuid is not None:
@@ -246,8 +245,8 @@ async def resolve_paths_to_uuids(conn, paths: list[Path]) -> dict[Path, UUID]:
     missing = [p for p in unique if p not in out]
     if missing:
         rendered = ", ".join("/".join(p) for p in missing)
-        # ``path`` only when a single path missed — with several, no one value
-        # identifies the failure, so leave it unset rather than pick a winner.
+        # Set path only when a single path missed. With several, no one value
+        # identifies the failure, so leave it unset rather than picking a winner.
         raise NodeNotFoundError(
             f"Could not resolve path(s): {rendered}",
             path="/".join(missing[0]) if len(missing) == 1 else None,
@@ -270,7 +269,7 @@ def build_filter_conditions(
     """Translate ``where_filters`` into SQL fragments + bind params.
 
     Recognized structural keys: ``type_col`` (typically ``"node_type"`` or
-    ``"edge_type"``) and ``"name"`` — both compared against their own
+    ``"edge_type"``) and ``"name"``, both compared against their own
     columns. Everything else is treated as a JSONB ``data->>`` predicate.
     Fragments must be joined with ``AND`` by the caller. ``table_alias``
     (e.g. ``"n"``) is prefixed to each column reference when the filter
@@ -305,8 +304,8 @@ async def resolve_subtree_uuids(conn, node_uuid: UUID) -> list[UUID]:
     Two PG round-trips: the root path lookup, then a prefix-LIKE on the
     materialized path. The escaped prefix is passed as a bind parameter so
     PG can extract the literal prefix at plan time and pick an Index Scan
-    on ``ix_node_path_prefix`` (``text_pattern_ops``) — a column-source
-    LIKE would force a Seq Scan. Net 2.4× faster than the single-query
+    on ``ix_node_path_prefix`` (``text_pattern_ops``); a column-source LIKE
+    would force a Seq Scan. Net 2.4× faster than the single-query
     self-join on bench-scale data (44 ms → 18 ms at C=200).
     """
     row = await (
@@ -378,7 +377,7 @@ def ambiguous_edge_error(
     return AmbiguousEdgeError(
         f"Edge address is ambiguous: {edge_address_repr(from_path, to_path, edge_type, None)} "
         f"matches {len(ordered)} parallel edges with names {rendered}. "
-        f"These are distinct edges — {fix}, or address the edge by uuid.",
+        f"These are distinct edges: {fix}, or address the edge by uuid.",
         from_path=from_path,
         to_path=to_path,
         edge_type=edge_type,
@@ -423,8 +422,8 @@ async def resolve_edge_uuid(
             name=name,
         )
     if len(rows) > 1:
-        # Unreachable when ``name`` was given — ``edge_uniq`` makes the
-        # quadruple unique — so this only fires for a bare triple.
+        # edge_uniq makes the quadruple unique, so this is unreachable when
+        # name was given and only fires for a bare triple.
         raise ambiguous_edge_error(
             from_path=joined_from,
             to_path=joined_to,
@@ -442,15 +441,15 @@ async def resolve_edge_uuid(
 _MANIFEST_REQUIRED = ("data_type", "name")
 _MANIFEST_ROUTES = ("node_uuid", "path", "edge_uuid")
 # Edge-triple routing: all three columns must be present together, resolved
-# server-side the same way node ``path`` is.
+# server-side the same way node path is.
 _MANIFEST_EDGE_TRIPLE = ("from_path", "to_path", "edge_type")
 # Optional fourth routing column, disambiguating parallel edges. Null means
-# "the unnamed edge of this triple" — the manifest counterpart of passing
-# ``name=None`` is simply leaving the column out.
+# "the unnamed edge of this triple"; the manifest counterpart of passing
+# name=None is leaving the column out.
 _MANIFEST_EDGE_NAME = "edge_name"
 # The edge-triple route's identity is the whole quintuple, so its unresolved-key
 # reporting carries all five columns where the single-column routes carry three
-# (six when ``edge_name`` is routing too).
+# (six when edge_name is routing too).
 _MISSING_EDGE_COLS = (*_MANIFEST_EDGE_TRIPLE, "data_type", "name")
 _MISSING_EDGE_NAMED_COLS = (*_MANIFEST_EDGE_TRIPLE, _MANIFEST_EDGE_NAME, "data_type", "name")
 
@@ -467,11 +466,11 @@ async def resolve_manifest(
 
     Detects routing mode from the columns present:
 
-    * ``node_uuid`` — direct lookup against ``series.node_uuid``.
-    * ``path``      — ``Utf8`` path joined with ``/`` (e.g. ``"a/b/c"``);
+    * ``node_uuid``: direct lookup against ``series.node_uuid``.
+    * ``path``: ``Utf8`` path joined with ``/`` (e.g. ``"a/b/c"``);
       resolved to ``node_uuid`` first.
-    * ``edge_uuid`` — direct lookup against ``series.edge_uuid``.
-    * ``from_path`` + ``to_path`` + ``edge_type`` — a ``Utf8`` edge identity
+    * ``edge_uuid``: direct lookup against ``series.edge_uuid``.
+    * ``from_path`` + ``to_path`` + ``edge_type``: a ``Utf8`` edge identity
       (all three columns required together), resolved to ``edge_uuid`` via the
       edge's endpoint nodes the same way ``path`` is resolved for nodes. An
       optional fourth ``edge_name`` column (``Utf8``, null = the unnamed edge)
@@ -481,28 +480,27 @@ async def resolve_manifest(
 
     The manifest must also carry ``data_type`` and ``name`` columns. Returns
     the original frame plus per-row ``series_id``, ``retention``, and
-    ``canonical_unit``, alongside a :class:`ResolveSummary` carrying
-    set-level signals (``has_overlapping``) that callers used to derive
-    themselves from the resolved frame.
+    ``canonical_unit``, alongside a :class:`ResolveSummary` carrying set-level
+    signals such as ``has_overlapping``.
 
     ``attach_path=True`` (default, for read pipelines) also surfaces the
     DB-derived hierarchy paths on the resolved frame (``path`` for nodes;
-    ``edge_type`` / ``edge_name`` / ``from_path`` / ``to_path`` for edges) so post-read
-    attach steps don't need another PG round-trip. ``attach_path=False``
-    skips that JOIN entirely — write pipelines drop those columns before
-    the CH insert and don't need them.
+    ``edge_type`` / ``edge_name`` / ``from_path`` / ``to_path`` for edges) so
+    post-read attach steps don't need another PG round-trip. ``attach_path=False``
+    skips that JOIN entirely, since write pipelines drop those columns before
+    the CH insert.
 
     ``on_missing`` governs unregistered series only:
 
-    * ``"raise"`` (default) — :class:`~energydb.errors.SeriesNotFoundError`
+    * ``"raise"`` (default): :class:`~energydb.errors.SeriesNotFoundError`
       naming *every* unresolved triple, not just the first one hit.
-    * ``"skip"`` — unresolved rows are dropped from the resolved frame and
+    * ``"skip"``: unresolved rows are dropped from the resolved frame and
       reported on ``summary.missing``, so one unregistered series can't fail a
       1,500-series read. Read pipelines only; the write pipeline never passes
       it, because silently dropping writes is data loss.
 
     Structural problems (missing/ambiguous routing column, wrong dtype, null
-    routing values, missing ``data_type``/``name``) raise either way — they are
+    routing values, missing ``data_type``/``name``) raise either way: they are
     caller bugs, not catalog gaps.
     """
     _check_on_missing(on_missing)
@@ -518,7 +516,7 @@ async def resolve_manifest(
             )
         present_routes.append("edge_triple")
     elif _MANIFEST_EDGE_NAME in manifest.columns:
-        # ``edge_name`` narrows an edge triple; on its own it routes nothing.
+        # edge_name narrows an edge triple; on its own it routes nothing.
         raise ManifestError(
             f"Manifest has {_MANIFEST_EDGE_NAME!r} without the edge triple "
             f"{list(_MANIFEST_EDGE_TRIPLE)}; {_MANIFEST_EDGE_NAME!r} only "
@@ -540,23 +538,23 @@ async def resolve_manifest(
 
     manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
-    # ``run`` (write pipelines only) upserts the energydb.runs row in the same
-    # call, folded into the resolve statement as a data-modifying CTE — every
-    # route resolves in ONE round-trip.
+    # run (write pipelines only) upserts the energydb.runs row in the same
+    # call, folded into the resolve statement as a data-modifying CTE, so every
+    # route resolves in one round-trip.
     if route == "edge_uuid":
         return await _resolve_manifest_by_owner(
             conn, manifest, owner_col="edge_uuid", attach_path=attach_path, run=run, on_missing=on_missing
         )
     if route == "edge_triple":
-        # A single ``edge ⋈ node ⋈ node ⋈ series`` query keyed by the endpoint
-        # paths + edge_type. Always attaches ``edge_uuid`` so downstream edge
-        # detection and projection work like the ``edge_uuid`` route.
+        # A single edge ⋈ node ⋈ node ⋈ series query keyed by the endpoint
+        # paths + edge_type. Always attaches edge_uuid so downstream edge
+        # detection and projection work like the edge_uuid route.
         return await _resolve_manifest_by_edge_triple(
             conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing
         )
     if route == "path":
-        # A single ``node ⋈ series`` query keyed by the materialized path.
-        # ``attach_path=True`` (reads) also surfaces ``node_uuid`` on the
+        # A single node ⋈ series query keyed by the materialized path.
+        # attach_path=True (reads) also surfaces node_uuid on the
         # resolved frame for the post-read hierarchy attach.
         return await _resolve_manifest_by_path(conn, manifest, run=run, attach_path=attach_path, on_missing=on_missing)
     return await _resolve_manifest_by_owner(
@@ -579,7 +577,7 @@ def _coerce_uuid_col(manifest: pl.DataFrame, col: str) -> pl.DataFrame:
 
 # SQL fragments per (owner_col, attach_path) combination. Splitting the
 # JOIN-to-owner-row from the core series scan lets writes opt out of the
-# hierarchy attach entirely — saves ~20ms PG-side at scale=200.
+# hierarchy attach entirely, saving ~20ms PG-side at scale=200.
 _OWNER_PATH_SELECT = {
     ("node_uuid", True): (", n.path AS path", f" LEFT JOIN {P}node n ON n.uuid = s.node_uuid"),
     ("node_uuid", False): ("", ""),
@@ -608,13 +606,13 @@ async def _resolve_manifest_by_owner(
     Workflow:
 
     1. Pre-hash the (owner, data_type, name) triple per manifest row via
-       ``hash_rows`` — walks the three Arrow buffers once without
+       ``hash_rows``, which walks the three Arrow buffers once without
        materializing a concatenated string. Much cheaper than a multi-key
        composite join over Utf8 columns once the manifest is large.
     2. Dedupe via single-column unique on ``_triple_k``.
     3. One PG round-trip on ``ix_series_{owner_col}`` filtering by
-       ``= ANY(unique_owners)``. We measured this beats ``UNNEST``-driven
-       triple JOINs at every scale that matters: at 36k unique triples PG
+       ``= ANY(unique_owners)``. This beats ``UNNEST``-driven triple JOINs at
+       every scale that matters: at 36k unique triples PG
        picks a Hash Join + Seq Scan plan for UNNEST (~300ms) vs an Index
        Scan for ``= ANY()`` (~80ms). Owner uuid comes back as text
        (``::text`` cast) so psycopg skips the UUID-object parse step
@@ -627,16 +625,16 @@ async def _resolve_manifest_by_owner(
       ``path`` (node) or ``edge_type``/``edge_name``/``from_path``/``to_path``
       (edge) on the resolved frame. Downstream attach steps consume these without
       another PG hop.
-    * False (write pipelines): skip the JOIN entirely — writes drop path
-      before the CH insert anyway.
+    * False (write pipelines): skip the JOIN entirely; writes drop path before
+      the CH insert anyway.
 
-    ``timeseries_type`` is *not* attached per-row; the OVERLAPPING check
-    moves up into :class:`ResolveSummary`.
+    ``timeseries_type`` is *not* attached per-row; the OVERLAPPING check lives
+    on :class:`ResolveSummary` instead.
     """
     manifest = _coerce_uuid_col(manifest, owner_col)
     is_edge = owner_col == "edge_uuid"
 
-    # Empty-or-all-null check first so the message matches the historical
+    # Empty-or-all-null check first so the message matches the documented
     # contract; per-row null check second.
     non_null = manifest.height - manifest[owner_col].null_count()
     if non_null == 0:
@@ -659,11 +657,11 @@ async def _resolve_manifest_by_owner(
     miss_names = triples_df["name"].to_list()
     miss_triples: list[tuple[str, str, str]] = list(zip(miss_owners, miss_dts, miss_names, strict=True))
 
-    # 3. Bulk-fetch every series owned by the affected owners — one indexed
-    # scan on ``ix_series_{owner_col}``. ``::text`` cast skips psycopg's
-    # per-row UUID-object parse. ``run`` (write pipelines) folds the runs
-    # upsert into this same statement as a leading data-modifying CTE, same
-    # as the path route; its params bind before the owner ANY().
+    # 3. Bulk-fetch every series owned by the affected owners: one indexed scan
+    # on ix_series_{owner_col}. The ::text cast skips psycopg's per-row
+    # UUID-object parse. run (write pipelines) folds the runs upsert into this
+    # same statement as a leading data-modifying CTE, like the path route; its
+    # params bind before the owner ANY().
     unique_owners = list({t[0] for t in miss_triples})
     extra_cols, join_sql = _OWNER_PATH_SELECT[(owner_col, attach_path)]
     cte_sql, cte_params = ("", ())
@@ -702,10 +700,9 @@ async def _resolve_manifest_by_owner(
         if triple in triple_to_meta
     }
     if unresolved:
-        # ``on_missing="skip"``: drop the unresolvable rows *before* the join.
-        # The left-join would otherwise leave them carrying a null ``series_id``
-        # and ``_project_meta``'s ``.unique()`` would emit a null-id series into
-        # the read.
+        # on_missing="skip": drop unresolvable rows before the join, or the
+        # left-join leaves them carrying a null series_id and _project_meta's
+        # .unique() emits a null-id series into the read.
         manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
 
     # 4. Build the per-hash lookup frame and attach via a single left-join.
@@ -778,7 +775,7 @@ async def _resolve_manifest_by_path(
     if manifest["path"].dtype == pl.List(pl.Utf8):
         raise ManifestError(
             "Manifest 'path' column must be Utf8 joined with '/'. "
-            "Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
+            "Got List(Utf8): pass 'a/b/c' instead of ['a','b','c']."
         )
     if manifest["path"].dtype != pl.Utf8:
         raise ManifestError(f"Manifest 'path' column must be Utf8 joined with '/'; got {manifest['path'].dtype}.")
@@ -832,7 +829,7 @@ async def _resolve_manifest_by_path(
         if triple in triple_to_meta
     }
     if unresolved:
-        # ``on_missing="skip"`` — see the note in ``_resolve_manifest_by_owner``.
+        # on_missing="skip": see the note in _resolve_manifest_by_owner.
         manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
     metas = list(hash_to_meta.values())
     lookup_data: dict[str, list] = {
@@ -874,7 +871,7 @@ async def _resolve_manifest_by_edge_triple(
 
     The edge analogue of :func:`_resolve_manifest_by_path`: instead of routing
     by a single materialized ``node.path``, route by the ``(from_path, to_path,
-    edge_type)`` identity — plus the optional ``edge_name`` fourth column —
+    edge_type)`` identity, plus the optional ``edge_name`` fourth column,
     joining the edge to its endpoint nodes' materialized paths. Hashes the
     ``(from_path, to_path, edge_type[, edge_name], data_type, name)`` key,
     dedupes, and issues one ``edge ⋈ node ⋈ node ⋈ series`` query with a
@@ -888,7 +885,7 @@ async def _resolve_manifest_by_edge_triple(
     :class:`~energydb.errors.AmbiguousEdgeError` listing the candidates.
 
     Always surfaces ``edge_uuid`` and ``edge_name`` on the resolved frame
-    regardless of ``attach_path`` — downstream edge detection
+    regardless of ``attach_path``: downstream edge detection
     (:func:`_finish_read`) and projection (:func:`_project_meta`) key off
     them. ``from_path`` / ``to_path`` / ``edge_type`` need no re-attach: the
     join is on path/type equality, so the manifest values ARE the DB values.
@@ -897,14 +894,14 @@ async def _resolve_manifest_by_edge_triple(
         if manifest[col].dtype == pl.List(pl.Utf8):
             raise ManifestError(
                 f"Manifest {col!r} column must be Utf8 joined with '/'. "
-                f"Got List(Utf8) — pass 'a/b/c' instead of ['a','b','c']."
+                f"Got List(Utf8): pass 'a/b/c' instead of ['a','b','c']."
             )
         if manifest[col].dtype != pl.Utf8:
             raise ManifestError(f"Manifest {col!r} column must be Utf8; got {manifest[col].dtype}.")
 
-    # ``edge_name`` is optional; when present it joins the routing key. Nulls
+    # edge_name is optional; when present it joins the routing key. Nulls
     # are meaningful there (the unnamed edge), so unlike the triple columns it
-    # gets no null check — only a dtype one.
+    # gets a dtype check but no null check.
     route_by_name = _MANIFEST_EDGE_NAME in manifest.columns
     if route_by_name and manifest[_MANIFEST_EDGE_NAME].dtype != pl.Utf8:
         raise ManifestError(
@@ -958,10 +955,10 @@ async def _resolve_manifest_by_edge_triple(
         )
     ).fetchall()
 
-    # Every edge the (superset) triple scan saw, keyed by triple — the input to
-    # the ambiguity check. Series-less edges are in here too, thanks to the LEFT
-    # JOIN, so an ambiguous address is caught even when only one of the parallel
-    # edges carries the requested series.
+    # Every edge the (superset) triple scan saw, keyed by triple: the input to
+    # the ambiguity check. The LEFT JOIN keeps series-less edges in here too, so
+    # an ambiguous address is caught even when only one of the parallel edges
+    # carries the requested series.
     edges_by_triple: dict[tuple[str, str, str], dict[str, str | None]] = {}
     key_to_meta: dict[tuple, tuple] = {}
     for fp, tp, et, edge_name, dt, sname, sid, unit, ts_type, retention, edge_uuid in rows:
@@ -973,7 +970,7 @@ async def _resolve_manifest_by_edge_triple(
 
     if not route_by_name:
         # Ambiguity is an addressing error, not a catalog gap: it raises even
-        # under ``on_missing="skip"``, and before the missing-series report, so
+        # under on_missing="skip", and before the missing-series report, so
         # "which of these edges did you mean?" always wins over "no series".
         for tup in miss_tuples:
             candidates = edges_by_triple.get(tup[:3], {})
@@ -994,7 +991,7 @@ async def _resolve_manifest_by_edge_triple(
         hash_val: key_to_meta[key] for hash_val, key in zip(miss_keys, miss_tuples, strict=True) if key in key_to_meta
     }
     if unresolved:
-        # ``on_missing="skip"`` — see the note in ``_resolve_manifest_by_owner``.
+        # on_missing="skip": see the note in _resolve_manifest_by_owner.
         manifest = manifest.join(_resolvable_keys(hash_to_meta), on="_triple_k", how="semi")
     metas = list(hash_to_meta.values())
     lookup_df = pl.DataFrame(

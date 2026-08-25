@@ -2,12 +2,12 @@
 
 ``edge_uniq`` is ``(edge_type, from_node_uuid, to_node_uuid, name)`` with
 ``NULLS NOT DISTINCT``, so a corridor can carry six circuits that differ only
-by name — the shape a real transmission network has and a simple graph cannot
+by name: the shape a real transmission network has and a simple graph cannot
 represent. The interesting half is not the constraint but the *addressing*:
 every triple-addressed path either resolves a unique edge or raises
 :class:`~energydb.errors.AmbiguousEdgeError`; none of them silently picks one.
 
-Live integration tests — skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
+Live integration tests: skipped if ``TIMEDB_PG_DSN`` / ``TIMEDB_CH_URL``
 aren't set.
 """
 
@@ -28,7 +28,7 @@ from energydb.errors import AlreadyExistsError, AmbiguousEdgeError, EdgeNotFound
 
 if not (os.environ.get("TIMEDB_PG_DSN") and os.environ.get("TIMEDB_CH_URL")):
     pytest.skip(
-        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set — skipping multigraph edge tests",
+        "TIMEDB_PG_DSN / TIMEDB_CH_URL not set: skipping multigraph edge tests",
         allow_module_level=True,
     )
 
@@ -96,7 +96,7 @@ def _register_and_write(client, *, name: str, offset: float) -> None:
 
 
 def test_parallel_named_edges_are_accepted(client, corridor):
-    """Six circuits on one endpoint pair — the whole point."""
+    """Six circuits on one endpoint pair: the whole point."""
     assert len(set(corridor.values())) == len(CIRCUITS)
     lines = client.query_edges(type="Line")
     assert sorted(line.name for line in lines) == sorted(CIRCUITS)
@@ -120,7 +120,7 @@ def test_duplicate_quadruple_is_rejected(client, corridor):
 def test_two_unnamed_edges_are_still_rejected(client):
     """``NULLS NOT DISTINCT``: at most one *unnamed* edge per (type, from, to).
 
-    Plain NULL semantics would allow unlimited unnamed duplicates — strictly
+    Plain NULL semantics would allow unlimited unnamed duplicates, strictly
     worse than the simple-graph constraint this replaced.
     """
     bus_a = edb.grid.JunctionPoint(name="BusA")
@@ -203,7 +203,7 @@ def test_ambiguous_triple_raises_with_every_candidate(client, corridor):
 def test_ambiguous_triple_is_a_validation_error(client, corridor):
     """Ambiguity is a caller-side addressing bug, not a missing entity."""
     assert issubclass(AmbiguousEdgeError, edb.ValidationError)
-    with pytest.raises(ValueError):  # noqa: PT011 -- the ValueError compat base is the point
+    with pytest.raises(ValueError):  # noqa: PT011  (the ValueError compat base is the point)
         client.get_edge(FROM_PATH, TO_PATH, type="Line").get_raw()
 
 
@@ -402,7 +402,7 @@ def test_edge_scope_read_carries_edge_name(client, corridor):
 
 
 def test_scope_read_on_an_ambiguous_triple_raises(client, corridor):
-    """The read path resolves the edge too — it must not pick one either."""
+    """The read path resolves the edge too; it must not pick one either."""
     _register_and_write(client, name="circuit-1", offset=10.0)
     with pytest.raises(AmbiguousEdgeError):
         client.get_edge(FROM_PATH, TO_PATH, type="Line").read(data_type="actual", name="flow")
@@ -420,7 +420,7 @@ def test_resolve_then_read_from_meta_keeps_the_edge_name(client, corridor):
 
 
 def test_edge_read_output_feeds_back_in_as_a_manifest(client, corridor):
-    """The output columns *are* the routing columns — including ``edge_name``."""
+    """The output columns *are* the routing columns, including ``edge_name``."""
     _register_and_write(client, name="circuit-1", offset=10.0)
     first = client.read(_manifest("circuit-1"))
     again = client.read(first.select(["from_path", "to_path", "edge_type", "edge_name", "data_type", "name"]).unique())
@@ -479,7 +479,7 @@ def test_deleting_one_circuit_leaves_its_siblings(client, corridor):
 def test_register_tree_loads_parallel_circuits(client):
     """The ``lines.csv`` shape: many endpoint pairs, several circuits each.
 
-    The load must drop nothing — that is the 12% of the public European
+    The load must drop nothing: that is the 12% of the public European
     transmission network a simple graph cannot hold.
     """
     pairs = 100
