@@ -102,6 +102,41 @@ def test_lifecycle_guard_passes_on_root(client: AsyncClient) -> None:
 
 
 @pytest.mark.skipif(not os.environ.get("TIMEDB_PG_DSN"), reason="TIMEDB_PG_DSN not set")
+def test_scope_resolve_binds_namespace_guc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: scope.resolve() → _build_resolved_meta must borrow its
+    connection through the client (which binds the namespace GUC) — a raw
+    pool checkout leaves the GUC unset, and under RLS the resolve silently
+    sees zero series (surfaced as API 404s on existing timeseries)."""
+    from uuid import uuid4
+
+    import energydb.series as series_mod
+    import polars as pl
+
+    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: object())
+    seen: dict[str, str | None] = {}
+
+    async def fake_resolve(conn, **kwargs):
+        row = await (await conn.execute("SELECT current_setting('energydb.namespace', true)")).fetchone()
+        seen["guc"] = row[0]
+        return pl.DataFrame()  # contract: a frame, empty = nothing matched
+
+    monkeypatch.setattr(series_mod, "resolve_subtree_series_for_read", fake_resolve)
+
+    async def run() -> None:
+        root = AsyncClient(pg_conninfo=os.environ["TIMEDB_PG_DSN"], ch_url="http://unused")
+        await root.open()
+        try:
+            view = root.namespace("ns-resolve-guc")
+            meta = await view.get_node(uuid=uuid4()).resolve(data_type="anything")
+            assert meta is None
+        finally:
+            await root.close()
+
+    asyncio.run(run())
+    assert seen["guc"] == "ns-resolve-guc", f"resolve ran without the namespace GUC bound (got {seen['guc']!r})"
+
+
+@pytest.mark.skipif(not os.environ.get("TIMEDB_PG_DSN"), reason="TIMEDB_PG_DSN not set")
 def test_conn_binds_transaction_local_guc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: object())
 
