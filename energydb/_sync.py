@@ -28,11 +28,15 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import logging
 import sys
 import threading
+import weakref
 from typing import Any
 
 from energydb.client import AsyncClient
+
+logger = logging.getLogger(__name__)
 
 
 def _new_portal_loop(platform: str = sys.platform) -> asyncio.AbstractEventLoop:
@@ -71,6 +75,7 @@ class _Portal:
             daemon=True,
         )
         self._thread.start()
+        self._stopped = False
 
     def run(self, coro) -> Any:
         """Run ``coro`` on the portal loop, block, and return its result.
@@ -80,8 +85,23 @@ class _Portal:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     def stop(self) -> None:
+        """Stop the event loop and join its thread. Idempotent.
+
+        A second call is a no-op, since a stopped loop can no longer accept
+        the coroutine a naive second ``stop``/``close`` would schedule on it.
+        The loop is only closed once its thread has actually exited; closing
+        a loop still running on a live thread would be unsafe, so a join
+        timeout instead just logs and leaves the loop open.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            logger.warning("energydb-sync-portal thread did not stop within 5s; leaving its event loop open")
+        else:
+            self._loop.close()
 
 
 def _has_coro_methods(obj: Any) -> bool:
@@ -201,11 +221,28 @@ class Client:
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._portal = _Portal()
-        self._async = AsyncClient(*args, **kwargs)
-        self._portal.run(self._async.open())
+        try:
+            self._async = AsyncClient(*args, **kwargs)
+            self._portal.run(self._async.open())
+        except BaseException:
+            # Construction failed after the portal thread was already
+            # started (bad DSN, unreachable DB, ...): stop it too, or the
+            # thread outlives the Client that would have owned it.
+            self._portal.stop()
+            raise
         self._proxy = _wrap(self._async, self._portal)
+        self._closed = False
+        weakref.finalize(self, _finalize_client, self._portal, self._async)
 
     def __getattr__(self, name: str) -> Any:
+        # The one recursion hazard: looking up self._proxy below, before
+        # __init__ has set it (e.g. probed by pickling/copy machinery, or an
+        # error mid-construction), would call back into this very method
+        # looking for "_proxy" again. Every other leading-underscore name
+        # (e.g. _dsn, forwarded through to the wrapped AsyncClient) keeps
+        # working via the proxy.
+        if name == "_proxy":
+            raise AttributeError(name)
         return getattr(self._proxy, name)
 
     def __repr__(self) -> str:
@@ -218,6 +255,35 @@ class Client:
         self.close()
 
     def close(self) -> None:
-        """Close the connection pool and stop the background event loop."""
+        """Close the connection pool and stop the background event loop.
+
+        Idempotent: a second call is a no-op, so calling it explicitly before
+        (or after) a ``with`` block exits is safe.
+        """
+        if self._closed:
+            return
+        self._closed = True
         self._portal.run(self._async.close())
         self._portal.stop()
+
+
+def _finalize_client(portal: _Portal, async_client: AsyncClient) -> None:
+    """Best-effort cleanup for a :class:`Client` whose ``close()`` was never called.
+
+    Runs as a :func:`weakref.finalize` callback, so it takes the portal and
+    async client directly rather than a reference to the ``Client`` itself,
+    which would keep it alive forever. Skips entirely once the interpreter is
+    shutting down: the portal thread may already be gone by then, and
+    scheduling a coroutine on it is unsafe at that point. The trade-off is a
+    quiet exit for the common case (a client that fell out of scope, or a
+    short script that never called close()) rather than a guarantee for
+    every possible shutdown ordering.
+    """
+    if sys.is_finalizing() or portal._stopped:
+        return
+    try:
+        portal.run(async_client.close())
+    except Exception:
+        pass
+    finally:
+        portal.stop()

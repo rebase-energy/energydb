@@ -90,6 +90,12 @@ class AsyncClient:
     round-trip is awaited; the ClickHouse leg (sync ``clickhouse-connect``)
     is offloaded to a worker thread. Synchronous callers use
     :class:`energydb.Client`, a thin blocking facade over this class.
+
+    ``await client.open()`` before first use, and ``await client.close()``
+    when done, or use it as an async context manager:
+
+    >>> async with AsyncClient(pg_conninfo=..., ch_url=...) as client:
+    ...     await client.create_node(node_type="site", name="S1")
     """
 
     # Class-level defaults so instances built without __init__ behave like root
@@ -148,6 +154,13 @@ class AsyncClient:
         """Open the async connection pool. Await once before first use."""
         self._require_root("open")
         await self._pool.open()
+
+    async def __aenter__(self) -> AsyncClient:
+        await self.open()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
 
     def _safe_dsn(self) -> str:
         """The DSN with the userinfo segment (user:pass) replaced by ``***``.
@@ -383,7 +396,7 @@ class AsyncClient:
         self._engine_unavailable = False
 
     async def close(self) -> None:
-        """Close the PostgreSQL connection pool.
+        """Close the PostgreSQL connection pool and the ClickHouse client.
 
         Root-client only: calling it on a
         :meth:`namespace` view raises
@@ -392,6 +405,7 @@ class AsyncClient:
         """
         self._require_root("close")
         await self._pool.close()
+        await asyncio.to_thread(self.td.close)
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`NodeScope` for a node or subtree.

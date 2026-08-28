@@ -52,14 +52,18 @@ Import the package and instantiate the client:
 
    import energydb as edb
 
-   client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
+   with edb.Client() as client:  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL from env
+       ...
 
 The constructor accepts explicit ``pg_conninfo=`` and ``ch_url=`` kwargs for
 custom connections; environment variables are the default. Both are
 keyword-only. The synchronous ``Client`` opens its pool on construction and
-should be closed with ``client.close()`` (or used as a ``with`` block); the
-:class:`~energydb.AsyncClient` requires ``await client.open()`` before its
-first call.
+should be used as a ``with`` block, as above, so the pool and background loop
+are released even if the block raises; call ``client.close()`` yourself if
+you construct one outside a ``with``. :class:`~energydb.AsyncClient` is the
+``async``/``await`` equivalent: use it as an async context manager
+(``async with edb.AsyncClient(...) as client:``), or call
+``await client.open()`` / ``await client.close()`` around it directly.
 
 energydb re-exports the EnergyDataModel public API under ``edb.*`` (see
 ``edb.wind``, ``edb.solar``, ``edb.battery``, ``edb.grid``, ``edb.Site``,
@@ -1593,3 +1597,4 @@ A complete workflow from setup to analysis:
 
    # 7. Cleanup.
    client.delete()
+   client.close()  # release the pool and background loop; skip this if using `with edb.Client() as client:`

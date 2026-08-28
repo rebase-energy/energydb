@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Any
+from unittest.mock import MagicMock
 
 import energydb.client as client_mod
 import pytest
@@ -24,7 +25,7 @@ _DSN = "postgresql://user:pass@localhost:5432/energydb_unit_test"
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> AsyncClient:
     """An AsyncClient that never touches PG or CH (pool unopened, CH stubbed)."""
-    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: object())
+    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: MagicMock())
     return AsyncClient(pg_conninfo=_DSN, ch_url="http://unused")
 
 
@@ -112,7 +113,7 @@ def test_scope_resolve_binds_namespace_guc(monkeypatch: pytest.MonkeyPatch) -> N
     import energydb.series as series_mod
     import polars as pl
 
-    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: object())
+    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: MagicMock())
     seen: dict[str, str | None] = {}
 
     async def fake_resolve(conn, **kwargs):
@@ -138,7 +139,7 @@ def test_scope_resolve_binds_namespace_guc(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.skipif(not os.environ.get("TIMEDB_PG_DSN"), reason="TIMEDB_PG_DSN not set")
 def test_conn_binds_transaction_local_guc(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: object())
+    monkeypatch.setattr(client_mod, "TimeDBClient", lambda ch_url=None: MagicMock())
 
     async def run() -> None:
         root = AsyncClient(pg_conninfo=os.environ["TIMEDB_PG_DSN"], ch_url="http://unused")
