@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import energydatamodel as edm
 import pytest
 from energydatamodel.reference import Reference
+from energydb.errors import UnknownElementTypeError
 from energydb.serialization import (
     _type_registry,
     reconstruct_edge,
@@ -323,6 +324,53 @@ class TestReconstructEdge:
         }
         with pytest.raises(TypeError, match="not an Edge subclass"):
             reconstruct_edge(row)
+
+
+class TestUnknownElementType:
+    """A registered type name reaching neither Node nor Edge reconstruction
+    raises the targeted :class:`UnknownElementTypeError`, and the registry
+    that backs the lookup recovers from a class registered after the first
+    miss (rather than staying stale for the process lifetime)."""
+
+    def test_unknown_node_type_raises_actionable_error(self):
+        from uuid import uuid4
+
+        row = {"uuid": uuid4(), "node_type": "TotallyUnregisteredNode", "name": "X", "data": {}}
+        with pytest.raises(UnknownElementTypeError, match="not in the EDM registry"):
+            reconstruct_node(row)
+
+    def test_unknown_edge_type_raises_actionable_error(self):
+        from uuid import uuid4
+
+        row = {
+            "uuid": uuid4(),
+            "edge_type": "TotallyUnregisteredEdge",
+            "name": "X",
+            "data": {},
+            "from_node_uuid": uuid4(),
+            "to_node_uuid": uuid4(),
+        }
+        with pytest.raises(UnknownElementTypeError, match="not in the EDM registry"):
+            reconstruct_edge(row)
+
+    def test_registry_refreshes_on_miss_for_a_class_defined_after_first_reconstruct(self):
+        """A miss must not stay cached forever: a class defined (and thus
+        registered) after the first failed lookup must still be found on the
+        next reconstruct call."""
+        from uuid import uuid4
+
+        _type_registry.cache_clear()
+        with pytest.raises(UnknownElementTypeError):
+            reconstruct_node({"uuid": uuid4(), "node_type": "LateDefinedNode", "name": "X", "data": {}})
+
+        class LateDefinedNode(edm.Node):
+            pass
+
+        try:
+            obj = reconstruct_node({"uuid": uuid4(), "node_type": "LateDefinedNode", "name": "Y", "data": {}})
+            assert isinstance(obj, LateDefinedNode)
+        finally:
+            _type_registry.cache_clear()
 
 
 class TestEdgeRoundTrip:

@@ -22,7 +22,7 @@ from energydatamodel.json_io import get_registry
 from energydatamodel.reference import Reference
 from psycopg.types.json import Jsonb
 
-from energydb.errors import ValidationError
+from energydb.errors import UnknownElementTypeError
 
 # id round-trips via the uuid column, not the data JSONB blob, as do all
 # fields stored as their own columns.
@@ -34,10 +34,26 @@ _EDGE_EXCLUDES = {"id", "from_element", "to_element", "timeseries"}
 def _type_registry() -> dict[str, type]:
     """Name → class lookup for every EDM Element subclass.
 
-    Cached for the process lifetime: the EDM class hierarchy is fixed at
-    import time, so we don't need to re-walk it on every reconstruct call.
+    Cached for the process lifetime: most lookups hit the same handful of
+    classes, so we don't want to re-walk the registry on every reconstruct
+    call. :func:`_lookup_type` refreshes this once on a miss, so a class
+    whose module is imported after the first reconstruct call is still found.
     """
     return get_registry()
+
+
+def _lookup_type(name: str) -> type | None:
+    """Look up an EDM class by its registered name, refreshing once on a miss.
+
+    ``_type_registry()`` snapshots the registry at first use and is cached
+    for the process lifetime; without a refresh, a class whose module is
+    imported after that first call would stay permanently invisible here.
+    """
+    cls = _type_registry().get(name)
+    if cls is not None:
+        return cls
+    _type_registry.cache_clear()
+    return _type_registry().get(name)
 
 
 def _build_storage_dict(row: dict[str, Any], *, type_col: str) -> dict[str, Any]:
@@ -83,9 +99,12 @@ def reconstruct_node(row: dict[str, Any]):
     the in-memory identity matches the persistent identity.
     """
     node_type = row["node_type"]
-    cls = _type_registry().get(node_type)
+    cls = _lookup_type(node_type)
     if cls is None:
-        raise ValidationError(f"Unknown node type: {node_type}")
+        raise UnknownElementTypeError(
+            f"Unknown node type: {node_type!r} is not in the EDM registry - import the "
+            "module that defines it before reading"
+        )
     if not issubclass(cls, (edm.Node, edm.Collection)):
         raise TypeError(f"node table row has type {node_type} which is not a Node or Collection subclass")
 
@@ -120,9 +139,12 @@ def reconstruct_edge(row: dict[str, Any]):
     round-trip needed.
     """
     edge_type = row["edge_type"]
-    cls = _type_registry().get(edge_type)
+    cls = _lookup_type(edge_type)
     if cls is None:
-        raise ValidationError(f"Unknown edge type: {edge_type}")
+        raise UnknownElementTypeError(
+            f"Unknown edge type: {edge_type!r} is not in the EDM registry - import the "
+            "module that defines it before reading"
+        )
     if not issubclass(cls, edm.Edge):
         raise TypeError(f"edge table row has type {edge_type} which is not an Edge subclass")
 

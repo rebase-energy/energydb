@@ -68,38 +68,42 @@ from datetime import UTC, datetime
 import energydb as edb
 import pandas as pd
 
-client = edb.Client()  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL
-client.create()
+with edb.Client() as client:  # reads TIMEDB_PG_DSN / TIMEDB_CH_URL
+    client.create()
 
-# 1. Declare your portfolio: a tree of typed assets with their series.
-t01 = edb.wind.WindTurbine(
-    name="T01", capacity=3.5, hub_height=80,
-    timeseries=[edb.TimeSeries(name="power", unit="MW",
-                               data_type=edb.DataType.ACTUAL)],
-)
-portfolio = edb.Portfolio(
-    name="my-portfolio",
-    members=[edb.Site(name="Offshore-1", members=[t01])],
-)
-client.register_tree(portfolio)   # create-only; edit existing nodes via scope mutators
+    # 1. Declare your portfolio: a tree of typed assets with their series.
+    t01 = edb.wind.WindTurbine(
+        name="T01", capacity=3.5, hub_height=80,
+        timeseries=[edb.TimeSeries(name="power", unit="MW",
+                                   data_type=edb.DataType.ACTUAL)],
+    )
+    portfolio = edb.Portfolio(
+        name="my-portfolio",
+        members=[edb.Site(name="Offshore-1", members=[t01])],
+    )
+    client.register_tree(portfolio)   # create-only; edit existing nodes via scope mutators
 
-# 2. Write hourly power for that turbine.
-start = datetime(2026, 1, 1, tzinfo=UTC)
-df = pd.DataFrame({
-    "valid_time": pd.date_range(start, periods=24, freq="1h", tz="UTC"),
-    "value":      [2.5 + 0.05 * i for i in range(24)],
-})
-client.get_node("my-portfolio", "Offshore-1", "T01").write(
-    df, name="power", data_type="actual",
-)
+    # 2. Write hourly power for that turbine.
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    df = pd.DataFrame({
+        "valid_time": pd.date_range(start, periods=24, freq="1h", tz="UTC"),
+        "value":      [2.5 + 0.05 * i for i in range(24)],
+    })
+    client.get_node("my-portfolio", "Offshore-1", "T01").write(
+        df, name="power", data_type="actual",
+    )
 
-# 3. Read across the whole portfolio in one fluent call.
-client.get_node("my-portfolio").read(name="power", data_type="actual")
+    # 3. Read across the whole portfolio in one fluent call.
+    client.get_node("my-portfolio").read(name="power", data_type="actual")
+# the pool and background loop are released once the `with` block exits;
+# without it, call client.close() yourself when you're done.
 ```
 
 > **Async?** `edb.Client` is a synchronous facade over `edb.AsyncClient`. For
-> `async`/`await` code, use `AsyncClient` directly — `await client.open()`
-> once, then `await` every method shown above.
+> `async`/`await` code, use `AsyncClient` directly, either as an async
+> context manager (`async with edb.AsyncClient(...) as client:`) or with
+> `await client.open()` / `await client.close()` around every method shown
+> above.
 
 ---
 

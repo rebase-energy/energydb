@@ -39,6 +39,7 @@ from energydb.errors import (
     NodeNotFoundError,
     NotFoundError,
     SeriesNotFoundError,
+    UnknownElementTypeError,
     ValidationError,
 )
 from energydb.paths import resolve_edge_uuid, resolve_manifest, resolve_node_uuid, resolve_path
@@ -58,6 +59,7 @@ PUBLIC_ERRORS = [
     ManifestError,
     ConfigurationError,
     IncompatibleUnitError,
+    UnknownElementTypeError,
 ]
 
 

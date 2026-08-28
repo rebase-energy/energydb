@@ -166,6 +166,16 @@ class AmbiguousEdgeError(ValidationError):
         self.matches: list[dict[str, Any]] | None = None if matches is None else [dict(m) for m in matches]
 
 
+class UnknownElementTypeError(ValidationError):
+    """A stored ``node_type`` / ``edge_type`` has no class in the EDM registry.
+
+    Almost always means the module defining that
+    :class:`~energydatamodel.Element` subclass was never imported in this
+    process: classes register themselves on definition, so an unimported
+    module leaves a gap the registry can't fill.
+    """
+
+
 class UnchangedScopeError(ValidationError):
     """``skip_unchanged`` was asked for with a comparison key that would lose data.
 
@@ -218,5 +228,6 @@ __all__ = [
     "NotFoundError",
     "SeriesNotFoundError",
     "UnchangedScopeError",
+    "UnknownElementTypeError",
     "ValidationError",
 ]
