@@ -32,7 +32,7 @@ from timedb import PgEngineMeta, UnchangedScope, profiling
 from energydb import series as series_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
-from energydb._io import WriteResult, annotate_undefined_table, autocommit_read_conn, execute_read
+from energydb._io import WriteResult, annotate_undefined_table, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, map_edge_conflict, register_tree_under
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
@@ -1221,9 +1221,11 @@ class NodeScope(_BaseScope):
             )
         else:
             where_conds, where_params = [], []
-        # Guarded against txn-bound scopes upstream, so this always borrows from
-        # the pool; autocommit skips psycopg's implicit BEGIN round-trip.
-        async with autocommit_read_conn(self._pool) as conn:
+        # Through the client's read checkout: binds the namespace GUC on
+        # namespaced views (a raw pool checkout would leave it unset and RLS
+        # would hide every series); autocommit still skips the implicit-BEGIN
+        # round-trip. Reads are guarded against txn-bound scopes upstream.
+        async with self._use_read_conn() as conn:
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
                 if self._path and self._node_uuid is None:
                     meta = await series_mod.resolve_subtree_series_for_read(
@@ -1571,8 +1573,8 @@ class EdgeScope(_BaseScope):
         (3 round-trips) into a single query. ``None`` if no series match.
         """
         data_type_str = str(data_type).lower() if data_type else None
-        # Reads are guarded against txn-bound scopes upstream; see NodeScope.
-        async with autocommit_read_conn(self._pool) as conn:
+        # Client read checkout (namespace GUC) — see NodeScope._build_resolved_meta.
+        async with self._use_read_conn() as conn:
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
                 if self._edge_uuid is not None:
                     meta = await series_mod.resolve_edge_series_for_read(
