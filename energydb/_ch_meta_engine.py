@@ -11,7 +11,10 @@ provisions both best-effort; ``Client.setup_ch_meta_engine()`` is the explicit
 from __future__ import annotations
 
 import os
-from urllib.parse import unquote, urlparse
+
+from psycopg.conninfo import conninfo_to_dict
+
+from .errors import ConfigurationError
 
 
 def _engine_table_name(base: str, schema: str) -> str:
@@ -92,7 +95,27 @@ def inlines_pg_password(pg_dsn: str) -> bool:
     """
     if os.environ.get("ENERGYDB_CH_PG_COLLECTION"):
         return False
-    return bool(unquote(urlparse(pg_dsn).password or ""))
+    return bool(conninfo_to_dict(pg_dsn).get("password"))
+
+
+def engine_pg_host(pg_dsn: str) -> str | None:
+    """``host:port`` ClickHouse can dial for ``pg_dsn``, or ``None`` if there is none.
+
+    ``ENERGYDB_CH_PG_HOST`` always wins, same as in :func:`engine_table_ddl`.
+    Otherwise the DSN's host is used, but only if it is a TCP host: missing, or a
+    Unix-socket directory (starting with ``/``, e.g. from
+    ``postgresql:///db?host=/run/postgresql``), yields ``None`` since ClickHouse
+    has no socket to dial. The DSN's ``host`` query parameter is honored, so
+    ``postgresql:///db?host=tcphost`` resolves to ``tcphost:5432``.
+    """
+    override = os.environ.get("ENERGYDB_CH_PG_HOST")
+    if override:
+        return override
+    info = conninfo_to_dict(pg_dsn)
+    host = str(info.get("host") or "")
+    if not host or host.startswith("/"):
+        return None
+    return f"{host}:{info.get('port') or 5432}"
 
 
 def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
@@ -117,6 +140,11 @@ def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
 
     The engine table must NOT be wrapped in a CH VIEW, that kills predicate
     pushdown of ``path LIKE 'root/%'`` (ClickHouse #86178).
+
+    Raises :class:`~energydb.errors.ConfigurationError` if ``pg_dsn`` has no TCP host and is not
+    overridden by ``ENERGYDB_CH_PG_HOST`` (see :func:`engine_pg_host`); callers
+    that provision from a DSN should check :func:`engine_pg_host` first so this
+    never fires as a surprise.
     """
     named_collection = os.environ.get("ENERGYDB_CH_PG_COLLECTION")
     if named_collection:
@@ -124,10 +152,15 @@ def engine_table_ddl(pg_dsn: str, pg_schema: str) -> str:
         # collection encodes, resolving against the wrong series_meta.
         source = f"{named_collection}, table = 'series_meta', schema = '{pg_schema}'"
     else:
-        u = urlparse(pg_dsn)
-        host = os.environ.get("ENERGYDB_CH_PG_HOST") or f"{u.hostname}:{u.port or 5432}"
-        db = (u.path or "/postgres").lstrip("/") or "postgres"
-        user = unquote(u.username or "")
-        pw = unquote(u.password or "")
+        host = engine_pg_host(pg_dsn)
+        if host is None:
+            raise ConfigurationError(
+                "the PostgreSQL DSN has no TCP host for ClickHouse to dial "
+                "(socket-only or missing); set ENERGYDB_CH_PG_HOST to override"
+            )
+        info = conninfo_to_dict(pg_dsn)
+        db = info.get("dbname") or "postgres"
+        user = info.get("user") or ""
+        pw = info.get("password") or ""
         source = f"'{host}', '{db}', 'series_meta', '{user}', '{pw}', '{pg_schema}'"
     return f"CREATE TABLE IF NOT EXISTS {CH_ENGINE_TABLE} {_ENGINE_COLS} ENGINE = PostgreSQL({source})"

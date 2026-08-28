@@ -25,11 +25,14 @@ from energydb import Client
 from energydb._ch_meta_engine import (
     CH_ENGINE_TABLE,
     _engine_table_name,
+    engine_pg_host,
     engine_table_ddl,
     inlines_pg_password,
     series_meta_view_ddl,
 )
 from energydb._io import _is_unknown_table, engine_meta_for_manifest, execute_read
+from energydb.client import AsyncClient
+from energydb.errors import ConfigurationError
 
 DSN = "postgresql://app_user:s3cret@db.example.com:6543/proddb"
 
@@ -263,6 +266,115 @@ def test_series_meta_view_ddl_qualifier():
     assert "CREATE OR REPLACE VIEW energydb.series_meta" in create
     assert "energydb.node" in create and "energydb.series" in create
     assert drop == "DROP VIEW IF EXISTS energydb.series_meta"
+
+
+# ---------------------------------------------------------------------------
+# engine_pg_host: TCP-vs-socket DSN resolution (no DB needed)
+# ---------------------------------------------------------------------------
+
+_SOCKET_DSN = "postgresql:///homelab?host=/run/postgresql&user=homelab"
+_QUERY_TCP_HOST_DSN = "postgresql:///db?host=tcphost"
+
+
+def test_socket_dsn_has_no_engine_pg_host(monkeypatch):
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    assert engine_pg_host(_SOCKET_DSN) is None
+
+
+def test_socket_dsn_ddl_construction_refuses(monkeypatch):
+    monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    with pytest.raises(ConfigurationError, match="TCP host"):
+        engine_table_ddl(_SOCKET_DSN, "public")
+
+
+def test_query_string_tcp_host_resolves(monkeypatch):
+    """``postgresql:///db?host=tcphost`` puts the TCP host in the query string,
+    not the netloc; conninfo_to_dict must still pick it up."""
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    assert engine_pg_host(_QUERY_TCP_HOST_DSN) == "tcphost:5432"
+
+
+def test_query_string_tcp_host_ddl(monkeypatch):
+    monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    ddl = engine_table_ddl(_QUERY_TCP_HOST_DSN, "public")
+    assert "'tcphost:5432'" in ddl
+
+
+def test_ch_pg_host_override_wins_for_socket_dsn(monkeypatch):
+    """The override is an escape hatch for exactly this case: a socket-only DSN
+    with a TCP host ClickHouse can still reach."""
+    monkeypatch.setenv("ENERGYDB_CH_PG_HOST", "postgres:5432")
+    assert engine_pg_host(_SOCKET_DSN) == "postgres:5432"
+    ddl = engine_table_ddl(_SOCKET_DSN, "public")
+    assert "'postgres:5432'" in ddl
+
+
+def test_ch_pg_host_override_wins_for_tcp_dsn(monkeypatch):
+    monkeypatch.setenv("ENERGYDB_CH_PG_HOST", "postgres:5432")
+    assert engine_pg_host(DSN) == "postgres:5432"
+
+
+# ---------------------------------------------------------------------------
+# setup_ch_meta_engine / provisioning skip for a socket-only DSN (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+def _bare_client(dsn: str) -> AsyncClient:
+    """An ``AsyncClient`` with only ``_dsn`` set, no pool or CH client.
+
+    The no-TCP-host branch of ``_provision_engine_table_blocking`` returns
+    before touching ``self.td`` or ``self._pool``, so this is enough to test it
+    without a live PostgreSQL or ClickHouse.
+    """
+    obj = object.__new__(AsyncClient)
+    obj._dsn = dsn
+    return obj
+
+
+def test_provisioning_skips_for_socket_dsn(monkeypatch, caplog):
+    monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    client = _bare_client(_SOCKET_DSN)
+
+    with caplog.at_level(logging.INFO, logger="energydb.client"):
+        client._provision_engine_table_blocking()
+
+    records = [r for r in caplog.records if r.name == "energydb.client"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "TCP host" in records[0].getMessage()
+
+
+def test_setup_ch_meta_engine_raises_for_socket_dsn(monkeypatch):
+    """The explicit, raising path: ``setup_ch_meta_engine`` must not silently
+    degrade the way ``create()``'s best-effort provisioning does."""
+    monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
+    monkeypatch.delenv("ENERGYDB_CH_PG_HOST", raising=False)
+    client = _bare_client(_SOCKET_DSN)
+
+    with pytest.raises(ConfigurationError, match="TCP host"):
+        client._provision_engine_table_blocking(strict=True)
+
+
+def test_ch_pg_host_override_lets_provisioning_proceed_for_socket_dsn(monkeypatch, caplog):
+    """The override unblocks provisioning entirely, not just ``engine_pg_host``:
+    with it set, the socket DSN no longer skips or raises past the host check.
+
+    The bare client has no ``self.td``, so past the host check it hits
+    ``AttributeError`` reaching for it, that failure is the proof it got past
+    the no-TCP-host branch instead of skipping or raising there.
+    """
+    monkeypatch.delenv("ENERGYDB_CH_PG_COLLECTION", raising=False)
+    monkeypatch.setenv("ENERGYDB_CH_PG_HOST", "postgres:5432")
+    client = _bare_client(_SOCKET_DSN)
+
+    with caplog.at_level(logging.INFO, logger="energydb.client"), pytest.raises(AttributeError):
+        client._provision_engine_table_blocking(strict=True)
+
+    records = [r for r in caplog.records if r.name == "energydb.client"]
+    assert not records  # did not take the no-TCP-host skip path
 
 
 # ---------------------------------------------------------------------------
@@ -585,18 +697,26 @@ def test_not_provisioned_logs_one_info_line_without_a_traceback(client, monkeypa
 
 
 @pytestmark_live
-def test_a_real_failure_still_warns_with_a_traceback(client, monkeypatch, caplog):
-    """The other half of the split, asserted so the quieting can't creep."""
+def test_a_real_failure_still_warns_with_the_cause_inline(client, monkeypatch, caplog):
+    """The other half of the split, asserted so the quieting can't creep.
+
+    The WARNING line carries ``str(err.__cause__)`` inline and no traceback; the
+    traceback moves to a DEBUG record on the same logger.
+    """
     _fail_engine_with(monkeypatch, _FakeDatabaseError("Code: 1002. Connection refused", code=1002))
     client._async._engine_unavailable = False
 
-    with caplog.at_level(logging.INFO, logger="energydb._io"):
+    with caplog.at_level(logging.DEBUG, logger="energydb._io"):
         client.get_node("P").read(data_type="actual", name="power")
 
     records = [r for r in caplog.records if r.name == "energydb._io"]
-    assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-    assert records[0].exc_info is not None  # traceback retained
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    debugs = [r for r in records if r.levelno == logging.DEBUG]
+    assert len(warnings) == 1
+    assert "Connection refused" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None  # traceback moved off the WARNING record
+    assert len(debugs) == 1
+    assert debugs[0].exc_info is not None  # traceback retained, just quieter
 
 
 @pytestmark_live

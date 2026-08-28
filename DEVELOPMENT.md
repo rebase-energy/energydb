@@ -194,6 +194,13 @@ Only the network path changes; database, user, and password still come from
 the DSN. Without this, engine provisioning succeeds but engine reads fail and
 degrade to the sequential path — which the tests assert against.
 
+The fast, engine-backed read path needs PostgreSQL reachable over TCP from
+ClickHouse. A Unix-socket-only PG DSN (e.g.
+`postgresql:///db?host=/run/postgresql`) has no TCP host at all, so
+provisioning skips the engine table (a logged INFO line, not a failure) and
+reads always take the sequential path; set `ENERGYDB_CH_PG_HOST` to a TCP
+address if you want the engine table in that setup.
+
 Two more variables are useful when running tests:
 
 - `ENERGYDB_ENGINE_STRICT=1` — an engine-read failure raises instead of

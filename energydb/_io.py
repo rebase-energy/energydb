@@ -709,11 +709,16 @@ async def execute_read(
             else:
                 logger.warning(
                     "energydb: engine-backed read failed for meta-engine table %r "
-                    "(ENERGYDB_SCHEMA=%r); falling back to the slower sequential read path "
-                    "(higher latency and an extra PostgreSQL round-trip per read) for the rest "
-                    "of this session. The usual cause after an upgrade or an ENERGYDB_SCHEMA "
-                    "change is a missing or mis-targeted meta-engine table; (re)provision it "
-                    "once with `await client.setup_ch_meta_engine()` (or `create()`).",
+                    "(ENERGYDB_SCHEMA=%r): %s; falling back to the slower sequential read path "
+                    "for the rest of this session. (Re)provision with "
+                    "`await client.setup_ch_meta_engine()`, or set ENERGYDB_ENGINE_STRICT=1 to "
+                    "raise instead of degrading.",
+                    CH_ENGINE_TABLE,
+                    os.environ.get("ENERGYDB_SCHEMA", "public"),
+                    str(err.__cause__),
+                )
+                logger.debug(
+                    "energydb: engine-backed read failure detail for meta-engine table %r (ENERGYDB_SCHEMA=%r)",
                     CH_ENGINE_TABLE,
                     os.environ.get("ENERGYDB_SCHEMA", "public"),
                     exc_info=err.__cause__,

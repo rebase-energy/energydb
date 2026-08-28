@@ -48,6 +48,7 @@ from energydb._ch_meta_engine import (
     CH_ENGINE_TABLE,
     DROP_ENGINE_TABLE,
     DROP_LEGACY_ENGINE_TABLE,
+    engine_pg_host,
     engine_table_ddl,
     inlines_pg_password,
 )
@@ -254,8 +255,13 @@ class AsyncClient:
 
         The engine table is best-effort: a CH role that cannot create
         ``PostgreSQL()`` engine tables gets a logged warning and reads fall
-        back to the sequential path. :meth:`setup_ch_meta_engine` is the
-        explicit, raising alternative.
+        back to the sequential path. Same fallback, quietly, if the PG DSN has
+        no TCP host as seen from ClickHouse (a Unix-socket-only DSN, e.g. from
+        ``postgresql:///db?host=/run/postgresql``): the fast, engine-backed
+        read path needs PostgreSQL reachable over TCP from ClickHouse, so set
+        ``ENERGYDB_CH_PG_HOST`` if the DSN's own host is socket-only or not
+        resolvable from ClickHouse's network. :meth:`setup_ch_meta_engine` is
+        the explicit, raising alternative.
 
         For production, set ``ENERGYDB_CH_PG_COLLECTION`` to a ClickHouse named
         collection holding the PostgreSQL connection; otherwise the credentials
@@ -294,7 +300,18 @@ class AsyncClient:
                 f"PostgreSQL 14 and older do not support."
             )
 
-    def _provision_engine_table_blocking(self) -> None:
+    def _provision_engine_table_blocking(self, *, strict: bool = False) -> None:
+        # Named collections carry their own PG host, so the DSN's host is
+        # irrelevant to them; only the inlined-credential path needs a TCP host.
+        if not os.environ.get("ENERGYDB_CH_PG_COLLECTION") and engine_pg_host(self._dsn) is None:
+            message = (
+                "CH<->PG engine needs a TCP host in the PG DSN; "
+                "reads will use the sequential path (set ENERGYDB_CH_PG_HOST to override)"
+            )
+            if strict:
+                raise ConfigurationError(message)
+            logger.info(message)
+            return
         # Warn from here, not engine_table_ddl(), so DDL construction stays
         # side-effect-free and the warning fires as the credential is written.
         if inlines_pg_password(self._dsn):
@@ -353,12 +370,16 @@ class AsyncClient:
         production deployments; without it the PostgreSQL password is inlined
         into the DDL and readable via ``SHOW CREATE TABLE`` (warned about at
         provisioning time).
+
+        Raises :class:`~energydb.errors.ConfigurationError` if the PG DSN has
+        no TCP host as seen from ClickHouse (see :meth:`create`); set
+        ``ENERGYDB_CH_PG_HOST`` to fix it.
         """
         self._require_root("setup_ch_meta_engine")
         async with annotate_undefined_table(), self._pool.connection() as conn:
             await conn.execute(CREATE_SERIES_META_VIEW)
             await conn.commit()
-        await asyncio.to_thread(self._provision_engine_table_blocking)
+        await asyncio.to_thread(self._provision_engine_table_blocking, strict=True)
         self._engine_unavailable = False
 
     async def close(self) -> None:
