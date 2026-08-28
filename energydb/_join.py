@@ -24,6 +24,11 @@ from typing import NamedTuple
 
 import polars as pl
 
+# Trailing identity columns hstacked onto an empty read result; order must match
+# the columns attach_node_hierarchy / attach_edge_hierarchy add via their join.
+NODE_IDENTITY_COLUMNS: tuple[str, ...] = ("path", "data_type", "name")
+EDGE_IDENTITY_COLUMNS: tuple[str, ...] = ("from_path", "to_path", "edge_type", "edge_name", "data_type", "name")
+
 
 class SeriesKey(NamedTuple):
     """Typed key for node-routed ``output="by_path"`` result dicts.

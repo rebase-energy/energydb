@@ -419,6 +419,73 @@ def test_resolve_then_read_from_meta_keeps_the_edge_name(client, corridor):
     assert [k.edge_name for k in out] == ["circuit-2"]
 
 
+# ---------------------------------------------------------------------------
+# Empty-read schema stability (energydb#5), edge-routed reads
+# ---------------------------------------------------------------------------
+
+
+def test_edge_scope_read_zero_rows_in_range_keeps_schema(client, corridor):
+    """A far-future start_valid resolves the circuit's series but CH returns
+    no rows; must still come back as {edge_name, valid_time, value}, matching
+    the non-empty single-series shape (edge_name survives the identity strip,
+    see test_edge_scope_read_carries_edge_name), not a schema-less frame."""
+    _register_and_write(client, name="circuit-1", offset=1.0)
+    scope = client.get_edge(FROM_PATH, TO_PATH, type="Line", name="circuit-1")
+    out = scope.read(data_type="actual", name="flow", start_valid=datetime(2099, 1, 1, tzinfo=UTC))
+    assert isinstance(out, pl.DataFrame)
+    assert set(out.columns) == {"edge_name", "valid_time", "value"}
+    assert out.height == 0
+    list(zip(out["valid_time"], out["value"], strict=True))
+
+
+def test_edge_scope_read_no_matching_series_keeps_full_identity_shape(client, corridor):
+    """Zero resolved series on an edge scope keeps the full edge identity shape."""
+    _register_and_write(client, name="circuit-1", offset=1.0)
+    scope = client.get_edge(FROM_PATH, TO_PATH, type="Line", name="circuit-1")
+    out = scope.read(data_type="does-not-exist", name="flow")
+    assert isinstance(out, pl.DataFrame)
+    assert set(out.columns) == {
+        "from_path",
+        "to_path",
+        "edge_type",
+        "edge_name",
+        "data_type",
+        "name",
+        "valid_time",
+        "value",
+    }
+    assert out.height == 0
+
+
+def test_manifest_edge_read_zero_rows_in_range_keeps_schema(client, corridor):
+    """Same regression via the triple-routed manifest (``client.read``) path."""
+    _register_and_write(client, name="circuit-1", offset=1.0)
+    manifest = pl.DataFrame(
+        {
+            "from_path": [FROM_PATH],
+            "to_path": [TO_PATH],
+            "edge_type": ["Line"],
+            "edge_name": ["circuit-1"],
+            "data_type": ["actual"],
+            "name": ["flow"],
+        }
+    )
+    out = client.read(manifest, start_valid=datetime(2099, 1, 1, tzinfo=UTC))
+    assert isinstance(out, pl.DataFrame)
+    assert set(out.columns) == {
+        "from_path",
+        "to_path",
+        "edge_type",
+        "edge_name",
+        "data_type",
+        "name",
+        "valid_time",
+        "value",
+    }
+    assert out.height == 0
+    list(zip(out["valid_time"], out["value"], strict=True))
+
+
 def test_edge_read_output_feeds_back_in_as_a_manifest(client, corridor):
     """The output columns *are* the routing columns, including ``edge_name``."""
     _register_and_write(client, name="circuit-1", offset=10.0)

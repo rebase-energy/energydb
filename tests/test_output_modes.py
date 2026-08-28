@@ -272,6 +272,65 @@ def test_scope_single_series_with_by_path_returns_dict(client):
 
 
 # ---------------------------------------------------------------------------
+# Empty-read schema stability (energydb#5): a zero-row result must keep the
+# same columns a non-empty result would carry.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_read_zero_rows_in_range_keeps_schema(client):
+    """Regression repro: a far-future start_valid resolves the series but CH
+    returns no rows; the historical bug returned a schema-less frame here,
+    so df["valid_time"] would raise."""
+    out = client.get_node("P", "T1").read(
+        data_type="actual",
+        name="power",
+        start_valid=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    assert isinstance(out, pl.DataFrame)
+    assert set(out.columns) == {"valid_time", "value"}
+    assert out.height == 0
+    list(zip(out["valid_time"], out["value"], strict=True))
+
+
+def test_scope_read_zero_rows_pandas_keeps_schema(client):
+    out = client.get_node("P", "T1").read(
+        data_type="actual",
+        name="power",
+        backend="pandas",
+        start_valid=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    assert isinstance(out, pd.DataFrame)
+    assert list(out.columns) == ["valid_time", "value"]
+    assert len(out) == 0
+
+
+def test_scope_read_no_matching_series_keeps_full_identity_shape(client):
+    """Zero resolved series (not just zero CH rows) keeps the full identity
+    shape: there is no single series to strip the identity columns for."""
+    out = client.get_node("P", "T1").read(data_type="does-not-exist", name="power")
+    assert isinstance(out, pl.DataFrame)
+    assert set(out.columns) == {"path", "data_type", "name", "valid_time", "value"}
+    assert out.height == 0
+
+
+def test_client_read_zero_rows_in_range_keeps_schema(client):
+    """Same regression via the manifest (``client.read``) path."""
+    out = client.read(_manifest("P/T1"), start_valid=datetime(2099, 1, 1, tzinfo=UTC))
+    assert isinstance(out, pl.DataFrame)
+    assert set(out.columns) == {"path", "data_type", "name", "valid_time", "value"}
+    assert out.height == 0
+    list(zip(out["valid_time"], out["value"], strict=True))
+
+
+def test_by_path_zero_rows_in_range_unchanged(client):
+    """``output='by_path'`` already kept the right per-series shape; pin it."""
+    out = client.read(_manifest("P/T1"), output="by_path", start_valid=datetime(2099, 1, 1, tzinfo=UTC))
+    sub = out[("P/T1", "actual", "power")]
+    assert sub.is_empty()
+    assert set(sub.columns) == {"valid_time", "value"}
+
+
+# ---------------------------------------------------------------------------
 # SeriesKey / EdgeSeriesKey NamedTuple result keys
 # ---------------------------------------------------------------------------
 

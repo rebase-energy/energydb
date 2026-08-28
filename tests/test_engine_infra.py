@@ -177,6 +177,7 @@ def test_engine_predicate_is_not_built_when_the_engine_is_unavailable():
             None,
             _FakeClient(engine_unavailable=True),
             resolve=_resolves_to_nothing,
+            is_edge=False,
             engine_meta=factory,
         )
     )
@@ -201,6 +202,7 @@ def test_engine_predicate_is_built_once_when_the_engine_is_available():
             None,
             _FakeClient(engine_unavailable=False),
             resolve=_resolves_to_nothing,
+            is_edge=False,
             engine_meta=factory,
         )
     )

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import polars as pl
 import psycopg
-from timedb import PgEngineMeta, UnchangedScope, profiling
+from timedb import RELATIVE_READ_COLUMNS, PgEngineMeta, UnchangedScope, empty_frame, profiling, read_columns
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 from energydb import runs as runs_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._join import (
+    EDGE_IDENTITY_COLUMNS,
+    NODE_IDENTITY_COLUMNS,
     EdgeSeriesKey,
     SeriesKey,
     attach_edge_hierarchy,
@@ -406,9 +408,10 @@ def _finish_read(
             return partition_node_by_path(pool, result, meta)
 
     if result.is_empty():
-        # The public column shape is incomplete when empty (no path, data_type or
-        # name), but callers branch on is_empty() first.
-        return result.drop("series_id") if "series_id" in result.columns else result
+        result = result.drop("series_id") if "series_id" in result.columns else result
+        identity_cols = EDGE_IDENTITY_COLUMNS if is_edge else NODE_IDENTITY_COLUMNS
+        identity = pl.DataFrame(schema={c: pl.Utf8 for c in identity_cols})
+        return result.hstack(identity)
 
     with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
         if is_edge:
@@ -580,6 +583,7 @@ async def execute_read(
     *,
     resolve: Callable[[], Awaitable[pl.DataFrame | None]] | None = None,
     manifest: pl.DataFrame | None = None,
+    is_edge: bool | None = None,
     engine_meta: Callable[[], PgEngineMeta | None] | None = None,
     relative: bool = False,
     unit: str | None = None,
@@ -603,6 +607,11 @@ async def execute_read(
     * ``manifest``: a routing manifest (``Client.read`` /
       ``Client.read_relative``), resolved via :func:`resolve_manifest` +
       :func:`_project_meta`.
+
+    ``is_edge`` says whether the read is edge- or node-routed, needed to shape
+    the zero-series empty result (no meta to inspect at that point). Required
+    when ``resolve=`` is given, since the scope already knows its own kind;
+    derived automatically from ``manifest``'s columns otherwise.
 
     ``engine_meta`` is a zero-arg **factory** for the engine predicate, not the
     predicate itself. It is invoked only once this function has confirmed the
@@ -635,6 +644,11 @@ async def execute_read(
         raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
     _check_on_missing(on_missing)
 
+    if manifest is not None:
+        is_edge = "edge_uuid" in manifest.columns or all(c in manifest.columns for c in _EDGE_TRIPLE_COLS)
+    elif is_edge is None:
+        raise ValidationError("execute_read requires is_edge when resolve= is given.")
+
     kwargs = (
         dict(td_kwargs or {})
         if relative
@@ -655,7 +669,6 @@ async def execute_read(
         if resolve is not None:
             return await resolve()
         assert manifest is not None
-        is_edge = "edge_uuid" in manifest.columns or all(c in manifest.columns for c in _EDGE_TRIPLE_COLS)
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             async with client._read_conn() as conn:
                 resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing)
@@ -664,7 +677,17 @@ async def execute_read(
             return _project_meta(resolved, is_edge=is_edge)
 
     def _empty() -> tuple[pl.DataFrame | dict, int, pl.DataFrame]:
-        return ({} if output == "by_path" else pl.DataFrame()), 0, missing
+        if output == "by_path":
+            return {}, 0, missing
+        cols = (
+            list(RELATIVE_READ_COLUMNS)
+            if relative
+            else read_columns(include_updates=include_updates, include_knowledge_time=include_knowledge_time)
+        )
+        data = empty_frame(cols).drop("series_id")
+        identity_cols = EDGE_IDENTITY_COLUMNS if is_edge else NODE_IDENTITY_COLUMNS
+        identity = pl.DataFrame(schema={c: pl.Utf8 for c in identity_cols})
+        return data.hstack(identity), 0, missing
 
     meta_source = engine_meta() if (engine_meta is not None and not client._engine_unavailable) else None
     if meta_source is not None:
