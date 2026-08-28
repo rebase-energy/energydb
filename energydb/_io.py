@@ -432,10 +432,7 @@ class _EngineReadError(RuntimeError):
     """
 
 
-# The driver surfaces no structured error code, so the match is on tokens in the
-# server text. The name is the primary marker, the code a fallback for a server
-# format that omits it.
-_UNKNOWN_TABLE_MARKERS = ("UNKNOWN_TABLE", "Code: 60.")
+_UNKNOWN_TABLE_CODE = 60  # ClickHouse UNKNOWN_TABLE
 
 
 def _is_unknown_table(exc: BaseException | None) -> bool:
@@ -454,8 +451,7 @@ def _is_unknown_table(exc: BaseException | None) -> bool:
     seen: set[int] = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
-        text = str(exc)
-        if any(marker in text for marker in _UNKNOWN_TABLE_MARKERS):
+        if getattr(exc, "code", None) == _UNKNOWN_TABLE_CODE:
             return True
         exc = exc.__cause__ or exc.__context__
     return False

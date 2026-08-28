@@ -453,8 +453,13 @@ def test_uuid_object_routed_read_works_with_the_engine_disabled(client, monkeypa
 
 
 class _FakeDatabaseError(Exception):
-    """Stands in for clickhouse-connect's DatabaseError, which embeds the server
-    text in its message rather than exposing a structured error code."""
+    """Stands in for clickhouse-connect's DatabaseError, which carries the
+    structured ClickHouse error code as a ``.code`` attribute alongside the
+    server-text message."""
+
+    def __init__(self, message: str = "", code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 _UNKNOWN_TABLE_TEXT = (
@@ -462,21 +467,33 @@ _UNKNOWN_TABLE_TEXT = (
 )
 
 
-def test_unknown_table_is_recognised_from_the_server_text():
-    assert _is_unknown_table(_FakeDatabaseError(_UNKNOWN_TABLE_TEXT)) is True
-
-
 def test_the_error_code_alone_is_enough():
-    """A server locale or driver version that drops the symbolic name still has
-    the code, so the classifier must not hinge on one spelling."""
-    assert _is_unknown_table(_FakeDatabaseError("Code: 60. DB::Exception: Table x doesn't exist.")) is True
+    """clickhouse-connect exposes the ClickHouse error code as a structured
+    ``.code`` attribute; the classifier must recognise it even without any
+    matching text markers, since the driver's message format is not a stable
+    contract."""
+    assert _is_unknown_table(_FakeDatabaseError("some generic failure", code=60)) is True
+
+
+def test_message_text_alone_is_not_enough():
+    """The server text is no longer trusted: a message containing
+    ``UNKNOWN_TABLE`` / ``Code: 60.`` with no matching ``.code`` must not
+    classify, so a similarly worded error can't be misread."""
+    assert _is_unknown_table(_FakeDatabaseError(_UNKNOWN_TABLE_TEXT)) is False
+
+
+def test_scrubbed_message_still_recognised():
+    """With ``show_clickhouse_errors=False`` the server sends a generic message
+    and the text markers vanish, but ``.code`` survives."""
+    assert _is_unknown_table(_FakeDatabaseError("A database error occurred", code=60)) is True
 
 
 def test_a_real_engine_failure_is_not_classified_as_not_provisioned():
     """The whole point of the split: network/auth/connectivity failures must keep
     their warning + traceback. A quieter log for those would hide real breakage."""
     refused = _FakeDatabaseError(
-        "Code: 1002. DB::Exception: Connection refused (POSTGRESQL_CONNECTION_FAILURE) (version 26.1.1.1)"
+        "Code: 1002. DB::Exception: Connection refused (POSTGRESQL_CONNECTION_FAILURE) (version 26.1.1.1)",
+        code=1002,
     )
     assert _is_unknown_table(refused) is False
     assert _is_unknown_table(None) is False
@@ -486,7 +503,7 @@ def test_a_real_engine_failure_is_not_classified_as_not_provisioned():
 def test_the_marker_is_found_down_the_exception_chain():
     """The driver may re-wrap the server error before it reaches us, so the
     classifier walks ``__cause__``/``__context__`` rather than only the top."""
-    inner = _FakeDatabaseError(_UNKNOWN_TABLE_TEXT)
+    inner = _FakeDatabaseError("Table doesn't exist", code=60)
     wrapped = RuntimeError("clickhouse query failed")
     wrapped.__cause__ = inner
     assert _is_unknown_table(wrapped) is True
@@ -503,6 +520,20 @@ def test_a_self_referential_chain_terminates():
     a.__cause__ = b
     b.__cause__ = a
     assert _is_unknown_table(a) is False
+
+
+@pytestmark_live
+def test_a_real_scrubbed_driver_error_is_recognised():
+    """Against a real server, ``show_clickhouse_errors=False`` scrubs the text
+    markers from the exception but the structured ``.code`` survives, which is
+    the exact scenario this item exists for."""
+    import clickhouse_connect
+
+    ch = clickhouse_connect.get_client(dsn=os.environ["TIMEDB_CH_URL"], show_clickhouse_errors=False)
+    missing_table = f"energydb_test_missing_{uuid.uuid4().hex}"
+    with pytest.raises(Exception) as excinfo:
+        ch.query(f"SELECT * FROM {missing_table}")
+    assert _is_unknown_table(excinfo.value) is True
 
 
 def _fail_engine_with(monkeypatch, exc: BaseException):
@@ -535,7 +566,7 @@ def test_not_provisioned_logs_one_info_line_without_a_traceback(client, monkeypa
     the engine table used to get a scary traceback on its first read of every
     process, and learned to silence it with ENERGYDB_DISABLE_ENGINE=1, which then
     hid real engine failures too."""
-    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
+    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT, code=60))
     expected = client.get_node("P").read(data_type="actual", name="power")
     client._async._engine_unavailable = False
 
@@ -556,7 +587,7 @@ def test_not_provisioned_logs_one_info_line_without_a_traceback(client, monkeypa
 @pytestmark_live
 def test_a_real_failure_still_warns_with_a_traceback(client, monkeypatch, caplog):
     """The other half of the split, asserted so the quieting can't creep."""
-    _fail_engine_with(monkeypatch, _FakeDatabaseError("Code: 1002. Connection refused"))
+    _fail_engine_with(monkeypatch, _FakeDatabaseError("Code: 1002. Connection refused", code=1002))
     client._async._engine_unavailable = False
 
     with caplog.at_level(logging.INFO, logger="energydb._io"):
@@ -573,7 +604,7 @@ def test_the_info_line_fires_once_per_session(client, monkeypatch, caplog):
     """The session latches ``_engine_unavailable``, so later reads never re-probe.
     Asserted here because the whole justification for info-level is that it is a
     one-off statement of configuration, not a per-read complaint."""
-    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
+    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT, code=60))
     client._async._engine_unavailable = False
 
     with caplog.at_level(logging.INFO, logger="energydb._io"):
@@ -591,7 +622,7 @@ def test_strict_mode_still_raises_for_the_not_provisioned_case(client, monkeypat
     who explicitly asked for the engine."""
     import energydb._io as _io
 
-    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT))
+    _fail_engine_with(monkeypatch, _FakeDatabaseError(_UNKNOWN_TABLE_TEXT, code=60))
     monkeypatch.setattr(_io, "_ENGINE_STRICT", True)
     client._async._engine_unavailable = False
 
