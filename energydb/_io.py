@@ -594,6 +594,8 @@ async def execute_read(
     end_known: datetime | None = None,
     include_updates: bool = False,
     include_knowledge_time: bool = False,
+    bucket_us: int | None = None,
+    bucket_dedup: bool = True,
     on_missing: OnMissing = "raise",
     td_kwargs: dict | None = None,
 ) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int, pl.DataFrame]:
@@ -658,6 +660,8 @@ async def execute_read(
             "start_known": start_known,
             "end_known": end_known,
             "include_updates": include_updates,
+            "bucket_us": bucket_us,
+            "bucket_dedup": bucket_dedup,
             "include_knowledge_time": include_knowledge_time,
         }
     )

@@ -17,6 +17,7 @@ resolution query and execute.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -28,6 +29,7 @@ import polars as pl
 from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
 from timedb import PgEngineMeta, UnchangedScope, profiling
+from timedb import read as timedb_read
 
 from energydb import series as series_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
@@ -279,6 +281,27 @@ class _BaseScope:
         # The checkout point binds the namespace GUC on namespaced views.
         async with self._client._conn() as conn:
             yield conn
+
+    async def valid_range_from_meta(self, meta: pl.DataFrame) -> tuple[datetime, datetime] | None:
+        """Overall ``[min, max]`` valid_time across the series in ``meta``
+        (a frame from :meth:`resolve`) — one ClickHouse aggregate, no row
+        reads. ``None`` when the series hold no data."""
+        ids = meta["series_id"].unique().to_list()
+        return await asyncio.to_thread(timedb_read.valid_time_range, self._td._ch, ids)
+
+    async def resolved_stats_from_meta(
+        self,
+        meta: pl.DataFrame,
+        *,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+    ) -> tuple[int, bool]:
+        """``(max per-series resolved point count, has_versions)`` for the
+        window — one cheap ClickHouse aggregate, for downsampling decisions."""
+        ids = meta["series_id"].unique().to_list()
+        return await asyncio.to_thread(
+            timedb_read.resolved_stats, self._td._ch, ids, start_valid, end_valid
+        )
 
     @asynccontextmanager
     async def _use_read_conn(self):
@@ -580,6 +603,8 @@ class _BaseScope:
         end_known: datetime | None = None,
         include_updates: bool = False,
         include_knowledge_time: bool = False,
+        bucket_us: int | None = None,
+        bucket_dedup: bool = True,
         output: Output = "frame",
         backend: Backend = "polars",
     ) -> (
@@ -618,6 +643,8 @@ class _BaseScope:
             end_known=end_known,
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
+            bucket_us=bucket_us,
+            bucket_dedup=bucket_dedup,
             output=output,
         )
         return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
