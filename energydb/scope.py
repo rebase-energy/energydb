@@ -303,6 +303,22 @@ class _BaseScope:
             timedb_read.resolved_stats, self._td._ch, ids, start_valid, end_valid
         )
 
+    async def knowledge_times_from_meta(
+        self,
+        meta: pl.DataFrame,
+        *,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        limit: int = 20,
+    ) -> list[datetime]:
+        """Newest-first distinct knowledge_times ("runs") for the series in
+        ``meta`` within the window — one ClickHouse aggregate. Returns up to
+        ``limit + 1`` so callers can detect truncation."""
+        ids = meta["series_id"].unique().to_list()
+        return await asyncio.to_thread(
+            timedb_read.distinct_knowledge_times, self._td._ch, ids, start_valid, end_valid, limit
+        )
+
     @asynccontextmanager
     async def _use_read_conn(self):
         """Yield a connection for a pure read. Inside a txn, the txn's
